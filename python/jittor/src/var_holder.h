@@ -25,7 +25,15 @@ struct DataView {
 };
 
 struct ItemData {
-    int64 data;
+    // int64 data is the "normal" scalar view (used as a plain 8-byte value by every
+    // existing dtype up to and including complex64/float64/int64); bytes[16] widens
+    // the SAME storage to fit complex128 (16 bytes), which VarHolder::item() reaches
+    // via a raw memcpy sized by dtype.dsize(). A union keeps `data` usable exactly as
+    // before (no other call site needs to change) while giving the memcpy enough room.
+    union {
+        int64 data;
+        char bytes[16];
+    };
     NanoString dtype;
 };
 

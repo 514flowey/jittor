@@ -74,4 +74,63 @@ inline __device__ complex64 atomicAdd(complex64* addr, complex64 v) {
 }
 #endif
 
+// Native complex128 = a float64 (real, imag) pair (16 bytes, matches numpy complex128 /
+// NPY_CDOUBLE layout). Mirrors complex64 above exactly, at double precision: same
+// operator/function set, math via the unsuffixed (double-precision) libm overloads
+// instead of the f-suffixed single-precision ones.
+struct complex128 {
+    double real, imag;
+    JT_CPLX_HD complex128() : real(0), imag(0) {}
+    JT_CPLX_HD complex128(double r) : real(r), imag(0) {}
+    JT_CPLX_HD complex128(double r, double i) : real(r), imag(i) {}
+};
+
+inline JT_CPLX_HD complex128 operator+(complex128 a, complex128 b) { return complex128(a.real+b.real, a.imag+b.imag); }
+inline JT_CPLX_HD complex128 operator-(complex128 a, complex128 b) { return complex128(a.real-b.real, a.imag-b.imag); }
+inline JT_CPLX_HD complex128 operator-(complex128 a) { return complex128(-a.real, -a.imag); }
+inline JT_CPLX_HD complex128 operator*(complex128 a, complex128 b) {
+    return complex128(a.real*b.real - a.imag*b.imag, a.real*b.imag + a.imag*b.real);
+}
+inline JT_CPLX_HD complex128 operator/(complex128 a, complex128 b) {
+    double d = b.real*b.real + b.imag*b.imag;
+    return complex128((a.real*b.real + a.imag*b.imag)/d, (a.imag*b.real - a.real*b.imag)/d);
+}
+inline JT_CPLX_HD bool operator==(complex128 a, complex128 b) { return a.real==b.real && a.imag==b.imag; }
+inline JT_CPLX_HD bool operator!=(complex128 a, complex128 b) { return !(a==b); }
+inline JT_CPLX_HD complex128 jt_conj(complex128 a) { return complex128(a.real, -a.imag); }
+inline JT_CPLX_HD double jt_creal(complex128 a) { return a.real; }
+inline JT_CPLX_HD double jt_cabs(complex128 a) { return ::sqrt(a.real*a.real + a.imag*a.imag); }
+
+inline JT_CPLX_HD complex128 jt_cexp(complex128 a) {
+    double e = ::exp(a.real);
+    return complex128(e*::cos(a.imag), e*::sin(a.imag));
+}
+inline JT_CPLX_HD complex128 jt_clog(complex128 a) {
+    return complex128(0.5*::log(a.real*a.real + a.imag*a.imag), ::atan2(a.imag, a.real));
+}
+inline JT_CPLX_HD complex128 jt_csin(complex128 a) {
+    return complex128(::sin(a.real)*::cosh(a.imag), ::cos(a.real)*::sinh(a.imag));
+}
+inline JT_CPLX_HD complex128 jt_ccos(complex128 a) {
+    return complex128(::cos(a.real)*::cosh(a.imag), -::sin(a.real)*::sinh(a.imag));
+}
+inline JT_CPLX_HD complex128 jt_csqrt(complex128 a) {
+    double r = ::sqrt(a.real*a.real + a.imag*a.imag);
+    double re = ::sqrt(0.5*(r + a.real));
+    double im = ::sqrt(0.5*(r - a.real));
+    return complex128(re, a.imag < 0 ? -im : im);
+}
+
+// complex64 <-> complex128 precision cast (both components, no truncation-to-real).
+inline JT_CPLX_HD complex128 jt_c64_to_c128(complex64 a) { return complex128((double)a.real, (double)a.imag); }
+inline JT_CPLX_HD complex64 jt_c128_to_c64(complex128 a) { return complex64((float)a.real, (float)a.imag); }
+
+#if defined(JIT_cuda) && !defined(IS_ACL)
+inline __device__ complex128 atomicAdd(complex128* addr, complex128 v) {
+    // native double atomicAdd (compute capability >= 6.0); no software CAS-loop
+    // fallback is provided since this repo's supported archs are all >= 6.0.
+    return complex128(::atomicAdd(&addr->real, v.real), ::atomicAdd(&addr->imag, v.imag));
+}
+#endif
+
 }

@@ -29,6 +29,7 @@ constexpr int ns_max_len = 16;
     m(float64) \
     m(bfloat16) \
     m(complex64) \
+    m(complex128) \
 \
     m(pow) \
     m(maximum) \
@@ -118,15 +119,19 @@ struct NanoString {
         _unsigned=_n+4,
         // bit5: is float
         _float=_n+5,
-        // bit6-7: dsize(1,2,4,8 byte)
-        _dsize=_n+6, _dsize_nbits=2,
-        // bit8: white list
-        _white_list=_n+8,
-        // bit9: backward opt
-        _no_need_back_in=_n+9,
-        _no_need_back_out=_n+10,
-        // bit11: is complex (real/imag pair; _float/_int both 0)
-        _complex=_n+11,
+        // bit6-8: dsize(1,2,4,8,16 byte). Widened from 2 to 3 bits to fit
+        // complex128's 16-byte (1<<4) category; every flag below is shifted
+        // by one bit accordingly. All access goes through the named Flags
+        // enum (NanoString::get/set), never a raw bit literal, so this is
+        // the single place that needs to change.
+        _dsize=_n+6, _dsize_nbits=3,
+        // bit9: white list
+        _white_list=_n+9,
+        // bit10: backward opt
+        _no_need_back_in=_n+10,
+        _no_need_back_out=_n+11,
+        // bit12: is complex (real/imag pair; _float/_int both 0)
+        _complex=_n+12,
     };
     ns_t data=0;
 
@@ -227,13 +232,29 @@ inline NanoString float_dtype(int dsize_, bool has_scalar=false, bool has_bf16=f
 }
 
 inline NanoString int_dtype(int dsize_) {
-    return (dsize_ == 3) ? ns_int64 : 
+    return (dsize_ == 3) ? ns_int64 :
         (dsize_ == 2) ? ns_int32 :
         (dsize_ == 1) ? ns_int16 : ns_int8;
 }
 
+// A non-complex operand needs double-precision-class combination (dsize>=8, i.e.
+// float64/int64/uint64) to widen a paired complex64 to complex128, mirroring
+// numpy/torch: complex64's value type is float32, so combining with float64 (or an
+// int64-class integer, whose default float promotion is float64) needs complex128
+// to avoid losing precision. A complex operand needs it only if it is ALREADY
+// complex128 (16 bytes).
+inline bool complex_needs_double(NanoString x) {
+    return x.is_complex() ? (x.dsize() == 16) : (x.dsize() >= 8);
+}
+inline NanoString complex_promote(NanoString x, NanoString y) {
+    return (complex_needs_double(x) || complex_needs_double(y)) ? ns_complex128 : ns_complex64;
+}
+inline NanoString complex_promote1(NanoString x) {
+    return x.dsize() == 16 ? ns_complex128 : ns_complex64;
+}
+
 inline  NanoString dtype_infer(NanoString x, NanoString y, bool xscalar=false, bool yscalar=false) {
-    if (x.is_complex() || y.is_complex()) return ns_complex64;  // complex propagates
+    if (x.is_complex() || y.is_complex()) return complex_promote(x, y);  // complex propagates
     int dsize_ = std::max(x.dsize_(), y.dsize_());
     if (xscalar) dsize_ = y.dsize_();
     if (yscalar) dsize_ = x.dsize_();
@@ -249,7 +270,7 @@ inline  NanoString dtype_infer(NanoString x, NanoString y, bool xscalar=false, b
 // @pyjt(binary_dtype_infer)
 inline NanoString binary_dtype_infer(NanoString op, NanoString x, NanoString y, bool xscalar=false, bool yscalar=false) {
     if (op.is_bool()) return ns_bool;   // comparisons -> bool even for complex
-    if (x.is_complex() || y.is_complex()) return ns_complex64;  // complex arithmetic
+    if (x.is_complex() || y.is_complex()) return complex_promote(x, y);  // complex arithmetic
     int dsize_ = std::max(x.dsize_(), y.dsize_());
     if (xscalar) dsize_ = y.dsize_();
     if (yscalar) dsize_ = x.dsize_();
@@ -268,7 +289,8 @@ inline NanoString binary_dtype_infer(NanoString op, NanoString x, NanoString y, 
 
 inline NanoString unary_dtype_infer(NanoString op, NanoString x) {
     if (op.is_bool()) return ns_bool;
-    if (x.is_complex()) return (op==ns_abs) ? ns_float32 : ns_complex64;  // |z|->float
+    if (x.is_complex())  // |z|->float, precision matching the complex width
+        return (op==ns_abs) ? (x.dsize()==16 ? ns_float64 : ns_float32) : complex_promote1(x);
     int dsize_ = x.dsize_();
     if (op.is_float()) {
         if (op.is_white() && !(amp_reg & amp_keep_white))
@@ -280,11 +302,11 @@ inline NanoString unary_dtype_infer(NanoString op, NanoString x) {
 }
 
 inline NanoString reduce_dtype_infer(NanoString op, NanoString x) {
-    // complex reductions stay complex (sum/mean/prod). Without this, mean -- which is in
-    // float_ops -- forces a float output dtype, so the kernel tries to assign a complex64
-    // accumulator into a double and fails to compile. (sum works already because 'add' is
-    // not a float_op.)
-    if (x.is_complex()) return ns_complex64;
+    // complex reductions stay complex (sum/mean/prod), preserving the input's complex
+    // width. Without this, mean -- which is in float_ops -- forces a float output
+    // dtype, so the kernel tries to assign a complex accumulator into a double and
+    // fails to compile. (sum works already because 'add' is not a float_op.)
+    if (x.is_complex()) return complex_promote1(x);
     bool is_float = x.is_float() || op.is_float();
     int dsize_ = x.dsize_();
     if (is_float) {

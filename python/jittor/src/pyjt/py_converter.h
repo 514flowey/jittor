@@ -519,6 +519,12 @@ DEF_IS(ItemData, PyObject*) to_py_object(T a) {
         auto* f = (float32*)&a.data;
         return PyComplex_FromDoubles((double)f[0], (double)f[1]);
     }
+    if (a.dtype == ns_complex128) {
+        // complex128 is {double real, imag;} (16 bytes) -- ItemData::data was widened
+        // to a 16-byte union (see var_holder.h) specifically to fit this.
+        auto* f = (float64*)&a.data;
+        return PyComplex_FromDoubles(f[0], f[1]);
+    }
     return PyLong_FromLongLong(a.data);
 }
 

@@ -11,13 +11,17 @@
 
 namespace jittor {
 
-// Native complex64 codegen. Mirrors FP16OpType: dispatches the elementwise ops on
-// complex64 to the operators in type/complex_compute.h (injected by post_pass).
-// Unsupported ops return "" (the op then fails loudly rather than silent-wrong).
+// Native complex64/complex128 codegen. Mirrors FP16OpType: dispatches the elementwise
+// ops on complex types to the operators in type/complex_compute.h (injected by
+// post_pass). Unsupported ops return "" (the op then fails loudly rather than
+// silent-wrong). The expression table below is dtype-name-agnostic (plain C++
+// operator/function syntax); it resolves to the right overload via the actual
+// Tx/Ty template substitution, so both complex64 and complex128 share it as-is.
 struct ComplexOpType : OpByType {
     ComplexOpType() {
         types = {
             "complex64",
+            "complex128",
         };
     }
 
@@ -26,13 +30,27 @@ struct ComplexOpType : OpByType {
         for (int i=1; i<args.size(); i+=2)
             if (types.count(args[i])) found = 1;
         if (!found) return "";
-        if (args.size() >= 4 && args[0] == "cast" &&
-            args[3] == "complex64" && args[1] != "complex64") {
-            // Casting complex to real discards the imaginary component. This is
-            // also the adjoint needed by real->complex cast backward.
-            if (args[1] == "bool")
-                return format("((($2).real != 0) || (($2).imag != 0))", args);
-            return format("(($1)(jittor::jt_creal($2)))", args);
+        if (args.size() >= 4 && args[0] == "cast") {
+            bool src_complex = types.count(args[3]);
+            bool dst_complex = types.count(args[1]);
+            if (src_complex && dst_complex && args[1] != args[3]) {
+                // complex64 <-> complex128 precision cast: convert BOTH components
+                // (widen or narrow each of real/imag independently), never drop the
+                // imaginary part -- that would silently corrupt a same-kind cast.
+                if (args[1] == "complex128")
+                    return format("jittor::jt_c64_to_c128($2)", args);
+                return format("jittor::jt_c128_to_c64($2)", args);
+            }
+            if (src_complex && !dst_complex) {
+                // Casting complex to real discards the imaginary component. This is
+                // also the adjoint needed by real->complex cast backward.
+                if (args[1] == "bool")
+                    return format("((($2).real != 0) || (($2).imag != 0))", args);
+                return format("(($1)(jittor::jt_creal($2)))", args);
+            }
+            // dst_complex && !src_complex (real->complex): falls through to the
+            // generic "cast" entry below, "(($1)($2))", which invokes the complex
+            // type's single-argument (real-only) constructor.
         }
         static unordered_map<string,string> m = {
             {"void", "($4)"},
@@ -65,7 +83,7 @@ struct ComplexOpType : OpByType {
 
     void post_pass(OpCompiler* oc) {
         string& src = oc->src;
-        if (src.find("complex64") == string::npos)
+        if (src.find("complex64") == string::npos && src.find("complex128") == string::npos)
             return;
         int i = src.rfind("#include");
         if (i<0) i=0;

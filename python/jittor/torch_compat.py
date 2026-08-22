@@ -7934,7 +7934,15 @@ def _install_tensor_methods(g, Var, _DTYPE_OBJS=None):
             if isinstance(other, (complex, np.complexfloating)):
                 other = _complex_scalar_var(other)
             if isinstance(other, Var):
-                da, db = str(self.dtype), str(other.dtype)
+                # _dtype_to_str strips the "torch." repr prefix: g._torch_promote_pair's
+                # own table (_PROMO_IDX / the complex .startswith("complex") branch) only
+                # matches BARE names ("complex64"), so feeding it str(Var.dtype) directly
+                # (which prints "torch.complex64") silently fell through to a no-op
+                # fallback -- e.g. complex64+float64 stayed complex64 instead of
+                # promoting to complex128 (jittor-core-gaps.md §3.2 uncovered this; it
+                # was equally wrong for complex64 before complex128 existed to compare
+                # against, just unobservable).
+                da, db = _dtype_to_str(self.dtype), _dtype_to_str(other.dtype)
                 if da == db and not da.startswith("uint"):
                     return native(self, other)
                 res = g._torch_promote_pair(da, db)
@@ -7942,7 +7950,7 @@ def _install_tensor_methods(g, Var, _DTYPE_OBJS=None):
                 b = other if db == res else other.cast(res)
                 out = native(a, b)
                 # native may still mis-infer (unsigned -> signed); fix it up.
-                if isinstance(out, Var) and str(out.dtype) != res:
+                if isinstance(out, Var) and _dtype_to_str(out.dtype) != res:
                     out = out.cast(res)
                 return out
             # torch defers numeric ops against a Python sequence to the sequence's
@@ -7998,14 +8006,18 @@ def _install_tensor_methods(g, Var, _DTYPE_OBJS=None):
             if isinstance(other, (complex, np.complexfloating)):
                 other = _complex_scalar_var(other)
             if isinstance(other, Var):
-                da, db = str(self.dtype), str(other.dtype)
+                # _dtype_to_str strips the "torch." repr prefix -- see the comment on
+                # the same pattern in _make_promoting_op above; without it this fell
+                # through to the float32-default fallback for any mixed complex/float64
+                # true-division instead of the torch-correct complex128 target.
+                da, db = _dtype_to_str(self.dtype), _dtype_to_str(other.dtype)
                 if da == db and da.startswith(("float", "bfloat", "complex")):
                     return native(self, other)
                 tgt = _truediv_target(da, db)
                 a = self if da == tgt else self.cast(tgt)
                 b = other if db == tgt else other.cast(tgt)
                 out = native(a, b)
-                if isinstance(out, Var) and str(out.dtype) != tgt:
+                if isinstance(out, Var) and _dtype_to_str(out.dtype) != tgt:
                     out = out.cast(tgt)
                 return out
             # python sequence: defer to it (torch returns NotImplemented), matching
@@ -8014,8 +8026,8 @@ def _install_tensor_methods(g, Var, _DTYPE_OBJS=None):
                 return NotImplemented
             sd = _scalar_dtype_name(other)
             if sd is not None:
-                tgt = _truediv_target(str(self.dtype), sd)
-                src_dt = str(self.dtype)
+                src_dt = _dtype_to_str(self.dtype)
+                tgt = _truediv_target(src_dt, sd)
                 # PyTorch's Python-float scalar division keeps the result dtype
                 # but uses the scalar value with enough precision to differ from
                 # division by a float32 tensor by 1 ulp in common cases. 3DGS hits
@@ -8025,7 +8037,7 @@ def _install_tensor_methods(g, Var, _DTYPE_OBJS=None):
                 a = self if src_dt == calc_dt else self.cast(calc_dt)
                 b = jt.array(other, dtype=calc_dt) if use_wide else other
                 out = native(a, b)
-                if isinstance(out, Var) and str(out.dtype) != tgt:
+                if isinstance(out, Var) and _dtype_to_str(out.dtype) != tgt:
                     out = out.cast(tgt)
                 return out
             return native(self, other)
@@ -8520,17 +8532,25 @@ def _install_misc(g, Var, _DTYPE_OBJS=None):
     }
     _PROMO_IDX = {n: i for i, n in enumerate(_PROMO_ORDER)}
 
+    # dtypes whose value width needs complex128 (not complex64) to combine losslessly
+    # with a complex operand: float64 itself, and any int type whose default torch
+    # float promotion is float64 (int64/uint64). Mirrors src/misc/nano_string.h's
+    # complex_needs_double() for the native complex64/complex128 promotion rule.
+    _COMPLEX_WIDENS_TO_128 = {"float64", "int64", "uint64"}
+
     def _promote_pair(a, b):
-        # a, b are bare dtype-name strings. Unknown/complex types fall back to the
-        # wider of the two by category index when possible, else to a.
+        # a, b are bare dtype-name strings (callers must strip any "torch." repr
+        # prefix via _dtype_to_str first -- see _make_promoting_op/_make_truediv).
         if a == b:
             return a
         ia, ib = _PROMO_IDX.get(a), _PROMO_IDX.get(b)
         if ia is not None and ib is not None:
             return _PROMO_ROWS[a][ib]
-        # complex (jittor has no native complex compute, but keep the lattice sane)
+        # complex: keep the lattice sane (native complex64/complex128 dtypes).
         if a.startswith("complex") or b.startswith("complex"):
-            wide = "complex128" if ("128" in a or "128" in b or "float64" in (a, b)) else "complex64"
+            wide = "complex128" if (a == "complex128" or b == "complex128" or
+                                     a in _COMPLEX_WIDENS_TO_128 or
+                                     b in _COMPLEX_WIDENS_TO_128) else "complex64"
             return wide
         return a if ib is None else b
 

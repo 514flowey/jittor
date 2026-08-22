@@ -4745,13 +4745,21 @@ class ComplexNumber:
 
 
 # ---------------------------------------------------------------------------
-# Native complex64 <-> float32[..., 2] bridge. This lets FFT / linalg use the native
-# complex64 dtype while the internal kernels still consume a real/imag float pair:
-#   _complex64_to_real2 : complex64[...]   -> float32[..., 2]   (torch.view_as_real)
-#   _real2_to_complex64 : float32[..., 2]  -> complex64[...]     (torch.view_as_complex)
+# Native complex64/complex128 <-> float32/float64 [..., 2] bridge. This lets FFT /
+# linalg use the native complex dtype while the internal kernels still consume a
+# real/imag float pair:
+#   _complex_to_real2 : complex64[...]/complex128[...] -> float32/float64[..., 2]
+#                        (torch.view_as_real)
+#   _real2_to_complex : float32/float64[..., 2] -> complex64[...]/complex128[...]
+#                        (torch.view_as_complex), target complex width inferred from
+#                        the input's OWN real dtype (float32->complex64,
+#                        float64->complex128), matching numpy/torch precision rules.
 # view_as_real/view_as_complex prefer the zero-copy reinterpret_view core op when available,
 # and fall back to isolated jt.code kernels otherwise. Both are wrapped as jt.Function with
 # each other as the adjoint backward, so the bridge is autograd-transparent on CPU+CUDA.
+_COMPLEX_REAL_PAIR = {"complex64": "float32", "complex128": "float64"}
+_REAL_COMPLEX_PAIR = {v: k for k, v in _COMPLEX_REAL_PAIR.items()}
+
 _complex64_imag_unit_cache = None
 def _complex64_imag_unit():
     global _complex64_imag_unit_cache
@@ -4759,95 +4767,124 @@ def _complex64_imag_unit():
         _complex64_imag_unit_cache = jt.array(np.array(1j, dtype="complex64"))
     return _complex64_imag_unit_cache
 
-def _complex64_to_real2_raw(z):
+def _complex_to_real2_raw(z):
+    cdtype = str(z.dtype)
+    rdtype = _COMPLEX_REAL_PAIR.get(cdtype)
+    assert rdtype is not None, \
+        f"view_as_real expects a native complex64/complex128 Var, got dtype {cdtype}"
     reinterpret_view = getattr(jt, "reinterpret_view", None)
     if reinterpret_view is not None:
-        return reinterpret_view(z, list(z.shape) + [2], "float32")
+        return reinterpret_view(z, list(z.shape) + [2], rdtype)
     # flatten to 1-D so the jt.code kernel is shape-agnostic, then restore the [..., 2] tail.
     n = 1
     for s in z.shape:
         n *= s
-    flat = jt.code([n, 2], "float32", [z.reshape([n])],
-        cpu_src="""
-        for (int i=0; i<in0_shape0; i++) {
+    cpu_src = f"""
+        for (int i=0; i<in0_shape0; i++) {{
             @out(i,0) = @in0(i).real;
             @out(i,1) = @in0(i).imag;
-        }""",
-        cuda_src="""
-        __global__ void k(@ARGS_DEF) {
+        }}"""
+    cuda_src = f"""
+        __global__ void k(@ARGS_DEF) {{
             @PRECALC
             int i = blockIdx.x*blockDim.x + threadIdx.x;
-            if (i < in0_shape0) { @out(i,0) = @in0(i).real; @out(i,1) = @in0(i).imag; }
-        }
-        int n = in0_shape0; k<<<(n+63)/64, 64>>>(@ARGS);""")
+            if (i < in0_shape0) {{ @out(i,0) = @in0(i).real; @out(i,1) = @in0(i).imag; }}
+        }}
+        int n = in0_shape0; k<<<(n+63)/64, 64>>>(@ARGS);"""
+    flat = jt.code([n, 2], rdtype, [z.reshape([n])], cpu_src=cpu_src, cuda_src=cuda_src)
     return flat.reshape(list(z.shape) + [2])
 
-def _real2_to_complex64_raw(x):
+def _real2_to_complex_raw(x, cdtype=None):
     assert x.shape[-1] == 2, f"view_as_complex expects last dim 2, got shape {x.shape}"
+    if cdtype is None:
+        rdtype = str(x.dtype)
+        cdtype = _REAL_COMPLEX_PAIR.get(rdtype)
+        assert cdtype is not None, \
+            f"view_as_complex expects a float32/float64 Var, got dtype {rdtype}"
     reinterpret_view = getattr(jt, "reinterpret_view", None)
     if reinterpret_view is not None:
-        return reinterpret_view(x, list(x.shape[:-1]), "complex64")
-    # real[..., 2] -> native complex64. Use one code kernel instead of two getitem ops
+        return reinterpret_view(x, list(x.shape[:-1]), cdtype)
+    # real[..., 2] -> native complex. Use one code kernel instead of two getitem ops
     # plus mixed complex arithmetic; this is the hot path for RoPE view_as_complex.
     n = 1
     for s in x.shape[:-1]:
         n *= s
     out_shape = list(x.shape[:-1])
-    flat = jt.code([n], "complex64", [x.reshape([n, 2])],
-        cpu_src="""
-        for (int i=0; i<in0_shape0; i++) {
-            @out(i) = complex64(float(@in0(i,0)), float(@in0(i,1)));
-        }""",
-        cuda_src="""
-        __global__ void k(@ARGS_DEF) {
+    comp_scalar = "float" if cdtype == "complex64" else "double"
+    cpu_src = f"""
+        for (int i=0; i<in0_shape0; i++) {{
+            @out(i) = {cdtype}({comp_scalar}(@in0(i,0)), {comp_scalar}(@in0(i,1)));
+        }}"""
+    cuda_src = f"""
+        __global__ void k(@ARGS_DEF) {{
             @PRECALC
             int i = blockIdx.x*blockDim.x + threadIdx.x;
-            if (i < in0_shape0) {
-                @out(i) = complex64(float(@in0(i,0)), float(@in0(i,1)));
-            }
-        }
-        int n = in0_shape0; k<<<(n+63)/64, 64>>>(@ARGS);""")
+            if (i < in0_shape0) {{
+                @out(i) = {cdtype}({comp_scalar}(@in0(i,0)), {comp_scalar}(@in0(i,1)));
+            }}
+        }}
+        int n = in0_shape0; k<<<(n+63)/64, 64>>>(@ARGS);"""
+    flat = jt.code([n], cdtype, [x.reshape([n, 2])], cpu_src=cpu_src, cuda_src=cuda_src)
     return flat.reshape(out_shape)
 
-class _Complex64ToReal2(jt.Function):
+# Back-compat aliases (complex64-specific names some callers may still spell out).
+_complex64_to_real2_raw = _complex_to_real2_raw
+def _real2_to_complex64_raw(x):
+    return _real2_to_complex_raw(x, cdtype="complex64")
+
+class _ComplexToReal2(jt.Function):
     def execute(self, z):
-        return _complex64_to_real2_raw(z)
+        self.cdtype = str(z.dtype)
+        return _complex_to_real2_raw(z)
     def grad(self, g):                       # adjoint of view_as_real is view_as_complex
-        return _real2_to_complex64_raw(g)
+        return _real2_to_complex_raw(g, cdtype=self.cdtype)
 
-class _Real2ToComplex64(jt.Function):
+class _Real2ToComplex(jt.Function):
     def execute(self, x):
-        return _real2_to_complex64_raw(x)
+        return _real2_to_complex_raw(x)
     def grad(self, g):                       # adjoint of view_as_complex is view_as_real
-        return _complex64_to_real2_raw(g)
+        return _complex_to_real2_raw(g)
 
-def _complex64_to_real2(z):
-    return _Complex64ToReal2.apply(z)
+# Back-compat names.
+_Complex64ToReal2 = _ComplexToReal2
+_Real2ToComplex64 = _Real2ToComplex
 
-def _real2_to_complex64(x):
-    return _Real2ToComplex64.apply(x)
+def _complex_to_real2(z):
+    return _ComplexToReal2.apply(z)
+
+def _real2_to_complex(x):
+    return _Real2ToComplex.apply(x)
+
+# Back-compat names: despite the "64" in the name, these now infer the complex/real
+# width from the input (float32<->complex64, float64<->complex128), matching numpy/
+# torch precision rules -- kept only because external code may spell them out.
+_complex64_to_real2 = _complex_to_real2
+_real2_to_complex64 = _real2_to_complex
 
 
 def polar(abs:jt.Var, angle: jt.Var) -> jt.Var:
-    # torch.polar: magnitude `abs`, phase `angle` -> native complex64 (Phase 6 migration off
-    # ComplexNumber). Differentiable through the P1 bridge.
+    # torch.polar: magnitude `abs`, phase `angle` -> native complex64/complex128
+    # (width inferred from abs/angle's own float dtype). Differentiable through the
+    # P1 bridge.
     assert abs.shape == angle.shape
-    return _real2_to_complex64(jt.stack([abs * angle.cos(), abs * angle.sin()], dim=-1))
+    return _real2_to_complex(jt.stack([abs * angle.cos(), abs * angle.sin()], dim=-1))
 
 def view_as_complex(x: jt.Var) -> jt.Var:
-    # torch.view_as_complex: real [..., 2] -> native complex64 (Phase 6 migration). Callers that
-    # still need the legacy pair use nn.ComplexNumber(...) directly.
+    # torch.view_as_complex: real [..., 2] -> native complex64/complex128 (width
+    # inferred from x's float dtype). Callers that still need the legacy pair use
+    # nn.ComplexNumber(...) directly.
     assert x.shape[-1] == 2, f"view_as_complex expects last dim 2, got shape {x.shape}"
-    return _real2_to_complex64(x)
+    return _real2_to_complex(x)
 
 def view_as_real(x) -> jt.Var:
-    # torch.view_as_real: complex -> real [..., 2]. Polymorphic across the native complex64
-    # dtype (Phase 6 bridge, differentiable) and the legacy nn.ComplexNumber (real/imag pair).
+    # torch.view_as_real: complex -> real [..., 2]. Polymorphic across the native
+    # complex64/complex128 dtype (Phase 6 bridge, differentiable) and the legacy
+    # nn.ComplexNumber (real/imag pair).
     if isinstance(x, ComplexNumber):
         return jt.stack([x.value[...,0],x.value[...,1]],dim=-1)
     assert "complex" in str(x.dtype), \
-        f"view_as_real expects a complex64 Var or ComplexNumber, got dtype {x.dtype}"
-    return _complex64_to_real2(x)
+        f"view_as_real expects a complex64/complex128 Var or ComplexNumber, got dtype {x.dtype}"
+    return _complex_to_real2(x)
 
 
 # Native complex64 accessors (torch parity), patched onto Var so they are available globally
