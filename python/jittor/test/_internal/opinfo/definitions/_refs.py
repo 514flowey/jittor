@@ -62,10 +62,11 @@ def log_softmax_ref(x, dim=-1):
 
 
 def reduce_ref(npfn):
-    """Wrap a numpy reduction so it matches jittor's (dim, keepdims) kwargs and
-    its (1,)-shaped full-reduce result (jittor has no 0-d scalar)."""
+    """Wrap a numpy reduction so it matches jittor's (dim, keepdims) kwargs; a
+    full reduce yields a real 0-d result on both sides (jittor-core-gaps.md
+    §3.1), so no shape padding is needed."""
     def ref(x, dim=None, keepdims=False):
-        return np.atleast_1d(npfn(x, axis=dim, keepdims=keepdims))
+        return np.asarray(npfn(x, axis=dim, keepdims=keepdims))
     return ref
 
 

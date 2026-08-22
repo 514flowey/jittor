@@ -285,5 +285,36 @@ class TestMoreDistributions(unittest.TestCase):
         self._ac(_grad1(jd.Beta(ja, jt.array([3.0, 1.5])).entropy().sum(), ja), "beta_ent_grad")
 
 
+class Test0DBatchShape(unittest.TestCase):
+    ''' jittor-core-gaps.md §3.1: Vars now have a real 0-d shape (), so
+    distributions.py's _bshape/_full_shape helpers were updated to stop
+    collapsing an all-scalar draw to (1,) and to stop treating any length-1
+    Var as indistinguishable from a scalar. This locks in the torch-matching
+    behavior across the shared helpers (used by every distribution class). '''
+
+    def test_scalar_param_batch_shape_is_0d(self):
+        d = jd.Normal(jt.array(0.5), jt.array(1.0))
+        self.assertEqual(tuple(d.batch_shape), ())
+        self.assertEqual(d.sample().shape, [])
+
+    def test_python_scalar_param_batch_shape_is_0d(self):
+        d = jd.Normal(0.5, 1.0)
+        self.assertEqual(tuple(d.batch_shape), ())
+        self.assertEqual(d.sample().shape, [])
+
+    def test_length_one_param_is_a_real_batch_axis(self):
+        # jt.array([0.5]) is a genuine 1-element batch, NOT a disguised scalar:
+        # torch.distributions.Normal(torch.tensor([0.5]), torch.tensor([1.0]))
+        # has batch_shape == (1,), and so must jittor's.
+        d = jd.Normal(jt.array([0.5]), jt.array([1.0]))
+        self.assertEqual(tuple(d.batch_shape), (1,))
+        self.assertEqual(d.sample().shape, [1])
+
+    def test_sample_shape_prepends_to_0d_batch(self):
+        d = jd.Normal(jt.array(0.5), jt.array(1.0))
+        self.assertEqual(d.sample((4,)).shape, [4])
+        self.assertEqual(d.sample((2, 3)).shape, [2, 3])
+
+
 if __name__ == "__main__":
     unittest.main()

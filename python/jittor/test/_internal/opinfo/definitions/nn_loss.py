@@ -37,12 +37,13 @@ from ..core import OpInfo, UnaryUfuncInfo, BinaryUfuncInfo, ReductionOpInfo
 # ------------------------------------------------------------------- numpy refs
 
 def _reduce_np(loss, reduction):
-    """jittor losses return a (1,)-shaped Var for mean/sum (no 0-d scalar); match it."""
+    """jittor losses return a real 0-d Var for mean/sum (jittor-core-gaps.md §3.1);
+    numpy's own .sum()/.mean() already yield a 0-d scalar, matching it."""
     if reduction == "none":
         return loss
     if reduction == "sum":
-        return np.atleast_1d(loss.sum())
-    return np.atleast_1d(loss.mean())   # "mean"
+        return np.asarray(loss.sum())
+    return np.asarray(loss.mean())   # "mean"
 
 
 def mse_loss_ref(input, target, reduction="mean"):
@@ -87,10 +88,10 @@ def cross_entropy_ref(input, target, reduction="mean", ignore_index=-100,
     keep = (tgt != ignore_index).astype(input.dtype)
     per = per * keep
     if reduction == "sum":
-        return np.atleast_1d(per.sum())
+        return np.asarray(per.sum())
     if reduction == "none":
         return per
-    return np.atleast_1d(per.sum() / max(keep.sum(), 1e-8))
+    return np.asarray(per.sum() / max(keep.sum(), 1e-8))
 
 
 def nll_loss_ref(input, target, ignore_index=-100, reduction="mean"):
@@ -101,10 +102,10 @@ def nll_loss_ref(input, target, ignore_index=-100, reduction="mean"):
     keep = (tgt != ignore_index).astype(input.dtype)
     per = per * keep
     if reduction == "sum":
-        return np.atleast_1d(per.sum())
+        return np.asarray(per.sum())
     if reduction == "none":
         return per
-    return np.atleast_1d(per.sum() / max(keep.sum(), 1e-8))
+    return np.asarray(per.sum() / max(keep.sum(), 1e-8))
 
 
 def bce_ref(input, target, reduction="mean"):
@@ -125,7 +126,7 @@ def kl_div_ref(input, target, reduction="mean", log_target=False):
     else:
         per = target * (np.log(target) - input)
     if reduction == "batchmean":
-        return np.atleast_1d(per.sum() / input.shape[0])
+        return np.asarray(per.sum() / input.shape[0])
     return _reduce_np(per, reduction)
 
 

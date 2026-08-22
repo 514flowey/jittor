@@ -205,7 +205,10 @@ def gradgradcheck(func, inputs, *, eps=1e-6, atol=1e-5, rtol=1e-3,
     # fixed cotangents per output, drawn once so g is deterministic
     vs0, outs0 = _call(func, base)
     rng = np.random.RandomState(0)
-    weights = [rng.randn(*to_numpy(o).shape).astype("float64") for o in outs0]
+    # np.random.randn(*()) returns a bare python float (not a 0-d ndarray), which
+    # has no .astype -- wrap in np.asarray so a real 0-d output (jittor-core-gaps.md
+    # §3.1, e.g. a full-reduction op) doesn't crash the harness.
+    weights = [np.asarray(rng.randn(*to_numpy(o).shape)).astype("float64") for o in outs0]
 
     def grad_fn(*vars_):
         out = _as_list(func(*vars_))

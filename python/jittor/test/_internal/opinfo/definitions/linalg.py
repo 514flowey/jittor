@@ -63,7 +63,7 @@ def _trace(x):
 # =============================================================================
 
 def dot_ref(a, b):
-    return np.atleast_1d(np.dot(a, b))            # jittor has no 0-d scalar
+    return np.asarray(np.dot(a, b))            # matches jittor's real 0-d result
 
 
 def outer_ref(a, b):
@@ -79,7 +79,7 @@ def inner_ref(a, b):
 
 
 def trace_ref(x):
-    return np.atleast_1d(np.trace(x, axis1=-2, axis2=-1))   # jittor has no 0-d scalar
+    return np.asarray(np.trace(x, axis1=-2, axis2=-1))   # matches jittor's real 0-d result
 
 
 def diag_ref(x, diagonal=0):

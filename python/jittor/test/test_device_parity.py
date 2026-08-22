@@ -139,7 +139,10 @@ def _run(op, sample, use_cuda):
             if diff and float_outs:
                 loss = None
                 for j, o in enumerate(float_outs):
-                    cot = np.random.RandomState(1234 + j).randn(*to_numpy(o).shape).astype("float32")
+                    # np.random.randn(*()) returns a bare python float (no .astype) --
+                    # wrap in np.asarray so a real 0-d output (jittor-core-gaps.md
+                    # §3.1, e.g. a full-reduction op) doesn't crash the harness.
+                    cot = np.asarray(np.random.RandomState(1234 + j).randn(*to_numpy(o).shape)).astype("float32")
                     term = (o * jt.array(cot)).sum()
                     loss = term if loss is None else loss + term
                 grads = [to_numpy(g) for g in jt.grad(loss, diff)]

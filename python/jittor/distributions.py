@@ -116,16 +116,11 @@ constraints = _ConstraintsModule("torch.distributions.constraints")
 # with the *batch* dims (broadcast of the parameters) preserved and sample_shape
 # PREPENDED. The helpers below give every distribution that contract.
 #
-# NB jittor has NO 0-d (scalar) Var: jt.zeros(()), jt.randn(()) and reshape(())
-# are all rejected at the C++ level (reshape_op.cc), so a scalar parameter -- a
-# python float OR jt.array(0.5) -- always materializes as shape (1,), and is
-# therefore INDISTINGUISHABLE from a genuine 1-element batch. We resolve this the
-# only consistent way jittor can: a parameter with a single element (prod(shape)==1)
-# is treated as a SCALAR, i.e. batch_shape = (). Consequences vs real torch:
-#   * scalar params + sample_shape=()      -> jittor (1,)  where torch gives ()
-#       (jittor has no 0-d, so a length-1 vector is the scalar representation);
-#   * scalar params + sample_shape (n,)/(n,m) -> EXACT match (n,) / (n,m);
-#   * ALL multi-element batched-parameter cases -> EXACT match with torch.
+# jittor Vars have a real 0-d shape () (see jittor-core-gaps.md §3.1), so a
+# scalar parameter -- a python float, or jt.array(0.5) which is genuinely 0-d --
+# contributes batch_shape=() exactly like torch, while a length-1 Var like
+# jt.array([0.5]) is a real 1-element batch axis contributing (1,). This matches
+# torch exactly, including scalar params + sample_shape=() -> ().
 # The pre-existing code instead used sample_shape AS the whole output shape, which
 # silently DROPPED the batch dims and raised a broadcast error the moment the
 # parameters were batched -- that is the real gap TASK #12 fixes.
@@ -149,17 +144,15 @@ def _prod(shape):
 
 def _bshape(*params):
     ''' Broadcast the parameter shapes to obtain batch_shape (torch semantics).
-    A single-element parameter (python number, or a length-1 Var that jittor uses
-    to stand in for a 0-d scalar) contributes () -- see the module note: jittor has
-    no 0-d Var so a scalar and a 1-element batch are indistinguishable, and we pick
-    the scalar reading so Normal(jt.array(0.5), ...).sample((n,)) is (n,), not (n,1).'''
+    jittor Vars now have real 0-d shape (), so a genuine 0-d parameter (or a
+    python number) contributes (); a length-1 Var like jt.array([0.5]) is a real
+    1-element batch axis and contributes (1,), matching torch exactly. '''
     shapes = []
     for p in params:
         if hasattr(p, "shape"):
-            s = tuple(p.shape)
-            shapes.append(() if _prod(s) == 1 else s)   # length-1 Var == scalar
+            shapes.append(tuple(p.shape))   # real shape, incl. () for 0-d
         else:
-            shapes.append(())                            # python number == scalar
+            shapes.append(())                # python number == scalar
     out = ()
     for s in shapes:
         out = _broadcast_two(out, s)
@@ -182,10 +175,9 @@ def _broadcast_two(a, b):
 
 
 def _full_shape(sample_shape, batch_shape, event_shape=()):
-    ''' torch's sample_shape + batch_shape + event_shape. A scalar (empty
-    batch+event) collapses to (1,) because jittor has no 0-d Var. '''
-    out = _norm_sample_shape(sample_shape) + tuple(batch_shape) + tuple(event_shape)
-    return out if len(out) > 0 else (1,)
+    ''' torch's sample_shape + batch_shape + event_shape; jittor Vars support a
+    real 0-d shape (), so an all-scalar draw stays () like torch, not (1,). '''
+    return _norm_sample_shape(sample_shape) + tuple(batch_shape) + tuple(event_shape)
 
 
 def _broadcast_var(value, shape):
@@ -506,8 +498,6 @@ class Bernoulli(Distribution):
             self.probs = probs
             self.logits = jt.safe_log(probs) - jt.safe_log(1 - probs)
         # torch parity: batch_shape = broadcast(params), event_shape = ().
-        # Compute from the RAW arg so a python scalar -> () (torch 0-d), not the
-        # (1,) that _as_var/jt.array forces (jittor has no 0-d Var).
         self.batch_shape = _bshape(logits if logits is not None else probs)
 
     def sample(self, sample_shape=None):

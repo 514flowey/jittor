@@ -44,8 +44,9 @@ test on the raw integer reduce kernel regardless of whether torch_compat is load
 
 Signatures (verified against ``__init__.pyi`` / ``src/ops/reduce_op.cc``): every
 native reduce primitive is ``op(x, dim:int, keepdims=False)`` /
-``op(x, dims:Tuple=(), keepdims=False)``; a no-arg call is the full reduce and yields
-a ``(1,)``-shaped Var (jittor has no 0-d scalar -> the numpy refs ``atleast_1d``).
+``op(x, dims:Tuple=(), keepdims=False)``; a no-arg call is the full reduce and
+yields a real 0-d Var (jittor-core-gaps.md §3.1), matching numpy's own 0-d
+full-reduce result -- no ``atleast_1d`` padding needed.
 The reduce kernel keeps the INPUT integer dtype on output (``reduce_dtype_infer``: no
 integer promotion), except a ``bool`` input always yields ``int32``
 (reduce_op.cc L289) -- so the all/any refs below emit int32 0/1 to match exactly.
@@ -57,23 +58,24 @@ from ..core import OpInfo, UnaryUfuncInfo, BinaryUfuncInfo, ReductionOpInfo, ski
 # ------------------------------------------------------------------- numpy refs
 #
 # A reduction full-reduces when no ``dim`` kwarg is given, else reduces ``dim``
-# honoring ``keepdims``. ``np.atleast_1d`` lifts the (0-d) numpy scalar of a full
-# reduce to the ``(1,)`` shape jittor produces. The integer refs operate in the
-# input dtype so wraparound (if any) matches the integer reduce kernel; the chosen
-# value ranges (see the sample builders) keep every forwarded reduction in-range so
-# the int64 oracle is exact and the sign behaviour of ``prod`` over negatives is the
+# honoring ``keepdims``. numpy's own full-reduce already yields a 0-d array, which
+# now matches jittor's real 0-d full-reduce result exactly (jittor-core-gaps.md
+# §3.1) -- no shape padding needed. The integer refs operate in the input dtype so
+# wraparound (if any) matches the integer reduce kernel; the chosen value ranges
+# (see the sample builders) keep every forwarded reduction in-range so the int64
+# oracle is exact and the sign behaviour of ``prod`` over negatives is the
 # discriminating signal.
 
 def _arith_reduce_ref(npfn):
-    """sum/prod/max/min reference, matching jittor's (dim, keepdims) kwargs and its
-    ``(1,)``-shaped full-reduce result. ``npfn`` is np.sum/np.prod/np.max/np.min.
+    """sum/prod/max/min reference, matching jittor's (dim, keepdims) kwargs and
+    its real 0-d full-reduce result. ``npfn`` is np.sum/np.prod/np.max/np.min.
 
     The result is cast back to the input dtype: numpy's ``np.prod`` upcasts small
     int dtypes to the platform int, whereas jittor's reduce keeps the input dtype
     (reduce_dtype_infer -> no promotion), so we must narrow to compare exactly."""
     def ref(x, dim=None, keepdims=False):
-        out = np.atleast_1d(npfn(x, axis=dim, keepdims=keepdims))
-        return out.astype(x.dtype)
+        out = npfn(x, axis=dim, keepdims=keepdims)
+        return np.asarray(out).astype(x.dtype)
     return ref
 
 
@@ -86,11 +88,11 @@ min_ref = _arith_reduce_ref(np.min)
 def all_ref(x, dim=None, keepdims=False):
     """jittor ``all_`` over bool: reduce truthiness; output dtype is int32 (a bool
     input forces an int32 reduce output, reduce_op.cc L289), so emit int32 0/1."""
-    return np.atleast_1d(np.all(x != 0, axis=dim, keepdims=keepdims)).astype("int32")
+    return np.asarray(np.all(x != 0, axis=dim, keepdims=keepdims)).astype("int32")
 
 
 def any_ref(x, dim=None, keepdims=False):
-    return np.atleast_1d(np.any(x != 0, axis=dim, keepdims=keepdims)).astype("int32")
+    return np.asarray(np.any(x != 0, axis=dim, keepdims=keepdims)).astype("int32")
 
 
 # --------------------------------------------------------------- sample builders

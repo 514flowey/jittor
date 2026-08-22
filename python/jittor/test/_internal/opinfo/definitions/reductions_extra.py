@@ -27,18 +27,12 @@ from ..core import OpInfo, UnaryUfuncInfo, BinaryUfuncInfo, ReductionOpInfo
 
 # ------------------------------------------------------------------- numpy refs
 
-def _atleast1d(a):
-    """jittor has no 0-d scalar: a full reduction yields a (1,)-shaped Var, so the
-    reference's python/0-d scalar must be lifted to 1-D to match shapes exactly."""
-    return np.atleast_1d(a)
-
-
 def amax_ref(x, dim=None, keepdim=False):
-    return _atleast1d(np.max(x, axis=dim, keepdims=keepdim))
+    return np.max(x, axis=dim, keepdims=keepdim)
 
 
 def amin_ref(x, dim=None, keepdim=False):
-    return _atleast1d(np.min(x, axis=dim, keepdims=keepdim))
+    return np.min(x, axis=dim, keepdims=keepdim)
 
 
 def maxdim_ref(x, dim, keepdim=False):
@@ -53,11 +47,11 @@ def mindim_ref(x, dim, keepdim=False):
 
 def var_ref(x, dim=None, keepdim=False):
     # jittor torch-compat var defaults to UNBIASED (Bessel correction) -> ddof=1.
-    return _atleast1d(np.var(x, axis=dim, ddof=1, keepdims=keepdim))
+    return np.asarray(np.var(x, axis=dim, ddof=1, keepdims=keepdim))
 
 
 def std_ref(x, dim=None, keepdim=False):
-    return _atleast1d(np.std(x, axis=dim, ddof=1, keepdims=keepdim))
+    return np.asarray(np.std(x, axis=dim, ddof=1, keepdims=keepdim))
 
 
 def cumsum_ref(x, dim=-1):
@@ -78,9 +72,10 @@ def logsumexp_ref(x, dim, keepdim=False):
 
 def norm2_ref(x, p=2, dim=None, keepdim=False):
     # torch/torch-compat norm: p=2 (Euclidean); dim=None reduces over the flattened
-    # tensor to a (1,)-shaped scalar, an int dim reduces that axis.
+    # tensor to a real 0-d scalar (jittor-core-gaps.md §3.1), an int dim reduces
+    # that axis.
     if dim is None:
-        return _atleast1d(np.sqrt(np.sum(np.square(x.reshape(-1)))))
+        return np.sqrt(np.sum(np.square(x.reshape(-1))))
     return np.sqrt(np.sum(np.square(x), axis=dim, keepdims=keepdim))
 
 
@@ -88,26 +83,26 @@ def argmax_ref(x, dim=None, keepdim=False):
     out = np.argmax(x, axis=dim)
     if keepdim and dim is not None:
         out = np.expand_dims(out, axis=dim)
-    return _atleast1d(out)
+    return np.asarray(out)
 
 
 def argmin_ref(x, dim=None, keepdim=False):
     out = np.argmin(x, axis=dim)
     if keepdim and dim is not None:
         out = np.expand_dims(out, axis=dim)
-    return _atleast1d(out)
+    return np.asarray(out)
 
 
 def all_ref(x, dim=None, keepdim=False):
-    return _atleast1d(np.all(x != 0, axis=dim, keepdims=keepdim))
+    return np.asarray(np.all(x != 0, axis=dim, keepdims=keepdim))
 
 
 def any_ref(x, dim=None, keepdim=False):
-    return _atleast1d(np.any(x != 0, axis=dim, keepdims=keepdim))
+    return np.asarray(np.any(x != 0, axis=dim, keepdims=keepdim))
 
 
 def count_nonzero_ref(x, dim=None):
-    return _atleast1d(np.count_nonzero(x, axis=dim))
+    return np.asarray(np.count_nonzero(x, axis=dim))
 
 
 # --------------------------------------------------------------- sample builders
