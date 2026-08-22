@@ -1241,6 +1241,10 @@ if has_cuda:
             nvcc_flags = nvcc_flags.replace("-std=c++17", "-std=c++14 -Xcompiler -std:c++14")
         else:
             nvcc_flags = nvcc_flags.replace("-std=c++17", "")
+        # nvcc's own frontend does not recognize the GNU dialect name (only
+        # host g++ needs it, to accept hex-float literals under strict
+        # -std=c++14, see the cc_flags "-std=gnu++14" switch above).
+        nvcc_flags = nvcc_flags.replace("-std=gnu++14", "-std=c++14")
         nvcc_flags = nvcc_flags.replace("-Wall", "")
         nvcc_flags = nvcc_flags.replace("-Wno-unknown-pragmas", "")
         nvcc_flags = nvcc_flags.replace("-fopenmp", "")
@@ -1256,6 +1260,14 @@ if has_cuda:
             nvcc_flags += " -G "
         return nvcc_flags
     nvcc_flags = convert_nvcc_flags(nvcc_flags)
+
+if os.name != 'nt':
+    # host g++/clang compiles JIT-generated code containing C99 hex-float
+    # literals (see jit_key.cc:convert_itof). Strict ISO "-std=c++14"
+    # rejects that syntax on newer GCC ("exponent has no digits"); the GNU
+    # dialect accepts it while keeping C++14 language semantics. nvcc_flags
+    # was already captured above and keeps the strict "-std=c++14" it needs.
+    cc_flags = cc_flags.replace("-std=c++14", "-std=gnu++14")
 
 extra_core_files = []
 setup_fake_cuda_lib = False

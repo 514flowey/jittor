@@ -133,19 +133,22 @@ class TestKernelTraps(JittorTestCase):
         else:
             self.skipTest(".long() not exposed")
 
-    @unittest.expectedFailure
     def test_constant_pad_fractional_fill_cpu_asmtuner(self):
-        """KNOWN-BUG (expected failure): a constant-pad with a FRACTIONAL fill value
-        fails to COMPILE on CPU.
+        """FIXED: a constant-pad with a FRACTIONAL fill value used to fail to COMPILE
+        on CPU (and any other JIT kernel embedding a non-representable-as-decimal
+        float64 constant, e.g. reindex overflow values, also failed on CUDA host-side
+        glue code compiled by g++).
 
-        Found by the full op battery: ``nn.pad(..., mode='constant', value=0.7)`` on the
-        CPU backend emits a ``reindex`` kernel whose overflow value is the hex-float
-        ``itof(0x3fe6666666666666)``; jittor's CPU ``asm_tuner`` (the ``-march=native``
-        assembly optimizer) rewrites that constant into a malformed literal and g++ aborts
-        with ``error: exponent has no digits``. INTEGER fills (0.0, 2.0, -3.0) and the CUDA
-        backend are unaffected -- so op_db's pad_constant samples use integer fills to keep
-        the pad semantics covered, and this test pins the fractional-fill regression loudly.
-        When the asm_tuner is fixed this turns XPASS and we drop the xfail."""
+        Root cause: JIT codegen (``jit_key.cc::convert_itof``) emits C99/C++17 hex-float
+        literals such as ``0x1.6666666666666p-1`` for float64 constants like the
+        ``reindex`` kernel's overflow value ``itof(0x3fe6666666666666)`` (0.7). Jittor
+        compiles host code with strict ISO ``-std=c++14`` (``python/jittor/compiler.py``),
+        which does not accept that GNU/C++17 extension on newer g++ (12.3.0 here) and
+        aborts with ``error: exponent has no digits``. Fixed by compiling host code with
+        ``-std=gnu++14`` instead (same C++14 language level, GNU extensions enabled),
+        while nvcc's own frontend still receives plain ``-std=c++14`` since it does not
+        recognize the ``gnu++14`` dialect name.
+        """
         with jt.flag_scope(use_cuda=0):
             x = jt.array(np.random.RandomState(0).randn(1, 1, 4, 4).astype("float32"))
             out = jt.nn.pad(x, [1, 1, 1, 1], mode="constant", value=0.7)
