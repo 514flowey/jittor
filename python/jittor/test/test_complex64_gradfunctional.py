@@ -4,27 +4,35 @@ Locks that jittor.gradfunctional.{vjp, jvp} accept and correctly differentiate t
 native complex64 dtype (a first-class differentiable Var), not just the legacy
 jt.nn.ComplexNumber real/imag-pair simulation.
 
-What is checked (CPU + CUDA):
+What is checked (CPU + CUDA), per jittor-core-gaps.md §3.3:
   - vjp on a complex->complex function with a native complex64 input and a complex
     grad-output v: result matches a numpy finite-difference oracle of the SAME real
     seeded loss the implementation uses, L = Re(sum(out * conj(v))) over the (real,imag)
     representation. (This is torch's conjugate/Wirtinger input-grad convention.)
   - vjp result is numerically identical to the legacy ComplexNumber path (polymorphism).
-  - jvp on native complex64 raises NotImplementedError cleanly (native complex64 has no
-    second-order autograd yet, and jvp is the double-backward trick) -- "宁可响亮崩也不静默错".
+  - jvp on native complex64 (holomorphic and non-holomorphic, elementwise and full
+    reduction to a 0-d output, real-input/complex-output, multi-input pytree,
+    create_graph True/False, zero tangent, unused input) matches a numpy
+    finite-difference oracle of the real-linear directional derivative
+    (f(z+eps*v)-f(z-eps*v))/(2*eps) -- well-defined for non-holomorphic f too.
+  - A real-valued loss of a complex variable differentiated TWICE (native complex
+    double-backward, the same machinery jvp's double-backward trick uses) is finite and
+    matches the closed form.
   - jvp on the legacy ComplexNumber path STILL works (regression guard).
-  - jvp on native REAL Vars still works (the guard only trips on native complex).
+  - jvp on native REAL Vars still works.
 
 No real torch in this env: numpy is the oracle.
 
-Scope notes (limitations of native complex64 itself, NOT of gradfunctional):
-  - jvp can't run on native complex64 because there is no second-order autograd for the
-    dtype yet (the double-backward needs a complex64->float32 cast-backward). gradfunctional
-    detects this and raises NotImplementedError instead of an opaque C++ compile error.
-  - vjp with a *real* input feeding a complex output (so the input grad must be cast from
-    complex64 back to float32) hits the same missing cast-backward in the op layer; that is
-    outside gradfunctional's control, so it is intentionally not exercised here. All-complex
-    and all-real input tuples work; those are what we lock.
+History (native complex64 jvp used to raise NotImplementedError here, believed to need
+an unimplemented complex64->float32 cast-backward): the double-backward machinery itself
+was already correct. Two unrelated real bugs made it LOOK broken, both now fixed at the
+source (not worked around in gradfunctional):
+  1. nn.py::_real2_to_complex64_raw used a stale ``list(shape[:-1]) or [1]`` fallback
+     (pre-dating §3.1's real 0-d Var support) that silently turned a genuinely 0-d
+     complex64 gradient into shape (1,) -- this broke ANY backward (not just jvp) through
+     .real/.imag of a full-reduction complex64 result.
+  2. py_converter.h's ItemData->PyObject conversion had no complex64 case, so ``.item()``
+     on a complex64 scalar silently reinterpreted the raw bytes as an int64.
 
 Run:  python -m jittor.test.test_complex64_gradfunctional
 """
@@ -193,28 +201,208 @@ class TestComplex64GradFunctional(unittest.TestCase):
                                        err_msg=f"two-complex grad y {dev}")
         both_devices(body)
 
-    # --------------------------------------------------- jvp: native complex -> raises
-    def test_jvp_native_complex_raises(self):
+    # --------------------------------------------- jvp: native complex64 -> numeric pass
+    # jittor-core-gaps.md §3.3. Previously native complex64 jvp raised NotImplementedError
+    # (the double-backward trick was believed to need an unimplemented complex64->float32
+    # cast-backward). It turns out the double-backward machinery itself was already
+    # correct; two unrelated real bugs made it LOOK broken and are now fixed at the
+    # source (not worked around here):
+    #   1. nn.py::_real2_to_complex64_raw used a stale ``list(x.shape[:-1]) or [1]``
+    #      fallback (pre-dating jittor-core-gaps.md §3.1's real 0-d Var support), which
+    #      silently turned a genuinely 0-d complex64 gradient into shape (1,) -- this
+    #      broke ANY backward (not just jvp's double-backward) through .real/.imag of a
+    #      full-reduction (e.g. ``x.sum()``) complex64 result.
+    #   2. py_converter.h's ItemData->PyObject conversion had no complex64 case, so
+    #      ``.item()`` on a complex64 scalar silently reinterpreted the raw 8-byte
+    #      (float32,float32) pair as an int64 bit pattern (returning a huge garbage int
+    #      instead of a python complex).
+    # A finite-difference oracle (numpy, real-linear directional derivative
+    # ``(f(z+eps*v) - f(z-eps*v)) / (2*eps)``) is used throughout: this is well-defined
+    # for holomorphic AND non-holomorphic f alike, unlike a closed-form Wirtinger formula.
+    def _fd_jvp(self, fnp, z, v, eps=1e-3):
+        return (fnp(z + eps * v) - fnp(z - eps * v)) / (2 * eps)
+
+    def test_jvp_native_complex_holomorphic(self):
+        # f(x) = exp(x).sum(1): elementwise holomorphic, reduced over one axis.
         rng = np.random.RandomState(3)
         s = (5, 6)
         a = _np_complex(rng, s)
-        vin = _np_complex(rng, s)        # jvp v matches input shape
+        vin = _np_complex(rng, s)
 
         def f(x):
             return x.exp().sum(1)
 
+        ref = self._fd_jvp(lambda z: np.exp(z).sum(1), a, vin)
+
         def body(dev):
-            with self.assertRaises(NotImplementedError):
-                jvp(f, jt.array(a), jt.array(vin), create_graph=True)
-            # also when complex appears only in the OUTPUT (real input -> complex out):
-            # real Var * complex64 Var promotes to complex64.
-            cone = jt.array(np.array(1.0 + 0.0j, dtype="complex64"))
-            def g(x):
-                return (x * cone).sum(1)
-            xr = rng.randn(*s).astype("float32")
-            vr = rng.randn(*s).astype("float32")
-            with self.assertRaises(NotImplementedError):
-                jvp(g, jt.array(xr), jt.array(vr), create_graph=True)
+            out, j = jvp(f, jt.array(a), jt.array(vin), create_graph=True)
+            self.assertEqual(str(out.dtype), "complex64", f"out dtype {dev}")
+            self.assertEqual(str(j.dtype), "complex64", f"jvp dtype {dev}")
+            self.assertEqual(tuple(j.shape), (5,), f"jvp shape {dev}")
+            got = np.asarray(j.numpy())
+            self.assertTrue(np.isfinite(got).all(), f"jvp finite {dev}")
+            np.testing.assert_allclose(got, ref, atol=5e-2, rtol=5e-2,
+                                       err_msg=f"jvp(exp) vs finite-diff {dev}")
+        both_devices(body)
+
+    def test_jvp_native_complex_nonholomorphic(self):
+        # conj(z) is the canonical non-holomorphic example (df/dz = 0, df/dz* = 1).
+        rng = np.random.RandomState(7)
+        s = (4, 5)
+        a = _np_complex(rng, s)
+        vin = _np_complex(rng, s)
+
+        def f(x):
+            return x.conj().sum()          # full reduction -> real 0-d complex64 output
+
+        ref = self._fd_jvp(lambda z: np.conj(z).sum(), a, vin)
+
+        def body(dev):
+            out, j = jvp(f, jt.array(a), jt.array(vin), create_graph=True)
+            self.assertEqual(tuple(out.shape), (), f"out shape (0-d) {dev}")
+            self.assertEqual(tuple(j.shape), (), f"jvp shape (0-d) {dev}")
+            got = complex(j.item())
+            self.assertTrue(np.isfinite(got), f"jvp finite {dev}")
+            np.testing.assert_allclose(got, ref, atol=5e-2, rtol=5e-2,
+                                       err_msg=f"jvp(conj) vs finite-diff {dev}")
+        both_devices(body)
+
+    def test_jvp_native_real_input_complex_output(self):
+        # complex appears only in the OUTPUT: a real Var times a complex64 constant
+        # promotes to complex64 (this is the case the old guard special-cased and
+        # raised on; it now numerically passes like everything else).
+        rng = np.random.RandomState(3)
+        s = (5, 6)
+        cone = jt.array(np.array(0.6 + 0.8j, dtype="complex64"))
+        cone_np = complex(cone.item())
+
+        def g(x):
+            return (x * cone).sum(1)
+
+        xr = rng.randn(*s).astype("float32")
+        vr = rng.randn(*s).astype("float32")
+        ref = self._fd_jvp(lambda z: (z * cone_np).sum(1), xr.astype("complex64"),
+                           vr.astype("complex64"))
+
+        def body(dev):
+            out, j = jvp(g, jt.array(xr), jt.array(vr), create_graph=True)
+            self.assertEqual(str(out.dtype), "complex64", f"out dtype {dev}")
+            self.assertEqual(tuple(j.shape), (5,), f"jvp shape {dev}")
+            got = np.asarray(j.numpy())
+            np.testing.assert_allclose(got, ref, atol=5e-2, rtol=5e-2,
+                                       err_msg=f"real-input jvp vs finite-diff {dev}")
+        both_devices(body)
+
+    def test_jvp_native_multi_input(self):
+        # pytree (tuple) inputs: f(a,b) = (a*b).sum(); jvp = sum(da*b + a*db) at (v1,v2).
+        rng = np.random.RandomState(11)
+        s = (3, 4)
+        x1 = _np_complex(rng, s)
+        x2 = _np_complex(rng, s)
+        v1 = _np_complex(rng, s)
+        v2 = _np_complex(rng, s)
+
+        def f(a, b):
+            return (a * b).sum()
+
+        ref = (self._fd_jvp(lambda a: (a * x2).sum(), x1, v1)
+               + self._fd_jvp(lambda b: (x1 * b).sum(), x2, v2))
+
+        def body(dev):
+            # jt.gradfunctional.jvp sums contributions across a tuple of inputs into a
+            # SINGLE jvp result per output (matches torch.autograd.functional.jvp).
+            out, j = jvp(f, (jt.array(x1), jt.array(x2)), (jt.array(v1), jt.array(v2)),
+                        create_graph=True)
+            got = complex(j.item())
+            np.testing.assert_allclose(got, ref, atol=5e-2, rtol=5e-2,
+                                       err_msg=f"multi-input jvp vs finite-diff {dev}")
+        both_devices(body)
+
+    def test_jvp_native_create_graph_false_matches_true(self):
+        rng = np.random.RandomState(13)
+        s = (4, 5)
+        a = _np_complex(rng, s)
+        vin = _np_complex(rng, s)
+
+        def f(x):
+            return (x * x).sum(1)          # holomorphic, non-trivial (not just linear)
+
+        def body(dev):
+            _, j_true = jvp(f, jt.array(a), jt.array(vin), create_graph=True)
+            _, j_false = jvp(f, jt.array(a), jt.array(vin), create_graph=False)
+            np.testing.assert_allclose(
+                np.asarray(j_true.numpy()), np.asarray(j_false.numpy()),
+                atol=1e-5, rtol=1e-5,
+                err_msg=f"create_graph=True/False value mismatch {dev}")
+        both_devices(body)
+
+    def test_jvp_native_zero_tangent_is_zero(self):
+        rng = np.random.RandomState(17)
+        s = (3, 3)
+        a = _np_complex(rng, s)
+        vzero = np.zeros(s, dtype="complex64")
+
+        def f(x):
+            return x.exp().sum()
+
+        def body(dev):
+            _, j = jvp(f, jt.array(a), jt.array(vzero), create_graph=True)
+            got = complex(j.item())
+            self.assertEqual(got, 0j, f"zero tangent -> zero jvp {dev}")
+        both_devices(body)
+
+    def test_jvp_native_unused_input_is_zero(self):
+        # strict=False (default): an input the output doesn't depend on gets a zero jvp
+        # instead of raising.
+        rng = np.random.RandomState(19)
+        s = (3,)
+        x1 = _np_complex(rng, s)
+        x2 = _np_complex(rng, s)
+        v1 = _np_complex(rng, s)
+        v2 = _np_complex(rng, s)
+
+        def f(a, b):
+            return (a * a).sum()           # does not depend on b
+
+        def body(dev):
+            out, j = jvp(f, (jt.array(x1), jt.array(x2)), (jt.array(v1), jt.array(v2)),
+                        create_graph=True)
+            ref = self._fd_jvp(lambda a: (a * a).sum(), x1, v1)
+            got = complex(j.item())
+            np.testing.assert_allclose(got, ref, atol=5e-2, rtol=5e-2,
+                                       err_msg=f"unused-input jvp {dev}")
+        both_devices(body)
+
+    def test_hessian_of_real_complex_loss_via_nested_grad(self):
+        # A real-valued loss of a complex variable, L(z) = |z|^2 = z * conj(z). jittor's
+        # native jt.grad follows the same convention as PyTorch: for a real L,
+        # z.grad = 2 * dL/dconj(z); holding z fixed, dL/dconj(z) = z, so grad = 2*z.
+        # Verify the SECOND jt.grad call (double backward through the native complex
+        # graph, the same machinery jvp's double-backward trick relies on) is finite
+        # and matches that closed form applied twice: differentiating
+        # (g1.real + g1.imag).sum() = 2*sum(Re z + Im z) a second time w.r.t. z
+        # reproduces 2*(1+1j) per element (the same "grad = 2 * d(.)/dconj(z)" rule).
+        rng = np.random.RandomState(23)
+        s = (3, 4)
+        a = _np_complex(rng, s)
+
+        def body(dev):
+            x = jt.array(a)
+            x.requires_grad = True
+            with jt.enable_grad():
+                loss = (x * x.conj()).real.sum()
+                g1 = jt.grad(loss, [x], retain_graph=True)[0]
+                proxy = (g1.real + g1.imag).sum()
+                g2 = jt.grad(proxy, [x], retain_graph=True)[0]
+            g1np = np.asarray(g1.numpy())
+            g2np = np.asarray(g2.numpy())
+            self.assertTrue(np.isfinite(g1np).all(), f"1st-order grad finite {dev}")
+            self.assertTrue(np.isfinite(g2np).all(), f"2nd-order grad finite {dev}")
+            np.testing.assert_allclose(g1np, 2 * a, atol=2e-3, rtol=2e-3,
+                                       err_msg=f"d|z|^2/dz == 2*z {dev}")
+            np.testing.assert_allclose(
+                g2np, np.full(s, 2 + 2j, dtype="complex64"), atol=2e-3, rtol=2e-3,
+                err_msg=f"2nd-order grad closed form {dev}")
         both_devices(body)
 
     # ----------------------------------------------- jvp: native REAL still works

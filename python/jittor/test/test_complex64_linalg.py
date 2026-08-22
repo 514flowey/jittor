@@ -87,6 +87,155 @@ class _Mixin:
         rec = _dot(_dot(un, _diag_embed(sn)), vhn)
         np.testing.assert_allclose(rec, a, atol=1e-3, rtol=1e-3)
 
+    # ---------------------------------------------- svd backward (jittor-core-gaps.md §3.4)
+    # Complex SVD/eigh backward were previously `raise NotImplementedError`. A per-column
+    # unitary phase (u_i -> e^{i theta} u_i, v_i -> e^{i theta} v_i, A = U S V^H invariant)
+    # is a genuine gauge freedom the analytic formula cannot resolve, matching torch's own
+    # documented limitation -- so these gradchecks use PHASE-INVARIANT losses (reconstruction:
+    # U@diag(S)@Vh, or V@diag(w)@V^H for eigh), which is also what real workloads use
+    # (MPS truncation, VQE energies, density matrices), not raw per-vector cotangents.
+    def _fd_grad(self, fnp, a, loss_np, eps=1e-3):
+        g = np.zeros_like(a)
+        for idx in np.ndindex(*a.shape):
+            ar = a.copy(); ar[idx] += eps
+            am = a.copy(); am[idx] -= eps
+            dr = (loss_np(fnp(ar)) - loss_np(fnp(am))) / (2 * eps)
+            ai = a.copy(); ai[idx] += eps * 1j
+            aim = a.copy(); aim[idx] -= eps * 1j
+            di = (loss_np(fnp(ai)) - loss_np(fnp(aim))) / (2 * eps)
+            g[idx] = dr + 1j * di
+        return g
+
+    def _svd_recon_gradcheck(self, shape, seed):
+        rng = np.random.RandomState(seed)
+        a = (rng.randn(*shape) + 1j * rng.randn(*shape)).astype("complex64")
+        p = (rng.randn(*shape) + 1j * rng.randn(*shape)).astype("complex64") * 0.1
+
+        def fnp(anp):
+            u, s, vh = np.linalg.svd(anp, full_matrices=False)
+            return (u @ np.diag(s) @ vh if anp.ndim == 2 else
+                    np.einsum("...ik,...k,...kj->...ij", u, s, vh))
+        def loss_np(rec):
+            return float(np.real(np.sum(rec * np.conj(p))))
+        ref = self._fd_grad(fnp, a, loss_np)
+
+        x = _to_complex64_var(a)
+        x.requires_grad = True
+        with jt.enable_grad():
+            u, s, vh = linalg.svd(x, full_matrices=False)
+            rec = jt.matmul(u * s.unsqueeze(-2), vh)
+            loss = (rec * _to_complex64_var(p).conj()).real.sum()
+            g = jt.grad(loss, [x])[0]
+        got = _np(g)
+        np.testing.assert_allclose(got, ref, atol=3e-2, rtol=3e-2,
+                                   err_msg=f"svd backward vs finite-diff, shape={shape}")
+
+    def test_svd_backward_square(self):
+        self._svd_recon_gradcheck((4, 4), 0)
+
+    def test_svd_backward_tall(self):
+        self._svd_recon_gradcheck((6, 3), 1)
+
+    def test_svd_backward_wide(self):
+        self._svd_recon_gradcheck((3, 6), 2)
+
+    def test_svd_backward_batched(self):
+        self._svd_recon_gradcheck((2, 3, 3), 3)
+
+    def test_svd_backward_singular_values_real_dtype(self):
+        # §3.4 design note: S must carry a gradient consistently even though it is
+        # mathematically real (the native-complex bridge represents it as complex64
+        # with imag~0); this locks that the S-only branch alone is correct and finite.
+        rng = np.random.RandomState(9)
+        a = (rng.randn(4, 4) + 1j * rng.randn(4, 4)).astype("complex64")
+        w = rng.randn(4).astype("float32") * 0.1
+        def fnp(anp):
+            return np.linalg.svd(anp, compute_uv=False)
+        def loss_np(s):
+            return float(np.sum(s * w))
+        ref = self._fd_grad(fnp, a, loss_np)
+        x = _to_complex64_var(a)
+        x.requires_grad = True
+        with jt.enable_grad():
+            s = linalg.svdvals(x)
+            loss = (s.real * jt.array(w)).sum()
+            g = jt.grad(loss, [x])[0]
+        got = _np(g)
+        self.assertTrue(np.isfinite(got).all())
+        np.testing.assert_allclose(got, ref, atol=3e-2, rtol=3e-2)
+
+    # --------------------------------------------- eigh backward (jittor-core-gaps.md §3.4)
+    def test_eigh_backward_eigenvalue_only(self):
+        rng = np.random.RandomState(10)
+        b = (rng.randn(4, 4) + 1j * rng.randn(4, 4)).astype("complex64")
+        a = (b + b.conj().T) / 2
+        ws = rng.randn(4).astype("float32")
+        def fnp(anp):
+            return np.linalg.eigh(anp, UPLO="L")[0]
+        def loss_np(w):
+            return float(np.sum(w * ws))
+        ref = self._fd_grad(fnp, a, loss_np)
+        x = _to_complex64_var(a)
+        x.requires_grad = True
+        with jt.enable_grad():
+            w, v = linalg.eigh(x)
+            loss = (w.real * jt.array(ws)).sum()
+            g = jt.grad(loss, [x])[0]
+        got = _np(g)
+        np.testing.assert_allclose(got, ref, atol=3e-2, rtol=3e-2)
+
+    def test_eigh_backward_eigenvector_dependent(self):
+        rng = np.random.RandomState(11)
+        b = (rng.randn(5, 5) + 1j * rng.randn(5, 5)).astype("complex64")
+        a = (b + b.conj().T) / 2
+        p = (rng.randn(5, 5) + 1j * rng.randn(5, 5)).astype("complex64") * 0.1
+        def fnp(anp):
+            w, v = np.linalg.eigh(anp, UPLO="L")
+            return v @ np.diag(w) @ v.conj().T
+        def loss_np(rec):
+            return float(np.real(np.sum(rec * np.conj(p))))
+        ref = self._fd_grad(fnp, a, loss_np)
+        x = _to_complex64_var(a)
+        x.requires_grad = True
+        with jt.enable_grad():
+            w, v = linalg.eigh(x)
+            rec = jt.matmul(v * w.unsqueeze(-2), v.conj().transpose(-1, -2))
+            loss = (rec * _to_complex64_var(p).conj()).real.sum()
+            g = jt.grad(loss, [x])[0]
+        got = _np(g)
+        np.testing.assert_allclose(got, ref, atol=3e-2, rtol=3e-2)
+
+    # ----------------------------------------------- qr shape/backward (jittor-core-gaps.md §3.4)
+    def test_qr_tall_forward_and_backward(self):
+        rng = np.random.RandomState(12)
+        shape = (6, 3)
+        a = (rng.randn(*shape) + 1j * rng.randn(*shape)).astype("complex64")
+        z = _to_complex64_var(a)
+        q, r = linalg.qr(z)
+        self.assertEqual(tuple(q.shape), (6, 3))
+        self.assertEqual(tuple(r.shape), (3, 3))
+        qn, rn = _np(q), _np(r)
+        np.testing.assert_allclose(_dot(qn, rn), a, atol=1e-3, rtol=1e-3)
+        qhq = _dot(np.conj(np.swapaxes(qn, -1, -2)), qn)
+        np.testing.assert_allclose(qhq, np.eye(3), atol=1e-3, rtol=1e-3)
+
+        p = (rng.randn(*shape) + 1j * rng.randn(*shape)).astype("complex64") * 0.1
+        def fnp(anp):
+            qq, rr = np.linalg.qr(anp)
+            return qq @ rr
+        def loss_np(rec):
+            return float(np.real(np.sum(rec * np.conj(p))))
+        ref = self._fd_grad(fnp, a, loss_np)
+        x = _to_complex64_var(a)
+        x.requires_grad = True
+        with jt.enable_grad():
+            qb, rb = linalg.qr(x)
+            rec = jt.matmul(qb, rb)
+            loss = (rec * _to_complex64_var(p).conj()).real.sum()
+            g = jt.grad(loss, [x])[0]
+        got = _np(g)
+        np.testing.assert_allclose(got, ref, atol=3e-2, rtol=3e-2)
+
     def test_svdvals(self):
         rng = np.random.RandomState(2)
         a = (rng.randn(4, 4) + 1j * rng.randn(4, 4))

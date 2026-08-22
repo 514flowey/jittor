@@ -510,6 +510,15 @@ DEF_IS(ItemData, PyObject*) to_py_object(T a) {
         return PyLong_FromLongLong((int64)*(int16*)&a.data);
     if (a.dtype == ns_int8)
         return PyLong_FromLongLong((int64)*(int8*)&a.data);
+    if (a.dtype == ns_complex64) {
+        // complex64 is {float real, imag;} (8 bytes), the same size as ItemData::data,
+        // so it round-trips through the raw int64 buffer like every other scalar dtype
+        // here -- but must be reinterpreted as two float32, not as an integer bit pattern
+        // (the fallthrough below would silently return a garbage huge int, see
+        // jittor-core-gaps.md §3.3).
+        auto* f = (float32*)&a.data;
+        return PyComplex_FromDoubles((double)f[0], (double)f[1]);
+    }
     return PyLong_FromLongLong(a.data);
 }
 

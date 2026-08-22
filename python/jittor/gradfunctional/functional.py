@@ -424,21 +424,14 @@ def jvp(func, inputs, v=None, create_graph=False, strict=False):
 
         # jvp is implemented with the "double backward trick" (there is no forward-mode
         # AD in jittor): it differentiates a *first* backward graph a second time. Native
-        # complex64 Vars do not yet support second-order autograd -- the second backward
-        # needs a complex64->float32 cast-backward that the native complex machinery does
-        # not implement, which otherwise surfaces as an opaque C++ compile error deep in
-        # _autograd_grad. Fail loudly and early instead ("宁可响亮崩也不静默错"). The legacy
-        # jt.nn.ComplexNumber path keeps working (its double backward is over the all-real
-        # (real, imag) representation), and native complex64 fully works through vjp.
-        if any(_is_native_complex(x) for x in inputs) or any(
-            _is_native_complex(o) for o in outputs
-        ):
-            raise NotImplementedError(
-                "jvp does not support native complex64 Vars: it relies on the double "
-                "backward trick, and native complex64 has no second-order autograd yet. "
-                "Use vjp (which supports native complex64), or wrap complex tensors in "
-                "jt.nn.ComplexNumber for the legacy real/imag-pair jvp path."
-            )
+        # complex64 Vars DO support this (jittor-core-gaps.md §3.3): the two real bugs that
+        # used to break it were in the (real,imag) bridge (nn.py::_real2_to_complex64_raw
+        # collapsing a genuinely 0-d complex result's shape to (1,) via a stale
+        # ``or [1]`` fallback) and in ItemData->PyObject conversion (py_converter.h missing
+        # a complex64 case, silently reinterpreting the raw bytes as an int64) -- neither
+        # was specific to jvp, both are now fixed at the source. The legacy
+        # jt.nn.ComplexNumber path keeps working too (its double backward is over the
+        # all-real (real, imag) representation).
 
         # The backward is linear so the value of grad_outputs is not important as
         # it won't appear in the double backward graph. We only need to ensure that

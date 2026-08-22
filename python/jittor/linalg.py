@@ -153,7 +153,57 @@ def complex_eigh(x:ComplexNumber):
         np.copyto(v, _complex_to_stack(tv))
 
     def backward_code(np, data):
-        raise NotImplementedError
+        # Hermitian eigh backward: adapt the real `eigh` formula above (T -> H,
+        # conjugate transpose), with the SAME off-diagonal masking that formula
+        # already uses (each eigenvector is only defined up to a per-column
+        # unit-phase factor -- the complex analogue of the real +-1 sign
+        # ambiguity -- so `V^H dV`'s diagonal is gauge freedom that must not
+        # leak into the gradient), PLUS a fold that the real formula does not
+        # need: `eigh` only READS the lower triangle (UPLO='L'), i.e. it treats
+        # A as the logical Hermitian matrix tril(A) + tril(A,-1)^H. A lower-
+        # triangle entry A_ij (i>j) therefore influences the eigendecomposition
+        # through BOTH the direct (i,j) position AND the conjugate-mirrored
+        # (j,i) position, so its true gradient is `t_ij + conj(t_ji)` (twice
+        # the Hermitian-symmetric part), while a diagonal entry contributes
+        # only once (`Re(t_ii)`, not doubled) and the (unread) upper triangle
+        # gets none. For real matrices this fold is invisible because `t`
+        # from a real dout is already exactly symmetric; for complex it is
+        # not, and skipping the fold is a genuine (verified) bug, not a
+        # cosmetic omission -- confirmed against a numpy finite-difference
+        # oracle for both branches, eigenvalue-only and eigenvector-dependent.
+        def H(x):
+            return np.conj(np.swapaxes(x, -1, -2))
+        def _stack_to_complex(x):
+            return x[..., 0] + 1j * x[..., 1]
+        def _complex_to_stack(x):
+            return np.stack([np.real(x), np.imag(x)], axis=-1)
+        def _fold_lower(t):
+            k_ = t.shape[-1]
+            diag = np.real(np.einsum('...ii->...i', t))
+            out_ = np.tril(t + H(t), -1)
+            idx = np.arange(k_)
+            out_[..., idx, idx] = diag
+            return out_
+        _dot = partial(np.einsum, '...ij,...jk->...ik')
+        dout = _stack_to_complex(data["dout"])
+        out = data["outputs"][0]
+        out_index = data["out_index"]
+        w, v = data["f_outputs"]
+        w = np.real(_stack_to_complex(w))
+        v = _stack_to_complex(v)
+        k = v.shape[-1]
+        w_repeated = np.repeat(w[..., np.newaxis], k, axis=-1)
+        if out_index == 0:
+            t = _dot(v * dout[..., np.newaxis, :], H(v))
+            np.copyto(out, _complex_to_stack(_fold_lower(t)))
+        elif out_index == 1:
+            if np.any(dout):
+                off_diag = np.ones((k, k)) - np.eye(k)
+                F = off_diag / (np.swapaxes(w_repeated, -1, -2) - w_repeated + np.eye(k))
+                t = _dot(_dot(v, F * _dot(H(v), dout)), H(v))
+                np.copyto(out, _complex_to_stack(_fold_lower(t)))
+            else:
+                np.copyto(out, np.zeros_like(out))
 
     sw = x.shape[:-2] + x.shape[-1:] + (2,)
     sv = x.value.shape
@@ -169,26 +219,38 @@ def complex_eigh(x:ComplexNumber):
 def complex_qr(x):
     r"""
     do the qr factorization of x in the below formula:
-    x = QR where Q is orthogonal matrix and R is upper-triangle matrix.
-    :param x (...,M,M):
-    :return:q,r as the result of qr factorization.They are both in the shape of (...,M,M).
+    x = QR where Q has orthonormal columns and R is upper-triangular.
+    :param x (...,M,N), M>=N (reduced/"economy" QR; M<N is not supported --
+        the backward relies on R being square and invertible, which only
+        holds for the tall/square case):
+    :return: q (...,M,N), r (...,N,N).
     """
     assert isinstance(x, ComplexNumber), "linalg_qr is implemented for nn.ComplexNumber"
     assert x.real.dtype == jt.float32 and x.imag.dtype == jt.float32, "real and imag in ComplexNumber should be jt.float32"
-    assert x.shape[-2] == x.shape[-1], "only square matrix is supported for linalg_qr"
+    m, n = x.shape[-2:]
+    assert m >= n, (
+        f"complex_qr only supports M>=N (reduced QR of a tall/square matrix), got shape {tuple(x.shape)}. "
+        "R is square (N,N) only in this case; M<N (wide) reduced QR has no square-R backward here."
+    )
     def forward_code(np, data):
         def _stack_to_complex(x):
             return x[..., 0] + 1j * x[..., 1]
         def _complex_to_stack(x):
             return np.stack([np.real(x), np.imag(x)], axis=-1)
         a = _stack_to_complex(data["inputs"][0])
-        qr = data["outputs"][0]
+        q_out, r_out = data["outputs"]
         Q, R = np.linalg.qr(a)
-        QR = np.stack([Q, R], axis=0)
-        np.copyto(qr, _complex_to_stack(QR))
+        np.copyto(q_out, _complex_to_stack(Q))
+        np.copyto(r_out, _complex_to_stack(R))
 
     def backward_code(np, data):
         # reference: https://github.com/tencent-quantum-lab/tensorcircuit/blob/master/tensorcircuit/backends/pytorch_ops.py
+        # Linear in (dq, dr) jointly (no dq*dr cross terms), so a multi-output
+        # numpy_code -- one out_index per Q/R, each called with the OTHER
+        # cotangent zeroed -- sums to the same total gradient as the original
+        # single combined-output call. Verified for M>N (tall) and M==N
+        # (square), batched and unbatched, against a numpy finite-difference
+        # oracle.
         def H(x):
             return np.conj(np.swapaxes(x, -1, -2))
         def _TriangularSolve(x, r):
@@ -200,14 +262,14 @@ def complex_qr(x):
         _dot = partial(np.einsum, '...ij,...jk->...ik')
         _diag = partial(np.einsum, '...ii->...i')
 
-        dout = data["dout"]
+        dout = _stack_to_complex(data["dout"])
         out = data["outputs"][0]
-        qr = data["f_outputs"][0]
-        dout = _stack_to_complex(dout)
-        dq, dr = dout[0], dout[1]
-        qr = _stack_to_complex(qr)
-        q, r = qr[0], qr[1]
-
+        out_index = data["out_index"]
+        q, r = data["f_outputs"]
+        q = _stack_to_complex(q)
+        r = _stack_to_complex(r)
+        dq = dout if out_index == 0 else np.zeros_like(q)
+        dr = dout if out_index == 1 else np.zeros_like(r)
 
         qdq = _dot(H(q), dq)
         qdq_ = qdq - H(qdq)
@@ -219,23 +281,23 @@ def complex_qr(x):
         grad_b = _TriangularSolve(dq - _dot(q, qdq), r)
         ret = grad_a + grad_b
 
-        m = rdr - H(qdq)
-        eyem = np.zeros_like(m)
-        _diag(eyem)[:] = _diag(m)
+        m_ = rdr - H(qdq)
+        eyem = np.zeros_like(m_)
+        _diag(eyem)[:] = _diag(m_)
         correction = eyem - np.real(eyem)
         ret = ret + _TriangularSolve(_dot(q, H(correction)), r)
-        
-        ret = _complex_to_stack(ret)
-        np.copyto(out,ret)
 
-    qr = jt.numpy_code(
-        (2,) + x.value.shape,
-        x.value.dtype,
+        np.copyto(out, _complex_to_stack(ret))
+
+    sq = list(x.shape[:-2]) + [m, n, 2]
+    sr = list(x.shape[:-2]) + [n, n, 2]
+    q, r = jt.numpy_code(
+        [sq, sr],
+        [x.value.dtype, x.value.dtype],
         [x.value],
         forward_code,
         [backward_code],
     )
-    q, r = qr[0], qr[1]
     return ComplexNumber(q, is_concat_value=True), ComplexNumber(r, is_concat_value=True)
 
 def complex_svd(x:ComplexNumber):
@@ -265,7 +327,65 @@ def complex_svd(x:ComplexNumber):
         np.copyto(v, _complex_to_stack(tv))
 
     def backward_code(np, data):
-        raise NotImplementedError
+        # Complex SVD backward: the real `_svd_reduced` formula above, extended
+        # with T -> H (conjugate transpose). Each singular vector pair (u_i, v_i)
+        # has a free simultaneous phase u_i -> e^{i theta} u_i, v_i -> e^{i theta}
+        # v_i (A = U S V^H is invariant), so U^H dU and V^H dV -- unlike the real
+        # case, where U^T dU - dU^T U is antisymmetric with a structurally-zero
+        # diagonal -- have a generically NONZERO purely-imaginary diagonal. That
+        # diagonal is gauge freedom (mirrors complex_eigh's `off_diag` masking and
+        # complex_qr's phase `correction` term above) and must be dropped before
+        # the antisymmetric F-weighting, else it leaks a spurious contribution
+        # into dA. Verified against a numpy finite-difference oracle for U/S/Vh
+        # separately, non-square (tall/wide) and square, batched and unbatched.
+        def H(x):
+            return np.conj(np.swapaxes(x, -1, -2))
+        def _stack_to_complex(x):
+            return x[..., 0] + 1j * x[..., 1]
+        def _complex_to_stack(x):
+            return np.stack([np.real(x), np.imag(x)], axis=-1)
+        def _drop_diag(x):
+            k_ = x.shape[-1]
+            return x * (np.ones((k_, k_)) - np.eye(k_))
+        _dot = partial(np.einsum, '...ij,...jk->...ik')
+        dout = _stack_to_complex(data["dout"])
+        out = data["outputs"][0]
+        inp = _stack_to_complex(data["inputs"][0])
+        out_index = data["out_index"]
+        u, s, v = data["f_outputs"]
+        u = _stack_to_complex(u)
+        s = np.real(_stack_to_complex(s))
+        v = H(_stack_to_complex(v))          # (...,n,k), matches _svd_reduced's `v`
+        m, n = inp.shape[-2:]
+        k = min(m, n)
+        i = np.reshape(np.eye(k), (1,) * (inp.ndim - 2) + (k, k))
+        if out_index == 0:
+            f = 1 / (s[..., np.newaxis, :] ** 2 - s[..., :, np.newaxis] ** 2 + i)
+            gu = dout
+            utgu = _drop_diag(_dot(H(u), gu))
+            t = (f * (utgu - H(utgu))) * s[..., np.newaxis, :]
+            t = _dot(_dot(u, t), H(v))
+            if m > n:
+                i_minus_uut = (np.reshape(np.eye(m), (1,) * (inp.ndim - 2) + (m, m)) -
+                               _dot(u, H(u)))
+                t = t + H(_dot(_dot(v / s[..., np.newaxis, :], H(gu)), i_minus_uut))
+            np.copyto(out, _complex_to_stack(t))
+        elif out_index == 1:
+            gs = dout
+            t = i * gs[..., :, np.newaxis]
+            t = _dot(_dot(u, t), H(v))
+            np.copyto(out, _complex_to_stack(t))
+        elif out_index == 2:
+            f = 1 / (s[..., np.newaxis, :] ** 2 - s[..., :, np.newaxis] ** 2 + i)
+            gv = dout                        # grad wrt the (...,k,n) Vh output
+            vtgv = _drop_diag(_dot(H(v), H(gv)))
+            t = s[..., :, np.newaxis] * (f * (vtgv - H(vtgv)))
+            t = _dot(_dot(u, t), H(v))
+            if m < n:
+                i_minus_vvt = (np.reshape(np.eye(n), (1,) * (inp.ndim - 2) + (n, n)) -
+                               _dot(v, H(v)))
+                t = t + _dot(_dot(u / s[..., np.newaxis, :], gv), i_minus_vvt)
+            np.copyto(out, _complex_to_stack(t))
 
     m, n = x.shape[-2:]
     k = min(m, n)
@@ -1237,9 +1357,10 @@ def solve(a,b):
 def qr(x):
     r"""
     do the qr factorization of x in the below formula:
-    x = QR where Q is orthogonal matrix and R is upper-triangle matrix.
-    :param x (...,M,M):
-    :return:q,r as the result of qr factorization.They are both in the shape of (...,M,M).
+    x = QR where Q has orthonormal columns and R is upper-triangular.
+    :param x (...,M,N): forward works for any M, N; backward requires M>=N
+        (tall or square -- R is only square, hence invertible, in that case).
+    :return: q (...,M,K), r (...,K,N), K=min(M,N).
     """
     if _is_native_complex(x):
         # native complex64 -> bridge to the ComplexNumber path, return native.
