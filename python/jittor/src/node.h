@@ -47,6 +47,9 @@ struct NodeFlags {
         _th_require_grad=_n+5,
         _is_scalar=_n+5,
         _is_swapped=_n+6,
+        // bit13-18: explicit device pin. 0=unset(inherit ambient device),
+        // 1=explicit CPU, 2+k=explicit GPU k. See var.h device_pin()/set_device_pin().
+        _device_tag=_n+7, _device_tag_nbits=6,
 
         // op related flags
         // bit0: support cpu

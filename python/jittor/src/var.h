@@ -15,6 +15,12 @@ namespace jittor {
 constexpr size_t alignment = 32;
 struct VarHolder;
 
+// Set once, process-lifetime, the first time any Var is ever explicitly
+// device-pinned (Var::set_device_pin). Lets executor.cc's resolve_op_device
+// short-circuit to its zero-overhead fast path for the overwhelmingly common
+// case where per-tensor device pinning is never used at all.
+EXTERN_LIB bool any_device_pin_ever;
+
 struct Var : Node {
     NanoVector shape;
     cstr name;
@@ -46,6 +52,17 @@ struct Var : Node {
     inline Op* output(uint i) { return Node::output(i)->op(); }
 
     Var(NanoVector shape, NanoString dtype);
+
+    // explicit device pin: -1 = CPU, 0..N = GPU index, -2 = unset (inherit ambient device)
+    inline bool has_device_pin() const { return flags.get(NodeFlags::_device_tag, NodeFlags::_device_tag_nbits) != 0; }
+    inline int device_pin() const {
+        auto t = flags.get(NodeFlags::_device_tag, NodeFlags::_device_tag_nbits);
+        return t == 0 ? -2 : (t == 1 ? -1 : (int)t - 2);
+    }
+    inline void set_device_pin(int device_id) {
+        flags.set(NodeFlags::_device_tag, device_id < 0 ? 1 : device_id + 2, NodeFlags::_device_tag_nbits);
+        any_device_pin_ever = true;
+    }
 
     string to_string();
     int64 numel();

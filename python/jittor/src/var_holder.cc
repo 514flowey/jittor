@@ -115,6 +115,8 @@ static inline void assign_var(Var* a, Var* b) {
         a->flags.set(NodeFlags::_stop_fuse);
     if (b->flags.get(NodeFlags::_th_require_grad))
         a->flags.set(NodeFlags::_th_require_grad);
+    if (b->has_device_pin())
+        a->set_device_pin(b->device_pin());
 }
 
 extern uint8 th_mode;

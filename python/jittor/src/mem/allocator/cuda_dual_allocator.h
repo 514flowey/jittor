@@ -42,6 +42,8 @@ struct CudaDualAllocator : Allocator {
     }
 
     uint64 flags() const override { return _cuda; }
+    // Data physically lives in cuda_dual_device_allocator's backing memory.
+    int device_id() const override { return cuda_dual_device_allocator.device_id(); }
     const char* name() const override { return "dual"; };
     void* alloc(size_t size, size_t& allocation) override {
         ASSERT(n_free_ids) << "id pool empty";
@@ -86,6 +88,7 @@ void to_free_allocation(CUDA_HOST_FUNC_ARGS);
 
 struct DelayFree final : Allocator {
     inline uint64 flags() const override { return _cuda; };
+    int device_id() const override { return cuda_dual_allocator.device_id(); }
     const char* name() const override { return "delay_free"; };
     void* alloc(size_t size, size_t& allocation) override { 
         LOGf << "Should not call this";

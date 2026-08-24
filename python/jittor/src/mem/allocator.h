@@ -18,6 +18,12 @@ struct Allocator {
     inline virtual uint64 flags() const { return 0; };
     inline bool is_cuda() const { return flags() & _cuda; }
     inline bool is_aligned() const { return flags() & _aligned; }
+    // Ground truth for "which physical GPU does this memory actually live
+    // on". -1 means CPU or an allocator that has no fixed device (e.g. the
+    // legacy ambient/global cuda allocator singletons). Overridden by
+    // per-device allocators (CudaDeviceAllocator) and forwarded by wrapping
+    // allocators (Stat/NFEF/Temp/SFRL) via their `underlying` pointer.
+    inline virtual int device_id() const { return -1; }
     virtual const char* name() const = 0;
     virtual void* alloc(size_t size, size_t& allocation) = 0;
     virtual void free(void* mem_ptr, size_t size, const size_t& allocation) = 0;
@@ -49,11 +55,19 @@ struct Allocation {
 };
 
 EXTERN_LIB Allocator* cpu_allocator;
-Allocator* get_allocator(bool temp_allocator=false);
+// device_id=-1 preserves today's exact ambient-flag-driven behavior. Passing
+// device_id>=0 requests the allocator pinned to that physical GPU (see
+// mem/allocator/cuda_device_allocator.h's get_cuda_device_allocator).
+Allocator* get_allocator(bool temp_allocator=false, int device_id=-1);
 // @pyjt(gc)
 void gc_all();
 
 void migrate_to_cpu(Var* var, Allocator* allocator);
 void migrate_to_gpu(Var* var, Allocator* allocator);
+// General cross-device migration used by VarHolder::migrate_to_device_().
+// target_device_id: -1 = CPU, 0..N = physical GPU index. Handles CPU<->GPU
+// (delegates to migrate_to_cpu/migrate_to_gpu) and GPU-to-GPU (stages
+// through a temporary host buffer; no P2P, correctness over speed).
+void migrate_to_device(Var* var, int target_device_id);
 
 } // jittor

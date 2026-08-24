@@ -12,6 +12,9 @@ namespace jittor {
 
 struct CudaManagedAllocator : Allocator {
     uint64 flags() const override { return _cuda; }
+    // Managed memory has no fixed owning device tracked here; report the
+    // process' actual current CUDA device rather than an inaccurate -1.
+    int device_id() const override;
     const char* name() const override;
     void* alloc(size_t size, size_t& allocation) override;
     void free(void* mem_ptr, size_t size, const size_t& allocation) override;

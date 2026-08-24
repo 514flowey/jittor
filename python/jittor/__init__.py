@@ -550,13 +550,56 @@ def clean():
 cast = unary
 Var.cast = Var.cast
 
-def array(data, dtype=None):
+def _resolve_device_id(device):
+    ''' Resolve a device spec (int, "cpu", "cuda", "cuda:N", "gpu:N", or a
+    torch_compat-style device object) to the integer form used by
+    Var.migrate_to_device(): -1 for CPU, 0..N for a physical GPU index
+    within the process' visible device set. Raises ValueError/IndexError on
+    an unrecognized spec or an out-of-range GPU index. '''
+    import builtins as _builtins_dev
+    if isinstance(device, _builtins_dev.int):
+        if device == -1:
+            return -1
+        idx = device
+    elif isinstance(device, str):
+        if device in ("cpu", "cpu:0"):
+            return -1
+        if device == "cuda":
+            # NB: this resolver always picks a concrete index (creation-time
+            # placement must land somewhere) -- unlike torch_compat.py's
+            # _device_index(), which returns None for a bare "cuda" to mean
+            # "no explicit override, keep the ambient placement" for an
+            # already-existing tensor. Different contracts for different call
+            # sites; not a bug, but don't assume they're interchangeable.
+            idx = 0
+        elif device.startswith("cuda:") or device.startswith("gpu:"):
+            idx = _builtins_dev.int(device.split(":", 1)[1])
+        else:
+            raise ValueError(f"Unsupported device spec: {device!r}")
+    elif hasattr(device, "type"):
+        # torch_compat.device-like object: has .type ("cpu"/"cuda") and .index
+        if device.type == "cpu":
+            return -1
+        idx = getattr(device, "index", None) or 0
+    else:
+        raise ValueError(f"Unsupported device spec: {device!r}")
+    if idx < 0 or idx >= core.get_device_count():
+        raise IndexError(f"GPU index {idx} out of range, "
+            f"process sees {core.get_device_count()} device(s)")
+    return idx
+
+def array(data, dtype=None, device=None):
     ''' Constructs a jittor Var from a number, List, numpy array or another jittor Var.
 
     :param data: The data to initialize the Var.
     :type data: number, list, numpy.ndarray, or jittor.Var.
     :param dtype: The data type of the Var. If None, the data type will be inferred from the data.
     :type dtype: str, jittor type-cast function, or None.
+    :param device: Explicit physical device to place the Var on (-1/"cpu",
+        0/"cuda:0", 1/"cuda:1", ...). If None, follows the ambient
+        jt.flags.use_cuda/device_id creation default, same as before this
+        parameter existed.
+    :type device: int, str, or None.
 
     ----------------
 
@@ -564,7 +607,7 @@ def array(data, dtype=None):
 
         >>> jt.array(1)
         jt.Var([1], dtype=int32)
-        >>> jt.array([0, 2.71, 3.14]) 
+        >>> jt.array([0, 2.71, 3.14])
         jt.Var([0.   2.71 3.14], dtype=float32)
         >>> jt.array(np.arange(4, dtype=np.uint8))
         jt.Var([0 1 2 3], dtype=uint8)
@@ -590,6 +633,8 @@ def array(data, dtype=None):
             ret = ops.array(np.array(data, dtype))
     else:
         ret = ops.array(data)
+    if device is not None:
+        ret = ret.migrate_to_device(_resolve_device_id(device))
     # TODO: move those code to core
     amp_reg = jt.flags.amp_reg
     if amp_reg and ret.numel() != 1 and ret.dtype.is_float():
@@ -1855,6 +1900,12 @@ class Module:
 
     def cuda(self, device=None):
         flags.use_cuda = 1
+        if device is not None:
+            idx = _resolve_device_id(device)
+            for p in self.parameters():
+                p.migrate_to_device(idx)
+            for _, b in self.named_buffers():
+                b.migrate_to_device(idx)
         return self
 
     def npu(self, device=None):

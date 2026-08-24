@@ -6,6 +6,7 @@
 // ***************************************************************
 #include <typeinfo>
 #include "misc/cuda_flags.h"
+#include "misc/cuda_guard.h"
 
 #include "mem/allocator/aligned_allocator.h"
 #ifdef HAS_CUDA
@@ -65,7 +66,7 @@ void setter_use_cuda_host_allocator(int value) {
 
 extern int64 sfrl_large_block_size_device;
 
-Allocator* get_allocator(bool temp_allocator) {
+Allocator* get_allocator(bool temp_allocator, int device_id) {
     Allocator* allocator = nullptr;
     if (use_cuda && sfrl_large_block_size_device >= (1ll<<40)) {
         // if super large block is used, don't use
@@ -75,8 +76,13 @@ Allocator* get_allocator(bool temp_allocator) {
 #ifdef HAS_CUDA
     if (use_cuda && !allocator) {
         if (use_cuda_managed_allocator) {
+            // Per-device pinning is not supported for the managed allocator
+            // (opt-in, off by default); explicit device_id is ignored here.
             LOGvv << "Using cuda_managed_allocator";
             allocator = &cuda_managed_allocator;
+        } else if (device_id >= 0) {
+            LOGvv << "Using per-device cuda_device_allocator" << device_id;
+            allocator = &get_cuda_device_allocator(device_id);
         } else {
             LOGvv << "Using cuda_device_allocator";
             allocator = &cuda_device_allocator;
@@ -180,6 +186,48 @@ void migrate_to_gpu(Var* var, Allocator* allocator) {
     var->allocation = a.allocation;
     var->allocator = a.allocator;
     a.ptr = nullptr;
+    #endif
+}
+
+void migrate_to_device(Var* var, int target_device_id) {
+    #ifdef HAS_CUDA
+    // Per-device pinning is not designed to compose with the managed
+    // allocator (get_allocator() above always routes it to the single
+    // process-wide cuda_managed_allocator, never a per-device instance) --
+    // fail loud rather than silently splitting the allocator population
+    // between pinned and managed Vars.
+    ASSERT(!use_cuda_managed_allocator) <<
+        "migrate_to_device() is not supported together with "
+        "use_cuda_managed_allocator; disable one of the two.";
+    if (target_device_id < 0) {
+        migrate_to_cpu(var, cpu_allocator);
+        return;
+    }
+    int src_device_id = var->allocator->device_id();
+    if (!var->allocator->is_cuda()) {
+        // CPU -> GPU target_device_id
+        CudaDeviceGuard guard(target_device_id);
+        migrate_to_gpu(var, &get_cuda_device_allocator(target_device_id));
+        return;
+    }
+    if (src_device_id == target_device_id) return;
+    // GPU src_device_id -> GPU target_device_id: no P2P, stage through host.
+    Allocation host_a(cpu_allocator, var->size);
+    {
+        CudaDeviceGuard guard(src_device_id);
+        checkCudaErrors(cudaMemcpy(host_a.ptr, var->mem_ptr, var->size, cudaMemcpyDeviceToHost));
+    }
+    Allocator* dst_allocator = &get_cuda_device_allocator(target_device_id);
+    Allocation dst_a(dst_allocator, var->size);
+    {
+        CudaDeviceGuard guard(target_device_id);
+        checkCudaErrors(cudaMemcpy(dst_a.ptr, host_a.ptr, var->size, cudaMemcpyHostToDevice));
+    }
+    var->allocator->free(var->mem_ptr, var->size, var->allocation);
+    var->mem_ptr = dst_a.ptr;
+    var->allocation = dst_a.allocation;
+    var->allocator = dst_a.allocator;
+    dst_a.ptr = nullptr;
     #endif
 }
 

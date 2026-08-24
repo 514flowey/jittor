@@ -17,6 +17,12 @@ EXTERN_LIB bool no_cuda_error_when_free;
 
 const char* CudaManagedAllocator::name() const {return "cuda_managed";}
 
+int CudaManagedAllocator::device_id() const {
+    int cur = 0;
+    cudaGetDevice(&cur);
+    return cur;
+}
+
 void* CudaManagedAllocator::alloc(size_t size, size_t& allocation) {
     if (size==0) return (void*)0x10;
     void* ptr;

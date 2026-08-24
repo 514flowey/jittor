@@ -116,6 +116,16 @@ struct VarHolder {
         return "cpu";
     }
 
+    // Ground truth for which physical GPU this Var's memory actually lives
+    // on: -1 for CPU/unallocated, 0..N for the real device index (read from
+    // the allocator that owns the memory, not from the pin intent below).
+    // @pyjt(device_id)
+    inline int device_id() {
+        if (var->mem_ptr == nullptr)
+            return -1;
+        return var->allocator->device_id();
+    }
+
     // @pyjt(migrate_to_cpu)
     // @attrs(return_self)
     inline VarHolder* migrate_to_cpu_() {
@@ -133,6 +143,23 @@ struct VarHolder {
         #ifdef HAS_CUDA
         migrate_to_gpu(var, get_allocator());
         #endif
+        return this;
+    }
+
+    // Explicitly pin this Var to a physical device (-1 = CPU, 0..N = GPU
+    // index within the process' visible device set), physically move its
+    // memory there now, and mark it as an explicit device boundary so it
+    // is never silently fused across devices with neighboring ops (see
+    // jittor-core-gaps.md section 3.8 / the device-id design doc).
+    // @pyjt(migrate_to_device)
+    // @attrs(return_self)
+    inline VarHolder* migrate_to_device_(int device_id) {
+        sync(true, false);
+        #ifdef HAS_CUDA
+        jittor::migrate_to_device(var, device_id);
+        #endif
+        var->set_device_pin(device_id);
+        var->flags.set(NodeFlags::_stop_fuse, 1);
         return this;
     }
     

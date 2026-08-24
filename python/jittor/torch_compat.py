@@ -249,6 +249,26 @@ def _device_is_cuda(dev):
     return False
 
 
+def _device_index(dev):
+    """Extract the explicit GPU index from a torch device= argument, if any.
+
+    Returns None for CPU, an unspecified device (None), or a device string
+    with no explicit index (e.g. "cuda" alone) -- callers should treat None
+    as "no specific physical device requested" and fall back to the ambient
+    default, exactly as before this per-tensor device-id support existed."""
+    if dev is None or _device_is_cpu(dev):
+        return None
+    if isinstance(dev, bool):
+        return None  # bool is an int subclass; never a meaningful device index
+    if isinstance(dev, int):
+        return dev  # torch accepts a bare int device index, e.g. tensor.cuda(1)
+    if isinstance(dev, str):
+        # NB: don't getattr(dev, "index") here -- every str has a builtin
+        # .index METHOD, which would be mistaken for a device index.
+        return int(dev.split(":", 1)[1]) if ":" in dev else None
+    return getattr(dev, "index", None)
+
+
 def _var_is_cpu_resident(v):
     """True if a Var's data actually lives in host memory.
 
@@ -1318,6 +1338,9 @@ def install(torch):
         elif _device_is_cuda(device):
             jt.flags.use_cuda = 1
             v = _make_cuda_resident(v, force=True)
+            idx = _device_index(device)
+            if idx is not None:
+                v = v.migrate_to_device(idx)
         if requires_grad:
             v.requires_grad_(True)
             _torch_register_leaf(v)
@@ -1331,7 +1354,9 @@ def install(torch):
                 return _make_cpu_resident(r)
             if _device_is_cuda(device):
                 jt.flags.use_cuda = 1
-                return _make_cuda_resident(r, force=True)
+                r = _make_cuda_resident(r, force=True)
+                idx = _device_index(device)
+                return r if idx is None else r.migrate_to_device(idx)
             return r
         return tensor(data, dtype=dtype, device=device)
     g.as_tensor = as_tensor
@@ -1342,7 +1367,9 @@ def install(torch):
             return _make_cpu_resident(v)
         if _device_is_cuda(device):
             jt.flags.use_cuda = 1
-            return _make_cuda_resident(v, force=True)
+            v = _make_cuda_resident(v, force=True)
+            idx = _device_index(device)
+            return v if idx is None else v.migrate_to_device(idx)
         return v
     g.from_numpy = from_numpy
 
@@ -4140,6 +4167,9 @@ def _wrap_constructors(g):
                 out = out.cast(_cast_to)
             if _want_cuda:
                 out = _make_cuda_resident(out, force=True)
+                _idx = _device_index(_requested_device)
+                if _idx is not None:
+                    out = out.migrate_to_device(_idx)
             try:
                 out._jittor_torch_ext_mutable = True
             except Exception:
@@ -5656,6 +5686,9 @@ def _install_module_methods(nn):
                 out = _make_cpu_resident(out, inplace=(out is v))
             elif _device_is_cuda(dev):
                 out = _make_cuda_resident(out, force=True, inplace=(out is v))
+                idx = _device_index(dev)
+                if idx is not None:
+                    out = out.migrate_to_device(idx)
             return out
 
         if dev is not None or ds is not None:
@@ -7115,6 +7148,9 @@ def _install_tensor_methods(g, Var, _DTYPE_OBJS=None):
         elif _device_is_cuda(device):
             jt.flags.use_cuda = 1
             v = _make_cuda_resident(v, force=True)
+            idx = _device_index(device)
+            if idx is not None:
+                v = v.migrate_to_device(idx)
         if requires_grad:
             v.requires_grad_(True)
             _torch_register_leaf(v)
@@ -7355,14 +7391,22 @@ def _install_tensor_methods(g, Var, _DTYPE_OBJS=None):
         # fires and eager weight init is skipped. See device.__enter__.
         if _DEVICE_CTX_STACK:
             return _DEVICE_CTX_STACK[-1]
-        # Report the Var's ACTUAL memory residency (matches jtorch's C++
-        # is_cpu()/device()): a Var built/migrated to host -- e.g. via
-        # torch.zeros(device='cpu') or .cpu() -- is "cpu" even while the
-        # global use_cuda flag is 1. Only fall back to the global flag when
-        # CUDA is on and the Var is genuinely device-resident.
-        if (jt.flags.use_cuda or getattr(jt.compiler, "has_acl", 0)):
+        # ACL/NPU backends don't carry a real per-tensor device index yet;
+        # keep the pre-existing CPU/device-0 boolean report for them.
+        if getattr(jt.compiler, "has_acl", 0):
             return device("cpu") if _var_is_cpu_resident(self) else device("cuda", 0)
-        return device("cpu")
+        # Report the Var's ACTUAL physical device (var->allocator->device_id(),
+        # ground truth for real residency -- see Var.device_id()), not a
+        # hardcoded "cuda:0" or a global-flag guess. Single-GPU/no-pin usage
+        # still resolves to 0, identical to the prior hardcoded behavior.
+        idx = self.device_id()
+        if idx < 0 and self.location() == "none" and jt.flags.use_cuda:
+            # Not yet materialized: device_id() has nothing to report yet, but
+            # it will land on the ambient device once realized (matches
+            # _var_is_cpu_resident's own fallback for this same 'none' state
+            # a few lines above) -- report that instead of a misleading "cpu".
+            return device("cuda", 0)
+        return device("cpu") if idx < 0 else device("cuda", idx)
     Var.device = property(_device)
 
     _orig_getitem = getattr(Var, "__getitem__", None)
@@ -7821,6 +7865,9 @@ def _install_tensor_methods(g, Var, _DTYPE_OBJS=None):
             out = _make_cpu_resident(out)
         elif _device_is_cuda(dev):
             out = _make_cuda_resident(out, force=True)
+            idx = _device_index(dev)
+            if idx is not None:
+                out = out.migrate_to_device(idx)
         if getattr(self, "_torch_0d", False):
             out._torch_0d = True
         return out
@@ -7865,6 +7912,9 @@ def _install_tensor_methods(g, Var, _DTYPE_OBJS=None):
     def _var_cuda(self, device=None, *a, **k):
         jt.flags.use_cuda = 1
         out = _make_cuda_resident(self, force=True)
+        idx = _device_index(device)
+        if idx is not None:
+            out = out.migrate_to_device(idx)
         if getattr(self, "_torch_0d", False):
             out._torch_0d = True
         return out
@@ -8077,8 +8127,11 @@ def _install_tensor_methods(g, Var, _DTYPE_OBJS=None):
     Var.is_meta = property(lambda self: getattr(self.device, "type", None) == "meta")
     # torch's Tensor.get_device(): CUDA device index, or -1 for CPU tensors.
     # 3DGS's fallback ssim (utils/loss_utils.py) does window.cuda(img.get_device()).
+    # ACL/NPU has no real per-tensor device id yet -- keep its old boolean report.
     if not hasattr(Var, "get_device"):
-        Var.get_device = lambda self: (0 if _is_cuda(self) else -1)
+        Var.get_device = lambda self: (
+            (0 if _is_cuda(self) else -1) if getattr(jt.compiler, "has_acl", 0)
+            else self.device_id())
 
     # torch's Tensor.narrow(dim, start, length): a view of `length` elements
     # starting at `start` along `dim` (jittor has no narrow; use a slice).

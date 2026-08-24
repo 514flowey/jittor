@@ -15,6 +15,7 @@
 namespace jittor {
 
 int64 Var::number_of_lived_vars = 0;
+bool any_device_pin_ever = false;
 
 DEFINE_FLAG(fast_shared_ptr<loop_options_t>, compile_options, {}, 
     "Override the default loop transfrom options");

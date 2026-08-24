@@ -17,6 +17,7 @@
 #include "event_queue.h"
 #endif
 #include "misc/cuda_flags.h"
+#include "misc/cuda_guard.h"
 #include "executor.h"
 #include "var.h"
 #include "op.h"
@@ -51,6 +52,37 @@ EXTERN_LIB list<VarPtr> fetcher_to_free;
 #ifdef HAS_CUDA
 DECLARE_FLAG(int, use_cuda_managed_allocator);
 #endif
+
+// Scan an op's (or fused op's) inputs/outputs for an explicit device pin
+// (see Var::set_device_pin / VarHolder::migrate_to_device). Returns:
+//   -2  no Var involved carries an explicit pin -- caller must fall back to
+//       today's ambient use_cuda/device_id-driven behavior, unchanged.
+//   -1  at least one Var is explicitly pinned to CPU.
+//  >=0  at least one Var is explicitly pinned to that physical GPU index;
+//       this becomes the target device for kernel launch and for migrating
+//       any other operand that currently lives elsewhere.
+// Vars pinned to two different devices on the same op is a user error (they
+// must call .migrate_to_device() explicitly first) -- fail loud rather than
+// silently running the kernel against the wrong CUDA context.
+static int resolve_op_device(Op* op) {
+    // Zero-overhead fast path for the overwhelmingly common case: device
+    // pinning has never been used anywhere in this process, so no op can
+    // possibly carry a pin -- skip scanning every input/output entirely.
+    if (!any_device_pin_ever) return -2;
+    int target = -2;
+    auto scan = [&](Var* v) {
+        if (!v->has_device_pin()) return;
+        int p = v->device_pin();
+        if (target == -2) { target = p; return; }
+        if (target != p)
+            LOGf << "Op" << op->name() << "combines Vars pinned to different devices ("
+                << target << "vs" << p << "). Call .migrate_to_device() explicitly"
+                << "before combining Vars pinned to different devices.";
+    };
+    for (Var* v : op->outputs()) scan(v);
+    for (Var* v : op->inputs()) scan(v);
+    return target;
+}
 
 void load_fused_op(FusedOp& fused_op, vector<int>& fuse_ops, vector<Op*>& ops, int ll, int rr, int64 tt) {
     fused_op.ops.clear();
@@ -581,6 +613,9 @@ void Executor::run_sync(vector<Var*> vars, bool device_sync, bool weak_sync) {
         LOGvvv << "Run" << op << "inputs:" << op->inputs() << "outputs:" << op->outputs();
         op->do_prepare(jkl);
         bool is_cuda = op->flags.get(NodeFlags::_cuda);
+        // -2 = no Var involved carries an explicit device pin: every branch
+        // below is byte-for-byte identical to the pre-existing behavior.
+        int pinned_device = resolve_op_device(op);
         #ifdef HAS_CUDA
         if (!is_cuda) {
             if (last_is_cuda) {
@@ -594,18 +629,28 @@ void Executor::run_sync(vector<Var*> vars, bool device_sync, bool weak_sync) {
                     migrate_to_cpu(v, allocator);
             }
             if (!use_cuda_managed_allocator) {
-                for (auto* var : op->outputs()) 
+                for (auto* var : op->outputs())
                     if (var->allocator->is_cuda())
                         migrate_to_cpu(var, allocator);
             }
         } else {
             for (Var* v : op->inputs()) {
-                if (!v->allocator->is_cuda())
-                    migrate_to_gpu(v, allocator);
+                if (!v->allocator->is_cuda()) {
+                    if (pinned_device >= 0)
+                        migrate_to_device(v, pinned_device);
+                    else
+                        migrate_to_gpu(v, allocator);
+                } else if (pinned_device >= 0 && v->allocator->device_id() != pinned_device)
+                    migrate_to_device(v, pinned_device);
             }
             for (Var* v : op->outputs()) {
-                if (!v->allocator->is_cuda())
-                    migrate_to_gpu(v, allocator);
+                if (!v->allocator->is_cuda()) {
+                    if (pinned_device >= 0)
+                        migrate_to_device(v, pinned_device);
+                    else
+                        migrate_to_gpu(v, allocator);
+                } else if (pinned_device >= 0 && v->allocator->device_id() != pinned_device)
+                    migrate_to_device(v, pinned_device);
             }
         }
         #endif
@@ -621,7 +666,12 @@ void Executor::run_sync(vector<Var*> vars, bool device_sync, bool weak_sync) {
         #endif
         last_is_cuda = is_cuda;
         // _JT_SEH_START2;
-        op->do_run_after_prepare(jkl);
+        {
+            // device_id<0 (no pin, or a CPU-only op) makes this a pure
+            // no-op, so single-GPU / no-pin execution is unaffected.
+            CudaDeviceGuard device_guard(is_cuda && pinned_device >= 0 ? pinned_device : -1);
+            op->do_run_after_prepare(jkl);
+        }
         // _JT_SEH_END2;
         #ifdef HAS_CUDA
         // migrate to gpu
