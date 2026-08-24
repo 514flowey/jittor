@@ -42,7 +42,13 @@ TransposeOp::TransposeOp(Var* x, NanoVector axes_) : x(x), axes(axes_) {
         return;
     }
     #ifdef HAS_CUDA
-    if (use_cuda) {
+    // cutt (the vendored CUDA transpose library) only supports element sizes
+    // of 1, 2, 4 or 8 bytes (see cuttPlanCheckInput in cutt.cpp); a 16-byte
+    // element (native complex128) trips CUTT_INVALID_PARAMETER at plan time.
+    // Skip cutt for such dtypes and fall through to the generic templated
+    // CUDA transpose_kernel below (Tx*-typed, dtype-agnostic), rather than
+    // handing it a size cutt cannot plan for.
+    if (use_cuda && x->dtype().dsize() <= 8) {
         static VarPtr(*cutt_transpose)(Var*, NanoVector) = nullptr;
         if (!cutt_transpose && has_op("cutt_transpose")) {
             cutt_transpose = get_op_info("cutt_transpose")

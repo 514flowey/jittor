@@ -1519,7 +1519,14 @@ def install(torch):
             if _t.ndim == 0:
                 raise RuntimeError(
                     f"zero-dimensional tensor (at position {_pos}) cannot be concatenated")
-        nonempty = [t for t in tensors if t.numel() > 0]
+        # "empty" here must mean zero-size ALONG THE CONCAT DIM specifically, not zero
+        # total numel: a (1,0)-shaped entry (e.g. from stacking two (0,)-shaped index
+        # arrays via unsqueeze(0)) has numel()==0 but a dim-0 size of 1 and must NOT be
+        # dropped, else concat/stack silently returns tensors[0] unchanged instead of
+        # growing along dim -- e.g. stacking two (0,) arrays into (2,0) previously
+        # collapsed to (1,0). Only skip an entry whose size is 0 specifically along dim.
+        _cdim = dim if dim >= 0 else dim + tensors[0].ndim
+        nonempty = [t for t in tensors if t.shape[_cdim] > 0]
         if len(nonempty) == 0:
             return tensors[0]
         if len(nonempty) == 1:
