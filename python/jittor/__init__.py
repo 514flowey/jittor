@@ -2895,6 +2895,12 @@ if compile_extern.nccl_ops is not None and not hasattr(core.Var, "mpi_all_reduce
     core.Var.mpi_broadcast = _nccl_broadcast
 
 
+# Real batching transform (jittor-core-gaps.md section 3.5): builds one real
+# batched op graph instead of looping over the batch in Python. Set before
+# torch_compat installs its own loop-based `vmap` fallback (torch_compat's
+# `_alias` only fills in names jt doesn't already have, so this wins).
+from .batch_transform import vmap
+
 # torch-compatibility layer: lets `import jittor as torch` run PyTorch code.
 # Additive only -- fills missing torch names/semantics. Safe to fail soft.
 try:
