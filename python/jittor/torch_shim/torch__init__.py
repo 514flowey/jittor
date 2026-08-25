@@ -1511,10 +1511,8 @@ class RemovableHandle:
 _hooks.RemovableHandle = RemovableHandle
 sys.modules["torch.utils.hooks"] = _hooks
 _dlpack = types.ModuleType("torch.utils.dlpack")
-def _dlpack_not_implemented(*args, **kwargs):
-    raise NotImplementedError("torch.utils.dlpack is not implemented by jittor torch shim")
-_dlpack.from_dlpack = _dlpack_not_implemented
-_dlpack.to_dlpack = _dlpack_not_implemented
+_dlpack.from_dlpack = _jt.from_dlpack
+_dlpack.to_dlpack = _jt.to_dlpack
 sys.modules["torch.utils.dlpack"] = _dlpack
 _utils.dlpack = _dlpack
 

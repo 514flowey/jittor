@@ -19,6 +19,7 @@
 #include "mem/allocator/sfrl_allocator.h"
 #include "mem/allocator/nfef_allocator.h"
 #include "mem/allocator/temp_allocator.h"
+#include "mem/allocator/foreign_allocator.h"
 #include "mem/swap.h"
 #include "var.h"
 
@@ -191,6 +192,15 @@ void migrate_to_gpu(Var* var, Allocator* allocator) {
 
 void migrate_to_device(Var* var, int target_device_id) {
     #ifdef HAS_CUDA
+    // A DLPack-imported (or otherwise foreign-memory-backed) Var's allocator
+    // ->free() fires the producer's deleter callback (see src/pyjt/dlpack.cc)
+    // -- migrating it would release memory a NumPy/CuPy/PyTorch array still
+    // owns as a side effect of a routine device move. Fail loud instead of
+    // silently freeing someone else's buffer (mirrors the equivalent guard
+    // in mem/swap.cc's move_with_swap).
+    ASSERT(!dynamic_cast<ForeignAllocator*>(var->allocator)) <<
+        "migrate_to_device() does not support Vars imported via DLPack "
+        "(or otherwise backed by foreign/external memory)";
     // Per-device pinning is not designed to compose with the managed
     // allocator (get_allocator() above always routes it to the single
     // process-wide cuda_managed_allocator, never a per-device instance) --

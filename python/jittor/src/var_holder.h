@@ -126,6 +126,36 @@ struct VarHolder {
         return var->allocator->device_id();
     }
 
+    // DLPack export (jittor-core-gaps.md section 3.7). Implemented in
+    // src/pyjt/dlpack.cc, not inline here, since the implementation needs
+    // the vendored DLPack ABI structs (src/pyjt/dlpack.h) and CPython
+    // capsule C-API that this widely-included header shouldn't have to pull
+    // in. `stream` is accepted for protocol compatibility (numpy/cupy/torch
+    // all pass it) but Jittor's single-default-stream execution model means
+    // there is nothing meaningful to do with it beyond the device sync
+    // to_dlpack() already performs -- see the design doc for why this is a
+    // sound simplification here, not a shortcut.
+    //
+    // Bound under plain names, not __dlpack__/__dlpack_device__ directly:
+    // pyjt_compiler.py treats any "__xxx__"-shaped @pyjt name as a CPython
+    // type slot and only recognizes a fixed whitelist (__init__, __repr__,
+    // __len__, __getitem__, ...) -- an unrecognized one is a hard compile
+    // error ("Not support slot"), not a fallback to a plain method. __init__.py
+    // aliases Var.__dlpack__ = Var.dlpack (same pattern already used
+    // throughout this codebase for exposing a C++-bound method under a
+    // different Python-facing name).
+    // max_version/dl_device/copy are accepted for signature compatibility
+    // with the modern __dlpack__(self, *, stream=None, max_version=None,
+    // dl_device=None, copy=None) protocol that NumPy>=2/CuPy actually call
+    // with (not just the DLPack 0.x `stream`-only form) -- see dlpack.cc for
+    // what's actually honored vs. rejected.
+    // @pyjt(dlpack)
+    PyObject* dlpack(PyObject* stream=nullptr, PyObject* max_version=nullptr,
+        PyObject* dl_device=nullptr, PyObject* copy=nullptr);
+
+    // @pyjt(dlpack_device)
+    PyObject* dlpack_device();
+
     // @pyjt(migrate_to_cpu)
     // @attrs(return_self)
     inline VarHolder* migrate_to_cpu_() {

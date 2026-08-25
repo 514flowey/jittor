@@ -17,6 +17,7 @@
 #include "var.h"
 #include "mem/swap.h"
 #include "mem/mem_info.h"
+#include "mem/allocator/foreign_allocator.h"
 
 namespace jittor {
 
@@ -158,6 +159,14 @@ void free_with_swap(Var* x) {
 
 bool move_with_swap(Var* x, Allocator* allocator, bool force) {
     if (allocator == x->allocator) return true;
+    // save_mem/swap doesn't know how to check a foreign (e.g. DLPack-imported,
+    // src/pyjt/dlpack.cc) allocation in or out -- it isn't backed by a plain
+    // cpu/gpu Allocator this module can move memory between (see the TODO in
+    // swap.h: "handle foreign allocator, only handle cpu allocator and gpu
+    // allocator"). Fail loud instead of silently mishandling ownership.
+    ASSERT(!dynamic_cast<ForeignAllocator*>(x->allocator)) <<
+        "save_mem/swap does not support Vars imported via DLPack "
+        "(or otherwise backed by foreign/external memory)";
     swap_total += x->size;
     Allocation allocation(x->mem_ptr, x->allocation, x->size, x->allocator);
     x->mem_ptr = nullptr;

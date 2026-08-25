@@ -9850,12 +9850,13 @@ def _install_misc(g, Var, _DTYPE_OBJS=None):
     g.utils.hooks = _sys_utils.modules["torch.utils.hooks"]
     if "torch.utils.dlpack" not in _sys_utils.modules:
         _dlpack = _types2.ModuleType("torch.utils.dlpack")
-        def _dlpack_not_implemented(*args, **kwargs):
-            raise NotImplementedError("torch.utils.dlpack is not implemented by jittor torch_compat")
-        _dlpack.from_dlpack = _dlpack_not_implemented
-        _dlpack.to_dlpack = _dlpack_not_implemented
+        _dlpack.from_dlpack = jt.from_dlpack
+        _dlpack.to_dlpack = jt.to_dlpack
         _sys_utils.modules["torch.utils.dlpack"] = _dlpack
     g.utils.dlpack = _sys_utils.modules["torch.utils.dlpack"]
+    # torch.from_dlpack is also exposed at the top level (not just
+    # torch.utils.dlpack.from_dlpack) since PyTorch 1.10+.
+    _alias("from_dlpack", jt.from_dlpack)
     if "torch._subclasses.fake_tensor" not in _sys_utils.modules:
         _subclasses = _types2.ModuleType("torch._subclasses")
         _fake_tensor = _types2.ModuleType("torch._subclasses.fake_tensor")

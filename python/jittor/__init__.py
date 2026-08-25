@@ -696,6 +696,34 @@ def array64(data, dtype=None):
     with jt.flag_scope(auto_convert_64_to_32=0):
         return array(data, dtype)
 
+# DLPack (jittor-core-gaps.md section 3.7). Var.dlpack()/dlpack_device() are
+# the real pyjt-bound C++ methods (src/pyjt/dlpack.cc); aliased to the
+# protocol's actual dunder names here rather than binding them directly,
+# because pyjt_compiler.py treats any "__xxx__" @pyjt name as a CPython type
+# slot and only recognizes a fixed whitelist (__init__, __repr__, __len__,
+# __getitem__, ...) -- an unrecognized one is a hard compile error, not a
+# fallback to a plain method.
+Var.__dlpack__ = Var.dlpack
+Var.__dlpack_device__ = Var.dlpack_device
+to_dlpack = core.to_dlpack
+
+def from_dlpack(obj):
+    ''' Import a tensor from another array library via the DLPack protocol,
+    zero-copy. Accepts either a raw DLPack capsule (the legacy
+    torch.utils.dlpack.from_dlpack(capsule) style) or any object
+    implementing __dlpack__/__dlpack_device__ (numpy/cupy ndarrays, torch
+    tensors, ...), matching numpy.from_dlpack/torch.from_dlpack's own dual
+    calling convention. The source tensor must be row-major contiguous
+    (Jittor's Var has no stride concept) and located on CPU or a CUDA
+    device; anything else raises rather than silently copying or misreading
+    the data. The returned Var is explicitly pinned to the source's physical
+    device (see Var.migrate_to_device) when that device is a GPU. '''
+    if hasattr(obj, "__dlpack__"):
+        capsule = obj.__dlpack__()
+    else:
+        capsule = obj
+    return core.from_dlpack_capsule(capsule)
+
 def grad(loss, targets, retain_graph=True):
     if type(targets) == core.Var:
         return core.grad(loss, [targets], retain_graph)[0]
