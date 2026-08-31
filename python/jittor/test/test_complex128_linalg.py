@@ -74,6 +74,38 @@ class _Mixin:
         rec2 = _dot(_np(zi), a)
         np.testing.assert_allclose(rec2, eye, atol=1e-9, rtol=1e-9)
 
+    # ------------------------------------------------------------------- det
+    def test_det(self):
+        # jittor-core-gaps.md §3.2 acceptance #4 also names det/solve/cholesky,
+        # but only inv/svd/svdvals/qr/eig/eigh/pinv had complex128 coverage.
+        rng = np.random.RandomState(1)
+        a = (rng.randn(4, 4) + 1j * rng.randn(4, 4))
+        z = _to_complex128_var(a)
+        d = linalg.det(z)
+        self.assertEqual(str(d.dtype), "complex128", "det must return native complex128")
+        np.testing.assert_allclose(_np(d), np.linalg.det(a), atol=1e-9, rtol=1e-9)
+
+    # --------------------------------------------------------------- cholesky
+    def test_cholesky(self):
+        rng = np.random.RandomState(2)
+        m = rng.randn(4, 4) + 1j * rng.randn(4, 4)
+        a = m @ m.conj().T + 4 * np.eye(4)  # Hermitian positive-definite
+        z = _to_complex128_var(a)
+        L = linalg.cholesky(z)
+        self.assertEqual(str(L.dtype), "complex128", "cholesky must return native complex128")
+        rec = _dot(_np(L), _np(L).conj().swapaxes(-1, -2))
+        np.testing.assert_allclose(rec, a, atol=1e-8, rtol=1e-8)
+
+    # ------------------------------------------------------------------ solve
+    def test_solve(self):
+        rng = np.random.RandomState(3)
+        a = rng.randn(4, 4) + 1j * rng.randn(4, 4)
+        b = rng.randn(4) + 1j * rng.randn(4)
+        za, zb = _to_complex128_var(a), jt.array(b.astype("complex128"))
+        x = linalg.solve(za, zb)
+        self.assertEqual(str(x.dtype), "complex128", "solve must return native complex128")
+        np.testing.assert_allclose(a @ _np(x), b, atol=1e-8, rtol=1e-8)
+
     # -------------------------------------------------------------------- svd
     def test_svd(self):
         rng = np.random.RandomState(1)

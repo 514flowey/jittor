@@ -235,6 +235,14 @@ class TestSpmm(unittest.TestCase):
             gv, gy = jt.grad(loss, [jval, jy])
 
         tol = 1e-6 if dtype in ("float64", "complex128") else 3e-2
+        # jittor-core-gaps.md §3.6 names, by shape, exactly the regression this
+        # locks: to_dense()'s split indices used to keep a (1, nnz) leading
+        # axis, so the values gradient came back (1, nnz) instead of (nnz,).
+        # assert_allclose alone would silently broadcast that away.
+        self.assertEqual(tuple(gv.shape), values.shape,
+                          f"spmm backward values grad shape {dev} {dtype} {layout}")
+        self.assertEqual(tuple(gy.shape), y.shape,
+                          f"spmm backward y grad shape {dev} {dtype} {layout}")
         gv_ref = self._fd_grad_values(row, col, values, y, dtype)
         gy_ref = self._fd_grad_y(row, col, values, y, dtype)
         np.testing.assert_allclose(gv.numpy(), gv_ref, atol=tol, rtol=tol,
@@ -265,6 +273,29 @@ class TestSpmm(unittest.TestCase):
                 loss = out.sum()
                 gv = jt.grad(loss, [values])[0]
             self.assertTrue(np.isfinite(gv.numpy()).all(), f"grad finite {dev}")
+        both_devices(body)
+
+    def test_indices_gradient_request_fails_loud(self):
+        # jittor-core-gaps.md §3.6 criterion 3 asks for an EXPLICIT
+        # stop-gradient contract on indices, not just "values gradient
+        # happens to be finite". Indices are int32 -- jt.grad's own target
+        # dtype check (grad.cc) rejects a non-float/complex grad target, so
+        # requesting d(loss)/d(indices) must raise, not silently return None
+        # or a zero/garbage Var.
+        row = jt.array(np.array([0, 1], dtype="int32"))
+        col = jt.array(np.array([1, 0], dtype="int32"))
+
+        def body(dev):
+            values = jt.array(np.array([2.0, 3.0], dtype="float32"))
+            values.requires_grad = True
+            y = jt.array(np.array([[5.0], [7.0]], dtype="float32"))
+            indices = jt.stack([row, col], dim=0)
+            sp = sparse.sparse_array(indices, values, jt.NanoVector([2, 2]))
+            with jt.enable_grad():
+                out = sparse.spmm(sp, y)
+                loss = out.sum()
+                with self.assertRaises(Exception, msg=f"grad wrt indices should fail loud {dev}"):
+                    jt.grad(loss, [indices])
         both_devices(body)
 
     def test_uncoalesced_csr_still_correct(self):
@@ -303,6 +334,28 @@ class TestSpmm(unittest.TestCase):
             np.testing.assert_array_equal(csr.crow_indices.numpy(), np.zeros(4, dtype="int32"),
                                           err_msg=f"empty to_csr crow {dev}")
             self.assertEqual(sp.coalesce().nnz, 0, f"empty coalesce nnz {dev}")
+        both_devices(body)
+
+    def test_degenerate_empty_shape_matrix(self):
+        # genuinely degenerate (M=0 or N=0) shapes, distinct from
+        # test_empty_nnz's zero-nnz-but-normal-shape case.
+        def body(dev):
+            idx = jt.empty((2, 0), "int32")
+            values = jt.array(np.array([], dtype="float32"))
+            sp = sparse.sparse_array(idx, values, jt.NanoVector([0, 4]))
+            dense = sp.to_dense()
+            self.assertEqual(tuple(dense.shape), (0, 4), f"(0,N) to_dense shape {dev}")
+            y = jt.array(np.random.RandomState(6).randn(4, 2).astype("float32"))
+            out = sparse.spmm(sp, y)
+            self.assertEqual(tuple(out.shape), (0, 2), f"(0,N) spmm shape {dev}")
+
+            sp2 = sparse.sparse_array(idx, values, jt.NanoVector([4, 0]))
+            dense2 = sp2.to_dense()
+            self.assertEqual(tuple(dense2.shape), (4, 0), f"(M,0) to_dense shape {dev}")
+            y2 = jt.array(np.random.RandomState(7).randn(0, 2).astype("float32"))
+            out2 = sparse.spmm(sp2, y2)
+            self.assertEqual(tuple(out2.shape), (4, 2), f"(M,0) spmm shape {dev}")
+            self.assertEqual(out2.numpy().sum(), 0.0, f"(M,0) spmm value {dev}")
         both_devices(body)
 
     def test_no_densify_large_shape(self):

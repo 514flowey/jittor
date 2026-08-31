@@ -62,6 +62,20 @@ class TestDLPack(unittest.TestCase):
         self.assertEqual(str(y.dtype), "bfloat16")
         np.testing.assert_allclose(y.float32().numpy(), [1.5, 2.5, 3.5])
 
+    def test_cpu_zero_copy_mutation_visible_on_import(self):
+        # jittor-core-gaps.md §3.7 criterion 2 (zero-copy + mutation visible
+        # both ways) previously had test coverage ONLY behind the CuPy-gated
+        # TestDLPackCupy class -- no CPU/NumPy-only proof existed, so on any
+        # machine without CuPy this criterion had zero executed evidence.
+        # from_dlpack must alias the NumPy buffer, not copy it: mutating the
+        # source array after import must be visible through the Jittor Var.
+        jt.flags.use_cuda = 0
+        src = np.array([1.0, 2.0, 3.0], dtype=np.float32)
+        y = jt.from_dlpack(src)
+        np.testing.assert_allclose(y.numpy(), [1, 2, 3])
+        src[1] = 42.0
+        np.testing.assert_allclose(y.numpy(), [1, 42, 3])
+
     def test_non_contiguous_import_rejected(self):
         a = np.arange(20, dtype=np.float32).reshape(4, 5)
         sliced = a[:, ::2]

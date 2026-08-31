@@ -235,6 +235,30 @@ class TestComplex128GradFunctional(unittest.TestCase):
                                        err_msg=f"unused-input jvp {dev}")
         both_devices(body)
 
+    def test_jvp_native_multi_output(self):
+        # jittor-core-gaps.md §3.3 criterion 2, complex128 mirror of the
+        # complex64 multi-output jvp test.
+        rng = np.random.RandomState(17)
+        s = (3, 4)
+        a = (rng.randn(*s) + 1j * rng.randn(*s)).astype("complex128")
+        vin = (rng.randn(*s) + 1j * rng.randn(*s)).astype("complex128")
+
+        def f(x):
+            return x.exp().sum(1), (x * x).sum()
+
+        ref0 = self._fd_jvp(lambda z: np.exp(z).sum(1), a, vin)
+        ref1 = self._fd_jvp(lambda z: (z * z).sum(), a, vin)
+
+        def body(dev):
+            out, j = jvp(f, jt.array(a), jt.array(vin), create_graph=True)
+            self.assertIsInstance(j, tuple)
+            self.assertEqual(len(j), 2)
+            np.testing.assert_allclose(np.asarray(j[0].numpy()), ref0, atol=1e-6, rtol=1e-6,
+                                       err_msg=f"multi-output jvp[0] {dev}")
+            np.testing.assert_allclose(complex(j[1].item()), ref1, atol=1e-6, rtol=1e-6,
+                                       err_msg=f"multi-output jvp[1] {dev}")
+        both_devices(body)
+
     def test_jvp_native_create_graph_false_matches_true(self):
         rng = np.random.RandomState(13)
         s = (4, 5)

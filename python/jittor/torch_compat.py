@@ -876,7 +876,7 @@ def _rebuild_nested_tensor(encoded_tensors, ragged_idx):
     return _NestedTensor.from_tensors(tensors, ragged_idx=ragged_idx)
 
 
-def _rebuild_var_from_numpy(np_arr, dtype_str=None):
+def _rebuild_var_from_numpy(np_arr, dtype_str=None, device_id=None):
     """Reconstruct a jittor Var from a (numpy array, dtype string) pair.
 
     Module-level so pickle can reference it by qualified name. Used as the
@@ -885,7 +885,8 @@ def _rebuild_var_from_numpy(np_arr, dtype_str=None):
     native numpy ndarray, which turns jittor's stock ``__reduce__`` -- ``(Var,
     (self.data,))`` -- into infinite recursion. Serializing via numpy + dtype
     keeps Vars picklable for Ray / multiprocessing (e.g. verl ships a DataProto
-    of token tensors to a reward actor)."""
+    of token tensors to a reward actor). ``device_id`` (-1/None == CPU/ambient)
+    round-trips the source Var's pinned device (jittor-core-gaps.md §3.8)."""
     import jittor as _jt
     v = _jt.array(np_arr)
     if dtype_str is not None and str(v.dtype) != dtype_str:
@@ -896,6 +897,8 @@ def _rebuild_var_from_numpy(np_arr, dtype_str=None):
             v = v.astype(dtype_str)
         except Exception:
             pass
+    if device_id is not None and device_id >= 0:
+        v = v.migrate_to_device(device_id)
     return v
 
 
@@ -7475,8 +7478,13 @@ def _install_tensor_methods(g, Var, _DTYPE_OBJS=None):
     # Vars picklable by serializing through numpy + dtype (needed for Ray to
     # ship token tensors to reward actors, torch.multiprocessing, etc.).
     if not getattr(Var, "_reduce_wrapped", False):
-        Var.__reduce__ = lambda self: (
-            _rebuild_var_from_numpy, (self.numpy(), str(self.dtype)))
+        def _var_reduce_torch(self):
+            try:
+                dev = self.device_id()
+            except Exception:
+                dev = -1
+            return (_rebuild_var_from_numpy, (self.numpy(), str(self.dtype), dev))
+        Var.__reduce__ = _var_reduce_torch
         Var._reduce_wrapped = True
 
     # Leaf registry for the no-optimizer backward() path (below): torch's
@@ -7867,7 +7875,17 @@ def _install_tensor_methods(g, Var, _DTYPE_OBJS=None):
             out = _make_cuda_resident(out, force=True)
             idx = _device_index(dev)
             if idx is not None:
-                out = out.migrate_to_device(idx)
+                try:
+                    cur_idx = out.device_id()
+                except Exception:
+                    cur_idx = None
+                if cur_idx != idx:
+                    # migrate_to_device() mutates in place; clone first unless
+                    # a fresh Var was already produced above (cast/copy/dtype
+                    # change), so .to(other_device) never mutates the source.
+                    if out is self and not copy:
+                        out = out.clone()
+                    out = out.migrate_to_device(idx)
         if getattr(self, "_torch_0d", False):
             out._torch_0d = True
         return out
@@ -8693,7 +8711,12 @@ def _install_misc(g, Var, _DTYPE_OBJS=None):
         if isinstance(obj, jt.Var):
             # Var.numpy() can materialize a CUDA Var on CPU in-place. Checkpoint
             # serialization must not change the live module/optimizer tensors.
-            return {_VAR_TAG: True, "data": obj.clone().numpy(), "dtype": str(obj.dtype)}
+            try:
+                dev = obj.device_id()
+            except Exception:
+                dev = -1
+            return {_VAR_TAG: True, "data": obj.clone().numpy(), "dtype": str(obj.dtype),
+                    "device_id": dev}
         # Drop non-picklable callables (e.g. an LR scheduler's local lr_lambda
         # closure in an extra/scheduler state_dict). torch's LambdaLR.state_dict
         # does the same -- the lambda is rebuilt on load, not restored.
@@ -8721,7 +8744,11 @@ def _install_misc(g, Var, _DTYPE_OBJS=None):
             if obj.get(_VAR_TAG):
                 # from_numpy preserves wide dtypes (float64/int64); jt.array narrows
                 # them to float32/int32 -> torch.save/load silently downcast checkpoints.
-                return g.from_numpy(obj["data"])
+                v = g.from_numpy(obj["data"])
+                dev = obj.get("device_id")
+                if dev is not None and dev >= 0:
+                    v = v.migrate_to_device(dev)
+                return v
             return {k: _from_portable(v) for k, v in obj.items()}
         if isinstance(obj, (list, tuple)):
             t = type(obj)
@@ -10502,8 +10529,7 @@ def _install_misc(g, Var, _DTYPE_OBJS=None):
         nd = input.ndim
         dims = [d % nd for d in dims]
         target = [s for i, s in enumerate(input.shape) if i not in dims]
-        # jittor has no 0-dim tensors; a full reduction stays (1,).
-        return out.reshape(target) if target else out.reshape(-1)
+        return out.reshape(target)
     _alias("logsumexp", _logsumexp); Var.logsumexp = _logsumexp
     def _nansum(input, dim=None, keepdim=False, **k):
         z = jt.nan_to_num(input, nan=0.0)

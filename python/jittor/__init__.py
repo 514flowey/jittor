@@ -2830,7 +2830,18 @@ Var.__array__ = _var__array__
 Var.__array_priority__ = 2000
 # __reduce__, __module__ is used for pickle.dump and pickle.load
 Var.__module__ = "jittor"
-Var.__reduce__ = lambda self: (Var, (self.data,))
+def _rebuild_var(data, device_id):
+    v = Var(data)
+    if device_id is not None and device_id >= 0:
+        v = v.migrate_to_device(device_id)
+    return v
+def _var__reduce__(self):
+    try:
+        dev = self.device_id()
+    except Exception:
+        dev = -1
+    return (_rebuild_var, (self.data, dev))
+Var.__reduce__ = _var__reduce__
 
 from . import nn
 from . import attention

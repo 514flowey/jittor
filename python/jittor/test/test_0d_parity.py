@@ -168,6 +168,50 @@ class Test0DParity(JittorTestCase):
             self.assertEqual(str((x * 2.0).dtype), "float32")
         self._devices(body)
 
+    def test_pow_backward_0d_base(self):
+        # binary_op.cc's pow-backward branch built its "1" constant as a
+        # literal shape-(1,) array instead of a 0-D one; once x is a real
+        # 0-D Var this shape mismatch against dout ([]) crashed grad.cc's
+        # broadcast-consistency check (jittor-core-gaps.md §3.1, criterion 5).
+        def body(d):
+            x = jt.array(2.0)
+            x.requires_grad = True
+            y = jt.array(3.0)
+            z = x ** y
+            self.assertEqual(z.shape, [])
+            gx = jt.grad(z, x)
+            self.assertEqual(gx.shape, [])
+            np.testing.assert_allclose(gx.item(), 3 * 2.0 ** 2, atol=1e-4)
+            gy = jt.grad(z, y)
+            self.assertEqual(gy.shape, [])
+            np.testing.assert_allclose(gy.item(), 2.0 ** 3 * np.log(2.0), atol=1e-4)
+        self._devices(body)
+
+    def test_pow_backward_0d_base_batched(self):
+        # same crash, reached through a batched (non-0-D) base so the pow
+        # backward's "ones" constant broadcasts against a real shape too.
+        def body(d):
+            x = jt.array([2.0, 3.0, 4.0])
+            x.requires_grad = True
+            z = (x ** 2.0).sum()
+            g = jt.grad(z, x)
+            np.testing.assert_allclose(g.numpy(), 2 * x.numpy(), atol=1e-4)
+        self._devices(body)
+
+    def test_tensordot_full_contraction_is_0d(self):
+        # torch_compat._tensordot's full-contraction branch (dims == 2 on
+        # two 2-D operands) must return a real 0-D result, matching
+        # torch.tensordot(a, b, dims=2) (jittor-core-gaps.md §3.1, criterion 3).
+        # Previously untested: git history shows no coverage of this branch.
+        def body(d):
+            a = np.random.randn(3, 4).astype("float32")
+            b = np.random.randn(3, 4).astype("float32")
+            out = jt.tensordot(jt.array(a), jt.array(b), dims=2)
+            ref = np.tensordot(a, b, axes=2)
+            self.assertEqual(tuple(out.shape), ())
+            np.testing.assert_allclose(out.item(), ref, atol=1e-3, rtol=1e-3)
+        self._devices(body)
+
 
 if __name__ == "__main__":
     unittest.main()

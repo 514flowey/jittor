@@ -263,7 +263,12 @@ void Executor::run_sync(vector<Var*> vars, bool device_sync, bool weak_sync) {
             for (auto i : node->_inputs)
                 if (i.node->tflag != t && !i.node->is_finished()) {
                     i.node->tflag = t;
-                    need_opt += i.node->flags.get(NodeFlags::_has_gopt);
+                    // _has_gopt is an op-only flag; it bit-aliases with
+                    // Var's explicit device-pin encoding (NodeFlags::_device_tag,
+                    // see Var::set_device_pin), so it must never be read on a
+                    // Var node -- otherwise a Var pinned to CPU or an odd GPU
+                    // id can be spuriously "has_gopt".
+                    need_opt += !i.node->is_var() && i.node->flags.get(NodeFlags::_has_gopt);
                     bfs_q.push_back(i.node);
                 }
             // this var has been fetched
@@ -276,7 +281,7 @@ void Executor::run_sync(vector<Var*> vars, bool device_sync, bool weak_sync) {
                         (n.node->id <= max_id ||
                             n.node->flags.get(NodeFlags::_fetch))) {
                         n.node->tflag = t;
-                        need_opt += n.node->flags.get(NodeFlags::_has_gopt);
+                        need_opt += !n.node->is_var() && n.node->flags.get(NodeFlags::_has_gopt);
                         bfs_q.push_back(n.node);
                     }
                 }
@@ -284,7 +289,9 @@ void Executor::run_sync(vector<Var*> vars, bool device_sync, bool weak_sync) {
         }
         if (!need_opt || gopt_disable) break;
         for (Node* n : bfs_q) {
-            if (n->flags.get(NodeFlags::_has_gopt)) {
+            // see the _has_gopt / _device_tag bit-aliasing note above: a Var
+            // must never be treated as "has_gopt" or have n->op() called.
+            if (!n->is_var() && n->flags.get(NodeFlags::_has_gopt)) {
                 n->op()->graph_optimize();
                 n->flags.set(NodeFlags::_has_gopt, 0);
             }

@@ -201,6 +201,18 @@ class TestLogsumexp(Base):
                     msg=f"logsumexp keepdim {dev}")
         both_devices(body)
 
+    def test_logsumexp_full_reduction_is_0d(self):
+        # _logsumexp used to special-case "no dims left" to reshape(-1)
+        # (jittor's (1,) collapse) instead of the real 0-D reshape([]) that
+        # every other full reduction gets (jittor-core-gaps.md §3.1).
+        x = self.x
+        def body(dev):
+            out = torch.logsumexp(t(x), dim=(0, 1))
+            self.assertEqual(tuple(out.shape), (), msg=f"logsumexp full reduce shape {dev}")
+            self.ac(out.numpy(), np_logsumexp(x, (0, 1)), rtol=1e-5, atol=1e-5,
+                    msg=f"logsumexp full reduce value {dev}")
+        both_devices(body)
+
 
 class TestAllAny(Base):
     def setUp(self):

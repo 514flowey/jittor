@@ -106,6 +106,20 @@ class TestComplex128Native(unittest.TestCase):
             np.testing.assert_allclose(complex(s.item()), a.sum(), atol=1e-10)
         both_devices(body)
 
+    def test_einsum(self):
+        # matmul/reduce were covered but einsum (named explicitly in
+        # jittor-core-gaps.md §3.2 acceptance #2) had no complex128 test.
+        rng = np.random.RandomState(12)
+        A = (rng.randn(3, 4) + 1j * rng.randn(3, 4)).astype("complex128")
+        B = (rng.randn(4, 5) + 1j * rng.randn(4, 5)).astype("complex128")
+        ref = np.einsum("ij,jk->ik", A, B)
+        def body(dev):
+            r = jt.linalg.einsum("ij,jk->ik", jt.array(A), jt.array(B))
+            self.assertEqual(str(r.dtype), "complex128", f"einsum dtype {dev}")
+            np.testing.assert_allclose(np.asarray(r.numpy()), ref, atol=1e-9, rtol=1e-9,
+                                       err_msg=f"einsum {dev}")
+        both_devices(body)
+
     def test_grad(self):
         rng = np.random.RandomState(11)
         a = (rng.randn(4) + 1j * rng.randn(4)).astype("complex128")
