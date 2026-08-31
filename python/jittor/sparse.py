@@ -323,8 +323,12 @@ class SparseVar:
         return SparseVar(indices, self.values, shape)
 
     def to_dense(self):
-        assert self.ndim == 2, "to_dense() only supports a plain 2-D sparse matrix"
-        return _coo_to_dense(self.indices[0], self.indices[1], self.values, self.shape)
+        ret = jt.zeros(self.shape,self.values.dtype)
+        indices = tuple(
+            index.reshape((-1,)) for index in self.indices.split(1, dim=0)
+        )
+        ret[indices]=self.values
+        return ret
 
     def coalesce(self):
         assert self.ndim == 2, "coalesce() only supports a plain 2-D sparse matrix"
