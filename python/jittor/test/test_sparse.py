@@ -133,6 +133,25 @@ class TestSparseCreateAndConvert(unittest.TestCase):
                                        err_msg=f"coo->csr->coo->dense round trip {dev}")
         both_devices(body)
 
+    def test_csr_row_indices_with_empty_rows(self):
+        row = np.array([0, 0, 3], dtype="int32")
+        col = np.array([0, 2, 1], dtype="int32")
+        values = np.array([1.0, 2.0, 3.0], dtype="float32")
+
+        def body(dev):
+            sp = _to_sparsevar(row, col, values, (5, 3)).to_csr()
+            back = sp.to_coo()
+            np.testing.assert_array_equal(
+                back.indices[0].numpy(), row, err_msg=f"csr row indices {dev}"
+            )
+            np.testing.assert_allclose(
+                sp.to_dense().numpy(),
+                _dense_ref(row, col, values, (5, 3)),
+                err_msg=f"csr empty rows {dev}",
+            )
+
+        both_devices(body)
+
     def test_csr_transpose_and_coalesce(self):
         row = np.array([0, 0, 1], dtype="int32")
         col = np.array([1, 1, 0], dtype="int32")
