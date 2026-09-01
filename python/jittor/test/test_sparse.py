@@ -23,6 +23,12 @@ import numpy as np
 import jittor as jt
 from jittor import sparse
 
+try:
+    import torch
+    skip_this_test = not hasattr(torch.sparse, "FloatTensor")
+except ImportError:
+    skip_this_test = True
+
 _DEVICES = [("cpu", 0)] + ([("cuda", 1)] if jt.has_cuda else [])
 
 
@@ -125,6 +131,25 @@ class TestSparseCreateAndConvert(unittest.TestCase):
             back = csr.to_coo()
             np.testing.assert_allclose(back.to_dense().numpy(), sp.to_dense().numpy(),
                                        err_msg=f"coo->csr->coo->dense round trip {dev}")
+        both_devices(body)
+
+    def test_csr_row_indices_with_empty_rows(self):
+        row = np.array([0, 0, 3], dtype="int32")
+        col = np.array([0, 2, 1], dtype="int32")
+        values = np.array([1.0, 2.0, 3.0], dtype="float32")
+
+        def body(dev):
+            sp = _to_sparsevar(row, col, values, (5, 3)).to_csr()
+            back = sp.to_coo()
+            np.testing.assert_array_equal(
+                back.indices[0].numpy(), row, err_msg=f"csr row indices {dev}"
+            )
+            np.testing.assert_allclose(
+                sp.to_dense().numpy(),
+                _dense_ref(row, col, values, (5, 3)),
+                err_msg=f"csr empty rows {dev}",
+            )
+
         both_devices(body)
 
     def test_csr_transpose_and_coalesce(self):
@@ -370,7 +395,9 @@ class TestSpmm(unittest.TestCase):
             sp = _to_sparsevar(row, col, values, (M, N))
             y = jt.array(rng.randn(N, K).astype("float32"))
             out = sparse.spmm(sp, y)
-            ref = _dense_ref(row, col, values, (M, N)) @ y.numpy()
+            y_numpy = y.numpy()
+            ref = np.zeros((M, K), dtype="float32")
+            np.add.at(ref, row, values[:, None] * y_numpy[col])
             np.testing.assert_allclose(out.numpy(), ref, atol=1e-3, rtol=1e-3,
                                        err_msg=f"no-densify large-shape spmm {dev}")
         both_devices(body)

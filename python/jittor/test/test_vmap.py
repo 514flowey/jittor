@@ -21,6 +21,20 @@ class TestVmap(unittest.TestCase):
         out = jt.vmap(f)(x)
         np.testing.assert_allclose(out.numpy(), np.sin(x.numpy()) * 2 + 1, atol=1e-5)
 
+    def test_install_preserves_plain_transpose_calling_conventions(self):
+        x_numpy = np.arange(24, dtype=np.float32).reshape(2, 3, 4)
+        x = jt.array(x_numpy)
+        jt.vmap(lambda a: a)(x).sync()
+
+        np.testing.assert_array_equal(
+            x.transpose(-1, -2).numpy(), x_numpy.swapaxes(-1, -2)
+        )
+        np.testing.assert_array_equal(
+            x.transpose((2, 0, 1)).numpy(), x_numpy.transpose((2, 0, 1))
+        )
+        np.testing.assert_array_equal((x == x).numpy(), np.ones(x.shape, dtype=bool))
+        np.testing.assert_array_equal(jt.init.eye(3).numpy(), np.eye(3))
+
     def test_reduce_dim(self):
         def f(x):
             return x.sum(dim=0)

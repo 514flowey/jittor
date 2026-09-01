@@ -135,8 +135,11 @@ def _csr_row_indices(crow_indices, nnz):
     def forward_code(np_, data):
         crow_ = data["inputs"][0]
         out = data["outputs"][0]
-        counts = crow_[1:] - crow_[:-1]
-        np_.copyto(out, np_.repeat(np_.arange(len(counts), dtype=out.dtype), counts))
+        # CuPy does not accept a device ndarray as the `repeats` argument of repeat.
+        # Search each stored element offset in the CSR row pointers instead; this stays
+        # device-resident and also handles empty rows without a host synchronization.
+        rows = np_.searchsorted(crow_[1:], np_.arange(nnz), side="right")
+        np_.copyto(out, rows.astype(out.dtype))
 
     return jt.numpy_code((nnz,), crow_indices.dtype, [crow_indices], forward_code,
                           [_unused_backward])
@@ -204,8 +207,9 @@ def _spmm_backward_values(np_, data, layout):
         row_, col_, y_ = data["inputs"][0], data["inputs"][1], data["inputs"][3]
     else:  # csr
         crow_, col_, y_ = data["inputs"][0], data["inputs"][1], data["inputs"][3]
-        counts = crow_[1:] - crow_[:-1]
-        row_ = np_.repeat(np_.arange(len(counts)), counts)
+        row_ = np_.searchsorted(
+            crow_[1:], np_.arange(len(col_)), side="right"
+        )
     out = data["outputs"][0]
     # dValues[e] = dOut[row[e],:] . conj(B[col[e],:])  (per-nonzero dot product, dense
     # gather -- no sparse matrix needed for this direction). The conj() on B, NOT dOut,
@@ -327,8 +331,7 @@ class SparseVar:
         indices = tuple(
             index.reshape((-1,)) for index in self.indices.split(1, dim=0)
         )
-        ret[indices]=self.values
-        return ret
+        return ret.setitem(indices, self.values, "add")
 
     def coalesce(self):
         assert self.ndim == 2, "coalesce() only supports a plain 2-D sparse matrix"
