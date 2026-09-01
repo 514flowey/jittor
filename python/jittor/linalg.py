@@ -223,19 +223,16 @@ def complex_qr(x):
     r"""
     do the qr factorization of x in the below formula:
     x = QR where Q has orthonormal columns and R is upper-triangular.
-    :param x (...,M,N), M>=N (reduced/"economy" QR; M<N is not supported --
-        the backward relies on R being square and invertible, which only
-        holds for the tall/square case):
-    :return: q (...,M,N), r (...,N,N).
+    :param x (...,M,N), reduced/"economy" QR. Forward supports all rectangular
+        matrices; backward currently requires M>=N because it relies on R being
+        square and invertible:
+    :return: q (...,M,K), r (...,K,N), where K=min(M,N).
     """
     assert isinstance(x, ComplexNumber), "linalg_qr is implemented for nn.ComplexNumber"
     assert x.real.dtype in (jt.float32, jt.float64) and x.imag.dtype == x.real.dtype, \
         "real and imag in ComplexNumber should both be jt.float32 (complex64) or both jt.float64 (complex128)"
     m, n = x.shape[-2:]
-    assert m >= n, (
-        f"complex_qr only supports M>=N (reduced QR of a tall/square matrix), got shape {tuple(x.shape)}. "
-        "R is square (N,N) only in this case; M<N (wide) reduced QR has no square-R backward here."
-    )
+    k = min(m, n)
     def forward_code(np, data):
         def _stack_to_complex(x):
             return x[..., 0] + 1j * x[..., 1]
@@ -268,6 +265,11 @@ def complex_qr(x):
 
         dout = _stack_to_complex(data["dout"])
         out = data["outputs"][0]
+        if q_shape[-2] < r_shape[-1]:
+            raise NotImplementedError(
+                "complex_qr backward currently supports tall/square matrices "
+                "only (M>=N)"
+            )
         out_index = data["out_index"]
         q, r = data["f_outputs"]
         q = _stack_to_complex(q)
@@ -293,8 +295,10 @@ def complex_qr(x):
 
         np.copyto(out, _complex_to_stack(ret))
 
-    sq = list(x.shape[:-2]) + [m, n, 2]
-    sr = list(x.shape[:-2]) + [n, n, 2]
+    q_shape = list(x.shape[:-2]) + [m, k]
+    r_shape = list(x.shape[:-2]) + [k, n]
+    sq = q_shape + [2]
+    sr = r_shape + [2]
     q, r = jt.numpy_code(
         [sq, sr],
         [x.value.dtype, x.value.dtype],
