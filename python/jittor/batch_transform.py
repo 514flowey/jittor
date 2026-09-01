@@ -596,13 +596,17 @@ _ORIG_RANDOM = None
 _PATCHED = False
 
 
-def _make_binary_dunder_forward(name):
+def _make_binary_dunder_forward(name, original=None):
     def f(self, other):
+        if original is not None and not isinstance(other, BatchedVar):
+            return original(self, other)
         return _apply_binary(name, self, other)
     return f
 
-def _make_binary_dunder_reverse(name):
+def _make_binary_dunder_reverse(name, original=None):
     def f(self, other):
+        if original is not None and not isinstance(other, BatchedVar):
+            return original(self, other)
         return _apply_binary(name, other, self)
     return f
 
@@ -686,9 +690,11 @@ def install_batching_patches():
         _install(jt, name, patched)
         fwd, rev = _BINARY_DUNDERS.get(name, (None, None))
         if fwd:
-            _install(jt.Var, fwd, _make_binary_dunder_forward(name))
+            original = getattr(jt.Var, fwd)
+            _install(jt.Var, fwd, _make_binary_dunder_forward(name, original))
         if rev:
-            _install(jt.Var, rev, _make_binary_dunder_reverse(name))
+            original = getattr(jt.Var, rev)
+            _install(jt.Var, rev, _make_binary_dunder_reverse(name, original))
 
     for name in _UNARY_NAMES:
         orig = getattr(jt.Var, name, None) or getattr(jt, name, None)

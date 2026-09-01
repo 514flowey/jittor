@@ -32,6 +32,8 @@ class TestVmap(unittest.TestCase):
         np.testing.assert_array_equal(
             x.transpose((2, 0, 1)).numpy(), x_numpy.transpose((2, 0, 1))
         )
+        np.testing.assert_array_equal((x == x).numpy(), np.ones(x.shape, dtype=bool))
+        np.testing.assert_array_equal(jt.init.eye(3).numpy(), np.eye(3))
 
     def test_reduce_dim(self):
         def f(x):
