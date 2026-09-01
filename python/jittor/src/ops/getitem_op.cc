@@ -459,8 +459,8 @@ void GetitemOp::jit_prepare(JK& jk) {
         auto io = i_to_o[i];
         jk << "«IV" << JK::hex1(i) << ':' << JK::shex1(iv);
         jk << "«IO" << JK::hex1(i) << ':' << JK::shex1(io);
-        auto& v = vs.slices[iv];
         if (iv>=0 && io==-1) {
+            auto& v = vs.slices[iv];
             if (v.is_int()) {
                 jk << "«VS" << JK::hex1(i) << ":-1";
             } else
@@ -483,6 +483,7 @@ void GetitemOp::jit_prepare(JK& jk) {
             }
         } else
         if (iv>=0 && io>=0) {
+            auto& v = vs.slices[iv];
             ASSERT(v.is_slice());
             jk << "«VS" << JK::hex1(i) << ':';
             if (std::abs(v.slice.step) <= 1)
