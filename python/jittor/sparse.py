@@ -327,8 +327,7 @@ class SparseVar:
         indices = tuple(
             index.reshape((-1,)) for index in self.indices.split(1, dim=0)
         )
-        ret[indices]=self.values
-        return ret
+        return ret.setitem(indices, self.values, "add")
 
     def coalesce(self):
         assert self.ndim == 2, "coalesce() only supports a plain 2-D sparse matrix"

@@ -747,6 +747,8 @@ def install_batching_patches():
 
     _ORIG_TRANSPOSE = jt.Var.transpose
     def _transpose(a, *dims):
+        if not isinstance(a, BatchedVar):
+            return _ORIG_TRANSPOSE(a, *dims)
         return _apply_transpose(a, _flatten_shape_args(dims) or None)
     _install(jt.Var, "transpose", _transpose)
     _install(jt.Var, "permute", _transpose)

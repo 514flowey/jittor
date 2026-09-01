@@ -23,6 +23,12 @@ import numpy as np
 import jittor as jt
 from jittor import sparse
 
+try:
+    import torch
+    skip_this_test = not hasattr(torch.sparse, "FloatTensor")
+except ImportError:
+    skip_this_test = True
+
 _DEVICES = [("cpu", 0)] + ([("cuda", 1)] if jt.has_cuda else [])
 
 
@@ -370,7 +376,9 @@ class TestSpmm(unittest.TestCase):
             sp = _to_sparsevar(row, col, values, (M, N))
             y = jt.array(rng.randn(N, K).astype("float32"))
             out = sparse.spmm(sp, y)
-            ref = _dense_ref(row, col, values, (M, N)) @ y.numpy()
+            y_numpy = y.numpy()
+            ref = np.zeros((M, K), dtype="float32")
+            np.add.at(ref, row, values[:, None] * y_numpy[col])
             np.testing.assert_allclose(out.numpy(), ref, atol=1e-3, rtol=1e-3,
                                        err_msg=f"no-densify large-shape spmm {dev}")
         both_devices(body)
