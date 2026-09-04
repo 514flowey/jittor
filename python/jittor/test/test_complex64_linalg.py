@@ -247,12 +247,13 @@ class _Mixin:
             rtol=1e-3,
         )
 
+        # Wide (M<N) backward is supported too; see test_qr_wide_forward_and_backward
+        # below for a gradcheck against a numpy finite-difference oracle.
         x = _to_complex64_var(a)
         x.requires_grad = True
-        with self.assertRaisesRegex(NotImplementedError, "tall/square"):
-            qb, rb = linalg.qr(x)
-            loss = jt.abs(qb).sum() + jt.abs(rb).sum()
-            jt.grad(loss, [x])[0].sync()
+        qb, rb = linalg.qr(x)
+        loss = jt.abs(qb).sum() + jt.abs(rb).sum()
+        jt.grad(loss, [x])[0].sync()
 
     def test_eigh_backward_eigenvector_dependent(self):
         rng = np.random.RandomState(11)
