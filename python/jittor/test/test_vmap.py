@@ -3,11 +3,11 @@
 # This file is subject to the terms and conditions defined in
 # file 'LICENSE.txt', which is part of this source code package.
 # ***************************************************************
-# Tests for jt.vmap (jittor-core-gaps.md section 3.5): a real batching
+# Tests for jt.vmap (jittor-core-gaps.md section 3.1): a real batching
 # transform that builds one batched op graph, instead of the loop-based
 # fallback in torch_compat.py's vmap. Core-set scope agreed with the user:
-# elementwise unary/binary, reduce, reshape/transpose/broadcast, matmul/
-# einsum, getitem/setitem (basic + simple fancy indexing), and random.
+# elementwise unary/binary, reduce, cast, reshape/transpose/broadcast,
+# matmul/einsum, getitem/setitem (basic + simple fancy indexing), and random.
 import unittest
 import numpy as np
 import jittor as jt
@@ -21,6 +21,18 @@ class TestVmap(unittest.TestCase):
         x = jt.array(np.arange(12, dtype=np.float32).reshape(4, 3))
         out = jt.vmap(f)(x)
         np.testing.assert_allclose(out.numpy(), np.sin(x.numpy()) * 2 + 1, atol=1e-5)
+
+    def test_cast_and_astype(self):
+        x_numpy = np.arange(8, dtype=np.float32).reshape(4, 2)
+        x = jt.array(x_numpy)
+
+        astype_out = jt.vmap(lambda value: value.astype("complex64"))(x)
+        cast_out = jt.vmap(lambda value: jt.cast(value, "float64"))(x)
+
+        self.assertEqual(str(astype_out.dtype), "complex64")
+        self.assertEqual(str(cast_out.dtype), "float64")
+        np.testing.assert_array_equal(astype_out.numpy(), x_numpy.astype("complex64"))
+        np.testing.assert_array_equal(cast_out.numpy(), x_numpy.astype("float64"))
 
     def test_install_preserves_plain_transpose_calling_conventions(self):
         x_numpy = np.arange(24, dtype=np.float32).reshape(2, 3, 4)

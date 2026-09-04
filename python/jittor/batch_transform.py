@@ -1,4 +1,4 @@
-# jittor-core-gaps.md section 3.5: a real batching transform (vmap), as opposed
+# jittor-core-gaps.md section 3.1: a real batching transform (vmap), as opposed
 # to the loop-based fallback in torch_compat.py's `vmap`/`torch.func.vmap`.
 #
 # Design: a BatchedVar wraps a real jt.Var whose physical axis 0 is a batch
@@ -119,6 +119,8 @@ class BatchedVar:
             return lambda dim=None, keepdims=False: _apply_maxmin(name, self, dim, keepdims)
         if name in _BINARY_NAMES:
             return lambda other: _apply_binary(name, self, other)
+        if name in ("cast", "astype"):
+            return lambda dtype: _apply_cast(self, dtype)
         if name in ("reshape", "view"):
             return lambda *shape: _apply_reshape(self, _flatten_shape_args(shape))
         if name in ("transpose", "permute"):
@@ -150,7 +152,8 @@ class BatchedVar:
         raise NotImplementedError(
             f"vmap: no batching rule for `.{name}` -- supported ops are limited to "
             "elementwise unary/binary, reduce (sum/mean/max/min/prod/argmax/argmin), "
-            "reshape/transpose/permute/unsqueeze, matmul/einsum, getitem/setitem, "
+            "cast/astype, reshape/transpose/permute/unsqueeze, matmul/einsum, "
+            "getitem/setitem, "
             "detach/start_grad/stop_grad, and random. Avoid calling this op inside a "
             "vmapped function, or restructure so it runs outside vmap.")
 
@@ -242,6 +245,12 @@ def _apply_unary(name, a):
     if not isinstance(a, BatchedVar):
         return _ORIG_UNARY[name](a)
     return BatchedVar(_apply_unary(name, a.value), a.level)
+
+
+def _apply_cast(a, dtype):
+    if not isinstance(a, BatchedVar):
+        return _ORIG_CAST(a, dtype)
+    return BatchedVar(_apply_cast(a.value, dtype), a.level)
 
 
 def _apply_real(a):
@@ -724,8 +733,8 @@ def vmap(func, in_dims=0, out_dims=0, randomness="different"):
         closure-captured value).
 
     Supported ops inside `func`: elementwise unary/binary (incl. conj),
-    real/imag, reduce (sum/mean/max/min/prod/argmax/argmin), reshape/
-    transpose/permute/unsqueeze/broadcast, matmul/einsum, getitem/setitem
+    real/imag, reduce (sum/mean/max/min/prod/argmax/argmin), cast/astype,
+    reshape/transpose/permute/unsqueeze/broadcast, matmul/einsum, getitem/setitem
     (incl. simple fancy indexing), detach/start_grad/stop_grad (so
     gradfunctional's vjp/jvp compose: `vmap(lambda x, v: jvp(f, x, v))`),
     and random. Anything else raises NotImplementedError.
@@ -797,6 +806,7 @@ _UNARY_DUNDERS = {"abs": "__abs__", "negative": "__neg__"}
 
 _ORIG_BINARY, _ORIG_UNARY, _ORIG_REDUCE = {}, {}, {}
 _ORIG_ARGREDUCE = {}
+_ORIG_CAST = None
 _ORIG_RESHAPE = _ORIG_TRANSPOSE = _ORIG_UNSQUEEZE = _ORIG_BROADCAST = None
 _ORIG_MATMUL = _ORIG_EINSUM = None
 _ORIG_GETITEM = _ORIG_SETITEM = None
@@ -883,7 +893,7 @@ def install_batching_patches():
     while a call with no BatchedVar involved is unaffected (falls through to
     the original implementation with zero added overhead beyond one isinstance
     check). Called once, lazily, the first time jt.vmap() is used. '''
-    global _PATCHED, _ORIG_RESHAPE, _ORIG_TRANSPOSE, _ORIG_UNSQUEEZE, _ORIG_BROADCAST
+    global _PATCHED, _ORIG_CAST, _ORIG_RESHAPE, _ORIG_TRANSPOSE, _ORIG_UNSQUEEZE, _ORIG_BROADCAST
     global _ORIG_MATMUL, _ORIG_EINSUM, _ORIG_GETITEM, _ORIG_SETITEM, _ORIG_GRAD, _ORIG_RANDOM
     if _PATCHED:
         return
@@ -952,6 +962,13 @@ def install_batching_patches():
             return f
         _install(jt.Var, name, make())
         _install(jt, name, make())
+
+    _ORIG_CAST = jt.Var.cast
+    def _cast(a, dtype):
+        return _apply_cast(a, dtype)
+    _install(jt.Var, "cast", _cast)
+    _install(jt.Var, "astype", _cast)
+    _install(jt, "cast", _cast)
 
     _ORIG_RESHAPE = jt.Var.reshape
     def _reshape(a, *shape):
