@@ -459,8 +459,8 @@ void GetitemOp::jit_prepare(JK& jk) {
         auto io = i_to_o[i];
         jk << "«IV" << JK::hex1(i) << ':' << JK::shex1(iv);
         jk << "«IO" << JK::hex1(i) << ':' << JK::shex1(io);
-        auto& v = vs.slices[iv];
         if (iv>=0 && io==-1) {
+            auto& v = vs.slices[iv];
             if (v.is_int()) {
                 jk << "«VS" << JK::hex1(i) << ":-1";
             } else
@@ -483,6 +483,7 @@ void GetitemOp::jit_prepare(JK& jk) {
             }
         } else
         if (iv>=0 && io>=0) {
+            auto& v = vs.slices[iv];
             ASSERT(v.is_slice());
             jk << "«VS" << JK::hex1(i) << ':';
             if (std::abs(v.slice.step) <= 1)
@@ -530,8 +531,10 @@ void GetitemOp::jit_run() {
         @if(IV@i==-1,oshape@{IO@i},
         @if(IV@i==-2,1,inshape@i));
     )
-    index_t istride@{IDIM-1} = 1;
-    @for(i, IDIM-2, -1, -1, index_t istride@i = istride@{i+1} * ishape@{i+1};)
+    @if(IDIM>0,
+        index_t istride@{IDIM-1} = 1;
+        @for(i, IDIM-2, -1, -1, index_t istride@i = istride@{i+1} * ishape@{i+1};)
+    )
 
     
     @for(i, 0, IDIM, 
@@ -550,10 +553,12 @@ void GetitemOp::jit_run() {
     @for(i, 0, IDIM, 
         @if(IV@i>=0 && IO@i<0, 
             @if(VS@i>=0,
-                index_t vs@i@@s@{VD-1} = 1;
                 VST@i* vp@i = vs.slices[IV@i].var->ptr<VST@i>();
-                @for(j,VD-2,-1,-1,index_t vs@i@@s@j = vs@i@@s@{j+1} * 
-                    @if((VS@i>>(j+1))&1,oshape@{j+1+FOV},1);
+                @if(VD>0,
+                    index_t vs@i@@s@{VD-1} = 1;
+                    @for(j,VD-2,-1,-1,index_t vs@i@@s@j = vs@i@@s@{j+1} *
+                        @if((VS@i>>(j+1))&1,oshape@{j+1+FOV},1);
+                    )
                 )
             );
         )

@@ -252,9 +252,19 @@ inline NanoString complex_promote(NanoString x, NanoString y) {
 inline NanoString complex_promote1(NanoString x) {
     return x.dsize() == 16 ? ns_complex128 : ns_complex64;
 }
+inline NanoString complex_promote_scalar_tensor(NanoString tensor) {
+    if (tensor.is_complex()) return complex_promote1(tensor);
+    if (tensor.is_float() && tensor.dsize() >= 8) return ns_complex128;
+    return ns_complex64;
+}
+inline NanoString complex_promote(NanoString x, NanoString y, bool xscalar, bool yscalar) {
+    if (xscalar != yscalar)
+        return complex_promote_scalar_tensor(xscalar ? y : x);
+    return complex_promote(x, y);
+}
 
 inline  NanoString dtype_infer(NanoString x, NanoString y, bool xscalar=false, bool yscalar=false) {
-    if (x.is_complex() || y.is_complex()) return complex_promote(x, y);  // complex propagates
+    if (x.is_complex() || y.is_complex()) return complex_promote(x, y, xscalar, yscalar);  // complex propagates
     int dsize_ = std::max(x.dsize_(), y.dsize_());
     if (xscalar) dsize_ = y.dsize_();
     if (yscalar) dsize_ = x.dsize_();
@@ -270,7 +280,7 @@ inline  NanoString dtype_infer(NanoString x, NanoString y, bool xscalar=false, b
 // @pyjt(binary_dtype_infer)
 inline NanoString binary_dtype_infer(NanoString op, NanoString x, NanoString y, bool xscalar=false, bool yscalar=false) {
     if (op.is_bool()) return ns_bool;   // comparisons -> bool even for complex
-    if (x.is_complex() || y.is_complex()) return complex_promote(x, y);  // complex arithmetic
+    if (x.is_complex() || y.is_complex()) return complex_promote(x, y, xscalar, yscalar);  // complex arithmetic
     int dsize_ = std::max(x.dsize_(), y.dsize_());
     if (xscalar) dsize_ = y.dsize_();
     if (yscalar) dsize_ = x.dsize_();

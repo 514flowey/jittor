@@ -232,6 +232,28 @@ class _Mixin:
         got = _np(g)
         np.testing.assert_allclose(got, ref, atol=3e-2, rtol=3e-2)
 
+    def test_qr_wide_forward(self):
+        rng = np.random.RandomState(13)
+        a = (rng.randn(2, 5) + 1j * rng.randn(2, 5)).astype("complex64")
+        q, r = linalg.qr(_to_complex64_var(a))
+        self.assertEqual(tuple(q.shape), (2, 2))
+        self.assertEqual(tuple(r.shape), (2, 5))
+        qn, rn = _np(q), _np(r)
+        np.testing.assert_allclose(_dot(qn, rn), a, atol=1e-3, rtol=1e-3)
+        np.testing.assert_allclose(
+            _dot(np.conj(np.swapaxes(qn, -1, -2)), qn),
+            np.eye(2),
+            atol=1e-3,
+            rtol=1e-3,
+        )
+
+        x = _to_complex64_var(a)
+        x.requires_grad = True
+        with self.assertRaisesRegex(NotImplementedError, "tall/square"):
+            qb, rb = linalg.qr(x)
+            loss = jt.abs(qb).sum() + jt.abs(rb).sum()
+            jt.grad(loss, [x])[0].sync()
+
     def test_eigh_backward_eigenvector_dependent(self):
         rng = np.random.RandomState(11)
         b = (rng.randn(5, 5) + 1j * rng.randn(5, 5)).astype("complex64")

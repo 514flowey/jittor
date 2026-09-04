@@ -100,6 +100,38 @@ class TestComplex64Native(unittest.TestCase):
                                            err_msg=f"complex scalar {name} {dev}")
         both_devices(body)
 
+    def test_real_scalar_preserves_complex_tensor_width_and_gradient(self):
+        def body(dev):
+            theta = jt.array(np.array(0.18, dtype="float32"))
+            theta.start_grad()
+            complex_theta = theta.cast("complex64")
+
+            for scalar in (np.pi, np.float64(np.pi)):
+                scaled = complex_theta * scalar
+                self.assertEqual(
+                    str(scaled.dtype), "complex64", f"scaled dtype {dev}"
+                )
+                angle = scaled / 2
+                self.assertEqual(str(angle.dtype), "complex64", f"angle dtype {dev}")
+                self.assertEqual(str(angle.real.dtype), "float32", f"real dtype {dev}")
+                grad = jt.grad(angle.real, theta)
+                if isinstance(grad, (list, tuple)):
+                    grad = grad[0]
+                np.testing.assert_allclose(
+                    np.asarray(grad.numpy()),
+                    np.array(np.pi / 2, dtype="float32"),
+                    atol=1e-6,
+                    rtol=1e-6,
+                    err_msg=f"wrapped real scalar gradient {dev}",
+                )
+
+            reflected = np.float64(np.pi) * complex_theta
+            self.assertEqual(
+                str(reflected.dtype), "complex64", f"reflected dtype {dev}"
+            )
+
+        both_devices(body)
+
     def test_arithmetic(self):
         rng = np.random.RandomState(0)
         a = (rng.randn(8) + 1j * rng.randn(8)).astype("complex64")

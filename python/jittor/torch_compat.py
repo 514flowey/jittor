@@ -8167,12 +8167,19 @@ def _install_tensor_methods(g, Var, _DTYPE_OBJS=None):
             sd = _scalar_dtype_name(other)
             if sd is not None:
                 src_dt = _dtype_to_str(self.dtype)
-                tgt = _truediv_target(src_dt, sd)
+                # Python real/integer scalars are wrapped scalars in PyTorch:
+                # dividing a complex tensor by one preserves the tensor's complex
+                # width instead of widening complex64 for an int64 scalar.
+                tgt = src_dt if src_dt.startswith("complex") else _truediv_target(src_dt, sd)
                 # PyTorch's Python-float scalar division keeps the result dtype
                 # but uses the scalar value with enough precision to differ from
                 # division by a float32 tensor by 1 ulp in common cases. 3DGS hits
                 # both uint8 image normalization and RGB2SH float32/C0 this way.
-                use_wide = sd.startswith("float") and src_dt != "float64"
+                use_wide = (
+                    sd.startswith("float")
+                    and not src_dt.startswith("complex")
+                    and src_dt != "float64"
+                )
                 calc_dt = "float64" if use_wide else tgt
                 a = self if src_dt == calc_dt else self.cast(calc_dt)
                 b = jt.array(other, dtype=calc_dt) if use_wide else other

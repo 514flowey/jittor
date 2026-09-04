@@ -67,6 +67,44 @@ class Test0DParity(JittorTestCase):
             self.assertEqual(jt.array(1.0).transpose().shape, [])
         self._devices(body)
 
+    def test_scalar_newaxis(self):
+        def body(d):
+            scalar = jt.array(np.int32(3))
+            leading = scalar[None]
+            trailing = scalar[..., None]
+            self.assertEqual(leading.shape, [1])
+            self.assertEqual(trailing.shape, [1])
+            np.testing.assert_array_equal(leading.numpy(), np.array([3], np.int32))
+            np.testing.assert_array_equal(trailing.numpy(), np.array([3], np.int32))
+        self._devices(body)
+
+    def test_scalar_tensor_index(self):
+        def body(d):
+            values = jt.array([2.0, 3.0, 5.0])
+            index = jt.array(np.int32(1))
+            result = values[index]
+            self.assertEqual(result.shape, [])
+            self.assertEqual(result.item(), 3.0)
+        self._devices(body)
+
+    def test_scalar_tensor_index_with_unindexed_dimension(self):
+        def body(d):
+            values = jt.array([[2.0, 3.0, 5.0], [7.0, 11.0, 13.0]])
+            index = jt.array(np.int32(1))
+            result = values[:, index]
+            self.assertEqual(result.shape, [2])
+            np.testing.assert_array_equal(result.numpy(), np.array([3.0, 11.0]))
+        self._devices(body)
+
+    def test_scalar_tensor_setitem_with_unindexed_dimension(self):
+        def body(d):
+            values = jt.array([[2.0, 3.0, 5.0], [7.0, 11.0, 13.0]])
+            index = jt.array(np.int32(1))
+            result = values.setitem((slice(None), index), jt.array([17.0, 19.0]))
+            expected = np.array([[2.0, 17.0, 5.0], [7.0, 19.0, 13.0]])
+            np.testing.assert_array_equal(result.numpy(), expected)
+        self._devices(body)
+
     def test_argmax_argmin_full_reduce(self):
         # cub_arg_reduce_op.cc had a leftover "empty shape -> push 1" fallback
         # (same pattern as the old Var::numel() default) that only the CUDA
