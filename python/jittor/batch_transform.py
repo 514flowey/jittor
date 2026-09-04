@@ -25,12 +25,34 @@
 # nested inside it.
 #
 # Scope (see jittor-core-gaps.md section 3.5, "core set" agreed with the
-# user): elementwise unary/binary, reduce, reshape/transpose/broadcast,
-# matmul/einsum, getitem/setitem (basic + simple fancy indexing), and random.
-# conv/pool and other nn layers, sparse ops, custom numpy_code ops, and
+# user): elementwise unary/binary (incl. conj), real/imag, reduce, reshape/
+# transpose/broadcast, matmul/einsum, getitem/setitem (basic + simple fancy
+# indexing), detach/start_grad/stop_grad/requires_grad, and random (both
+# randomness="different" and "same"). conv/pool and other nn layers, sparse
+# ops, linalg ops (qr/svd/eigh/solve/...), custom numpy_code ops, and
 # fancy-index corner cases (batched index arrays, nested-depth mismatches in
-# setitem) are explicitly out of scope and fail loud rather than silently
-# looping or producing wrong results.
+# setitem) are explicitly out of scope (jittor-core-gaps.md §3.1 acceptance
+# #7) and fail loud rather than silently looping or producing wrong results.
+#
+# §3.1 "native vmap cannot compose with jvp/vjp": gradfunctional.vjp/jvp
+# (python/jittor/gradfunctional/functional.py) are themselves plain Python
+# functions built entirely out of ops in the scope above (grad/sum/detach/
+# start_grad/stop_grad/requires_grad/reshape/real/imag/...), so once those
+# ops have BatchedVar batching rules, `vmap(lambda x, v: jvp(f, x, v))` /
+# `vmap(lambda x, v: vjp(f, x, v))` compose with no vjp/jvp-specific code at
+# all -- the same "it's just a real op graph" argument as vmap(grad(f))
+# above, just one level higher. The two concrete gaps that used to break
+# this in practice were (a) detach/start_grad/stop_grad/requires_grad simply
+# didn't exist as BatchedVar operations (jvp/vjp's _grad_preprocess/
+# _grad_postprocess call them on every input/output), and (b) `.real`/
+# `.imag`/`.conj()` weren't batchable either, so no complex-valued
+# (quantum-state-style) computation could flow through vjp/jvp under vmap.
+# Both are fixed above/below. Nested vmap(vmap(...)) composes for the same
+# structural reason (every op in scope is recursion-correct at any nesting
+# depth, per the "peel one level" argument above); create_graph=True (higher-
+# order jvp/vjp) likewise needs no special-casing, since it only changes
+# whether `.detach()`/`.stop_grad()` are called at all in _grad_preprocess,
+# not what they do.
 import jittor as jt
 from collections.abc import Sequence as _Sequence
 
@@ -42,12 +64,11 @@ def _new_level():
     _level_counter[0] += 1
     return _level_counter[0]
 
-# Stack of (level, batch_size) for currently-executing vmap() calls, outermost
-# first. jt.random() has no BatchedVar argument to key off of (its args are
-# plain shape/dtype), so the only way to give it correct "randomness=different"
-# semantics (each batch element gets its own independent draw, matching
-# jt.random's own per-element-independent sampling one level up) is this
-# ambient context that vmap's wrapper pushes/pops around calling `func`.
+# Stack of (level, randomness, batch_size) for currently-executing vmap()
+# calls, outermost first. jt.random() has no BatchedVar argument to key off
+# of (its args are plain shape/dtype), so the only way to give it correct
+# "randomness" semantics (see _apply_random) is this ambient context that
+# vmap's wrapper pushes/pops around calling `func`.
 _active_batch_context = []
 
 
@@ -106,18 +127,72 @@ class BatchedVar:
             return lambda dim: _apply_unsqueeze(self, dim)
         if name in ("argmax", "argmin"):
             return lambda dim, keepdims=False: _apply_argreduce(name, self, dim, keepdims)
+        # jittor-core-gaps.md §3.1: gradfunctional's jvp/vjp (via
+        # _grad_preprocess/_grad_postprocess/_fill_in_zeros) call these on
+        # every input/output, so composing vmap(jvp(f))/vmap(vjp(f)) needs
+        # them to work on a BatchedVar. All three only touch autograd
+        # bookkeeping (a NodeFlags bit, or a real-but-shape-preserving detach
+        # op), never axis positions, so -- like the elementwise family above
+        # -- they simply peel one level, recurse, and rewrap/return self,
+        # correct at any nesting depth. `jt.Var.detach/start_grad/stop_grad`
+        # are never monkeypatched (unlike the ops above): a call always
+        # lands directly on a single Var with no "other operand" that could
+        # itself be a BatchedVar, so there's no mixed-argument case to
+        # intercept -- only the BatchedVar side of the dispatch is needed.
+        if name == "detach":
+            return lambda: _apply_detach(self)
+        if name == "start_grad":
+            return lambda: _apply_start_grad(self)
+        if name == "stop_grad":
+            return lambda: _apply_stop_grad(self)
+        if name in ("nelement", "numel"):
+            return lambda: _logical_numel(self)
         raise NotImplementedError(
             f"vmap: no batching rule for `.{name}` -- supported ops are limited to "
             "elementwise unary/binary, reduce (sum/mean/max/min/prod/argmax/argmin), "
-            "reshape/transpose/permute/unsqueeze, matmul/einsum, getitem/setitem, and "
-            "random. Avoid calling this op inside a vmapped function, or restructure "
-            "so it runs outside vmap.")
+            "reshape/transpose/permute/unsqueeze, matmul/einsum, getitem/setitem, "
+            "detach/start_grad/stop_grad, and random. Avoid calling this op inside a "
+            "vmapped function, or restructure so it runs outside vmap.")
 
     def __getitem__(self, index):
         return _apply_getitem(self, index)
 
     def __setitem__(self, index, value):
         _apply_setitem(self, index, value)
+
+    # jittor-core-gaps.md §3.1: `.real`/`.imag` are properties (not zero-arg
+    # methods, unlike `.conj()` which is folded into _UNARY_NAMES below), so
+    # they can't go through the generic __getattr__ dispatch above -- Python
+    # only calls __getattr__ once ordinary attribute/property lookup fails,
+    # and a `property` object here IS that lookup. Elementwise/shape-
+    # preserving like the rest of the unary family: peel one level, recurse,
+    # rewrap. This (plus `conj`) was a real, previously undocumented gap:
+    # any complex-valued (quantum-state-style) expectation value computation
+    # inside vmap needs at least one of conj/real/imag and none were
+    # batchable (see 2026-08-26-core-gaps-3.1-3.8-verification.md §6.2(b)).
+    @property
+    def real(self):
+        return BatchedVar(_apply_real(self.value), self.level)
+
+    @property
+    def imag(self):
+        return BatchedVar(_apply_imag(self.value), self.level)
+
+    # jittor-core-gaps.md §3.1: gradfunctional's `_grad_preprocess`/
+    # `_autograd_grad`/`_check_requires_grad` all read (and, for
+    # `requires_grad_`, write) `.requires_grad`; it is a thin view over the
+    # same stop-grad NodeFlags bit `.stop_grad()`/`.start_grad()` above
+    # mutate, so it must be defined as a real property here (not routed
+    # through __getattr__, for the same "Python checks properties before
+    # __getattr__" reason as `.real`/`.imag`) rather than raising
+    # NotImplementedError like an unhandled attribute would.
+    @property
+    def requires_grad(self):
+        return _get_requires_grad(self)
+
+    @requires_grad.setter
+    def requires_grad(self, flag):
+        _set_requires_grad(self, flag)
 
 
 def _flatten_shape_args(args):
@@ -169,6 +244,90 @@ def _apply_unary(name, a):
     return BatchedVar(_apply_unary(name, a.value), a.level)
 
 
+def _apply_real(a):
+    if not isinstance(a, BatchedVar):
+        return a.real
+    return BatchedVar(_apply_real(a.value), a.level)
+
+
+def _apply_imag(a):
+    if not isinstance(a, BatchedVar):
+        return a.imag
+    return BatchedVar(_apply_imag(a.value), a.level)
+
+
+# ---------------------------------------------------------------------------
+# Autograd bookkeeping (jittor-core-gaps.md §3.1): detach/start_grad/
+# stop_grad/requires_grad only flip a NodeFlags bit or make a shape-
+# preserving copy -- never touch axis positions -- so, like the elementwise
+# family above, they simply peel one level, recurse, and rewrap/return self.
+# These are the specific glue gradfunctional's vjp/jvp needs (via
+# _grad_preprocess/_grad_postprocess/_autograd_grad/_check_requires_grad) to
+# work when its inputs/outputs are BatchedVar, i.e. when vjp/jvp is called
+# *inside* a vmapped function (`vmap(lambda x, v: jvp(f, x, v))`).
+# ---------------------------------------------------------------------------
+
+def _apply_detach(a):
+    if not isinstance(a, BatchedVar):
+        return a.detach()
+    return BatchedVar(_apply_detach(a.value), a.level)
+
+
+def _apply_start_grad(a):
+    if not isinstance(a, BatchedVar):
+        a.start_grad()
+        return a
+    _apply_start_grad(a.value)
+    return a
+
+
+def _apply_stop_grad(a):
+    if not isinstance(a, BatchedVar):
+        a.stop_grad()
+        return a
+    _apply_stop_grad(a.value)
+    return a
+
+
+def _get_requires_grad(a):
+    if not isinstance(a, BatchedVar):
+        return a.requires_grad
+    return _get_requires_grad(a.value)
+
+
+def _set_requires_grad(a, flag):
+    if not isinstance(a, BatchedVar):
+        a.requires_grad = flag
+        return
+    _set_requires_grad(a.value, flag)
+
+
+def _logical_numel(a):
+    n = 1
+    for s in a.shape:
+        n *= int(s)
+    return n
+
+
+def _apply_like(fn, a, *args, **kwargs):
+    # Batching rule for zeros_like/ones_like/full_like. This is NOT just a
+    # convenience: gradfunctional's jvp() builds its "double backward trick"
+    # seed via jt.zeros_like(out) (see _zeros_seed_like) and that seed MUST
+    # itself be a genuinely per-example-independent BatchedVar, not merely a
+    # value that *broadcasts* correctly against one. A plain (non-batched)
+    # zero broadcasts fine for elementwise use, but differentiating a
+    # per-example loss w.r.t. ONE SHARED scalar seed collapses to the SUM
+    # over the batch (by the ordinary chain rule for a truly shared
+    # variable) instead of yielding each example's own gradient -- jvp
+    # silently returned `sum_i jvp_i` repeated across every batch slot
+    # instead of each example's own jvp before this fix. Elementwise/shape-
+    # preserving like the rest of the unary family: peel one level, recurse,
+    # rewrap.
+    if not isinstance(a, BatchedVar):
+        return fn(a, *args, **kwargs)
+    return BatchedVar(_apply_like(fn, a.value, *args, **kwargs), a.level)
+
+
 def _align_logical_rank(av, bv):
     # Jittor's real binary ops broadcast right-aligned with no notion of "the
     # leading axis is a special batch axis" -- so if av/bv (each already
@@ -208,22 +367,69 @@ def _apply_matmul(a, b):
     lvl = max(_lvl(a), _lvl(b))
     if lvl == -1:
         return _ORIG_MATMUL(a, b)
+    # jt.matmul (like numpy.matmul) promotes a bare 1-D operand to a row/
+    # column vector for the multiply and squeezes the inserted axis back out
+    # afterward. That promotion must happen at the LOGICAL (unbatched) rank
+    # -- via .ndim, which already excludes the batch axis -- BEFORE peeling
+    # off BatchedVar wrappers below: otherwise the real (physical) matmul
+    # sees the leading batch axis as an ordinary matrix dimension and
+    # misinterprets/rejects the shapes. This was a real, previously
+    # undocumented gap: "shared (unbatched) weight matrix @ batched vector"
+    # -- the single most common vmap pattern -- used to fail outright (see
+    # 2026-08-26-core-gaps-3.1-3.8-verification.md §6.2(a) for the repro:
+    # `U(3,3) @ x` where `x` is vmapped raised "dimension not match").
+    a_vec = a.ndim == 1
+    b_vec = b.ndim == 1
+    if a_vec:
+        a = _apply_unsqueeze(a, 0)
+    if b_vec:
+        b = _apply_unsqueeze(b, -1)
     av = a.value if _lvl(a) == lvl else a
     bv = b.value if _lvl(b) == lvl else b
     # matmul already broadcasts arbitrary leading dims (nn.py), so once both
     # operands are resolved to real Vars (or a lower-level BatchedVar,
-    # handled by recursion) at this level, no reshape is needed.
-    return BatchedVar(_apply_matmul(av, bv), lvl)
+    # handled by recursion) at this level, no further reshape is needed.
+    result = BatchedVar(_apply_matmul(av, bv), lvl)
+    if b_vec:
+        result = _squeeze_logical(result, -1)
+    if a_vec:
+        result = _squeeze_logical(result, -1 if b_vec else -2)
+    return result
+
+
+def _squeeze_logical(v, dim):
+    # Drop a size-1 LOGICAL axis via reshape (works for both BatchedVar,
+    # through its own patched `.reshape`, and a plain Var, through the
+    # (possibly-patched-but-passthrough) `jt.Var.reshape`).
+    shape = list(v.shape)
+    nd = len(shape)
+    d = dim if dim >= 0 else dim + nd
+    return v.reshape(shape[:d] + shape[d + 1:])
 
 
 def _apply_random(shape, *args, **kwargs):
     if not _active_batch_context:
         return _ORIG_RANDOM(shape, *args, **kwargs)
     shape = [shape] if isinstance(shape, int) else list(shape)
-    full_shape = [bs for _, bs in _active_batch_context] + shape
+    # jittor-core-gaps.md §3.1 acceptance #8: "different" (default) means
+    # every batch element gets its own independent draw -- which is exactly
+    # what jt.random already does per-element, so generating the full
+    # [level_batch_sizes..., *shape] tensor directly needs no extra code.
+    # "same" means every element along that level's batch axis must see the
+    # IDENTICAL sample -- implemented by adding NO physical axis for that
+    # level and NOT wrapping the result in a BatchedVar for it: an unwrapped
+    # value already broadcasts against that level exactly like any other
+    # closure-captured (non-batched) operand does elsewhere in this module
+    # (see _align_logical_rank / the "shared weight matrix" case above).
+    # Nested vmaps with mixed modes are handled correctly because each
+    # active level is decided independently and only "different" levels
+    # contribute a physical axis, in original outermost-first order --
+    # matching how nested BatchedVar wrapping is defined everywhere else.
+    diff_levels = [(lvl, bs) for lvl, mode, bs in _active_batch_context if mode == "different"]
+    full_shape = [bs for _, bs in diff_levels] + shape
     real = _ORIG_RANDOM(full_shape, *args, **kwargs)
     result = real
-    for lvl, _ in _active_batch_context:
+    for lvl, _ in diff_levels:
         result = BatchedVar(result, lvl)
     return result
 
@@ -509,21 +715,23 @@ def vmap(func, in_dims=0, out_dims=0, randomness="different"):
         each argument to map over (None = broadcast that argument unchanged).
     :param out_dims: int or a pytree matching func's return value -- where to
         place the batch axis in each output.
-    :param randomness: "different" (default; each random op call already
-        produces independent per-element samples, matching this) or "same"
-        (not implemented -- fails loud).
+    :param randomness: "different" (default) -- every random op call inside
+        `func` produces an independent sample per batch element, matching
+        jt.random's own native per-element-independent semantics one level
+        up. "same" -- every batch element sees the IDENTICAL sample for each
+        random op call (drawn once at the logical, unbatched shape and
+        broadcast against the batch, same as any other non-mapped
+        closure-captured value).
 
-    Supported ops inside `func`: elementwise unary/binary, reduce (sum/mean/
-    max/min/prod/argmax/argmin), reshape/transpose/permute/unsqueeze/
-    broadcast, matmul/einsum, getitem/setitem (incl. simple fancy indexing),
+    Supported ops inside `func`: elementwise unary/binary (incl. conj),
+    real/imag, reduce (sum/mean/max/min/prod/argmax/argmin), reshape/
+    transpose/permute/unsqueeze/broadcast, matmul/einsum, getitem/setitem
+    (incl. simple fancy indexing), detach/start_grad/stop_grad (so
+    gradfunctional's vjp/jvp compose: `vmap(lambda x, v: jvp(f, x, v))`),
     and random. Anything else raises NotImplementedError.
     '''
     if randomness not in ("different", "same"):
         raise ValueError(f"vmap: unknown randomness={randomness!r}")
-    if randomness == "same":
-        raise NotImplementedError("vmap: randomness='same' is not supported yet; "
-            "jt.random already produces independent per-element samples, matching "
-            "the default randomness='different'.")
     install_batching_patches()
 
     def wrapped(*args, **kwargs):
@@ -536,7 +744,7 @@ def vmap(func, in_dims=0, out_dims=0, randomness="different"):
             for a, d in zip(flat_args, flat_in_dims)
         ]
         batched_args = _tree_unflatten(batched_flat, spec)
-        _active_batch_context.append((level, batch_size))
+        _active_batch_context.append((level, randomness, batch_size))
         try:
             out = func(*batched_args, **kwargs)
         finally:
@@ -568,7 +776,8 @@ _BINARY_NAMES = ["add", "subtract", "multiply", "divide", "floor_divide", "mod",
 _UNARY_NAMES = ["abs", "negative", "logical_not", "bitwise_not", "log", "exp", "sqrt",
     "round", "floor", "ceil", "round_int", "floor_int", "ceil_int",
     "sin", "asin", "sinh", "asinh", "tan", "atan", "tanh", "atanh",
-    "cos", "acos", "cosh", "acosh", "sigmoid", "erf", "erfinv", "relu"]
+    "cos", "acos", "cosh", "acosh", "sigmoid", "erf", "erfinv", "relu",
+    "conj"]
 
 _REDUCE_NAMES = ["sum", "mean", "prod"]
 _MAXMIN_NAMES = ["max", "min"]
@@ -800,6 +1009,16 @@ def install_batching_patches():
     def _random(shape, *args, **kwargs):
         return _apply_random(shape, *args, **kwargs)
     _install(jt, "random", _random)
+
+    for name in ("zeros_like", "ones_like", "full_like"):
+        orig = getattr(jt, name, None)
+        if orig is None:
+            continue
+        def make_like(orig=orig):
+            def f(a, *args, **kwargs):
+                return _apply_like(orig, a, *args, **kwargs)
+            return f
+        _install(jt, name, make_like())
 
     _ORIG_GETITEM = jt.Var.__getitem__
     _ORIG_SETITEM = jt.Var.__setitem__

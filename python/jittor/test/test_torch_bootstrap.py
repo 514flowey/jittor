@@ -142,6 +142,77 @@ class TestTorchBootstrap(unittest.TestCase):
             )
             self.assertEqual(result["empty_cache"], "gc")
 
+    def test_install_does_not_clobber_a_real_torch_namespace(self):
+        # Regression test for jittor-core-gaps.md section 3.4.1: importing
+        # jittor alongside a REAL PyTorch used to silently replace
+        # sys.modules["torch.cuda"] (and dozens of other "torch.*" entries)
+        # with torch_compat.py's own fake stand-in stubs -- built for the
+        # `import jittor as torch` scenario -- even when jittor was NOT
+        # standing in for torch. PyTorch's own lazy CUDA init resolves "the
+        # torch.cuda module" via sys.modules to inject native bindings
+        # (_get_device_properties, Triton kernel registration through
+        # torch.library, ...); those landed in jittor's stub instead of the
+        # real module, so torch.cuda._lazy_init() (reading its own module
+        # globals) failed with a confusing "module 'torch.cuda' has no
+        # attribute '_lazy_init'"/"name '_get_device_properties' is not
+        # defined" on the first real CUDA op run afterward -- with no
+        # apparent connection to CUDA itself. Needs a subprocess: this
+        # process may already have jittor (and its own torch_compat state)
+        # loaded from an earlier test in the same run.
+        try:
+            import torch  # noqa: F401
+        except Exception:
+            self.skipTest("PyTorch is not installed in this environment")
+
+        script = textwrap.dedent("""
+            import json
+            import sys
+            import torch
+            real_cuda = torch.cuda
+            real_library = torch.library
+            import jittor as jt  # noqa: F401  -- triggers torch_compat.install()
+
+            result = {
+                "torch_cuda_sys_modules_preserved":
+                    sys.modules.get("torch.cuda") is real_cuda,
+                "torch_library_sys_modules_preserved":
+                    sys.modules.get("torch.library") is real_library,
+                "torch_cuda_attr_preserved": torch.cuda is real_cuda,
+            }
+            if torch.cuda.is_available():
+                try:
+                    t = torch.tensor([1.0, 2.0, 3.0], device="cuda:0")
+                    result["cuda_lazy_init_ok"] = bool((t.cpu().numpy() == [1, 2, 3]).all())
+                except Exception as e:
+                    result["cuda_lazy_init_ok"] = False
+                    result["cuda_lazy_init_error"] = f"{type(e).__name__}: {e}"
+            else:
+                result["cuda_lazy_init_ok"] = None
+            print("RESULT=" + json.dumps(result))
+        """)
+        with tempfile.TemporaryDirectory() as d:
+            entry = os.path.join(d, "probe.py")
+            with open(entry, "w") as f:
+                f.write(script)
+            env = os.environ.copy()
+            python_root = os.fspath(pathlib.Path(__file__).resolve().parents[2])
+            env["PYTHONPATH"] = os.pathsep.join(filter(None, (
+                python_root, env.get("PYTHONPATH", ""),
+            )))
+            output = subprocess.check_output(
+                [sys.executable, entry], cwd=d, env=env, text=True,
+            )
+        import json
+        line = next(line for line in output.splitlines() if line.startswith("RESULT="))
+        result = json.loads(line[len("RESULT="):])
+        self.assertTrue(result["torch_cuda_sys_modules_preserved"],
+            "sys.modules['torch.cuda'] was replaced by jittor's fake stub")
+        self.assertTrue(result["torch_library_sys_modules_preserved"],
+            "sys.modules['torch.library'] was replaced by jittor's fake stub")
+        self.assertTrue(result["torch_cuda_attr_preserved"])
+        if result["cuda_lazy_init_ok"] is not None:
+            self.assertTrue(result["cuda_lazy_init_ok"], result.get("cuda_lazy_init_error"))
+
     def test_strict_bootstrap_propagates_install_failure(self):
         from jittor.torch_shim import enable
 

@@ -1,5 +1,13 @@
 # reference: https://github.com/pytorch/pytorch/blob/8ea5b572a63b1acc538a9fc8d3862c73739116e8/torch/autograd/functional.py
 import jittor as jt
+# jittor-core-gaps.md §3.1: BatchedVar (python/jittor/batch_transform.py) is
+# what `x`/`v`/outputs actually are when vjp()/jvp() run *inside* a vmapped
+# function (`vmap(lambda x, v: jvp(f, x, v))`) -- widening the type checks
+# below to accept it (alongside jt.Var/ComplexNumber) is the only change
+# needed here, since every jittor op this module calls on its inputs/outputs
+# (detach/start_grad/stop_grad/requires_grad/reshape/sum/real/imag/*) already
+# has a BatchedVar batching rule.
+from ..batch_transform import BatchedVar
 
 __all__ = ["vjp", "jvp", "jacobian", "hessian", "hvp", "vhp"]
 
@@ -7,7 +15,9 @@ __all__ = ["vjp", "jvp", "jacobian", "hessian", "hvp", "vhp"]
 def _is_native_complex(x):
     # A native complex64/complex128 jt.Var (the new first-class complex dtype), as
     # opposed to the legacy jt.nn.ComplexNumber real/imag-pair simulation (not a Var).
-    return isinstance(x, jt.Var) and "complex" in str(x.dtype)
+    # Also matches a BatchedVar wrapping one (its .dtype delegates to the
+    # underlying physical Var's dtype).
+    return isinstance(x, (jt.Var, BatchedVar)) and "complex" in str(x.dtype)
 
 
 def _zeros_seed_like(out):
@@ -39,7 +49,7 @@ def _as_tuple(inp, arg_name=None, fn_name=None):
         is_inp_tuple = False
 
     for i, el in enumerate(inp):
-        if not isinstance(el, (jt.Var, jt.nn.ComplexNumber)):
+        if not isinstance(el, (jt.Var, jt.nn.ComplexNumber, BatchedVar)):
             if is_inp_tuple:
                 raise TypeError(
                     f"The {arg_name} given to {fn_name} must be either a Tensor or a tuple of Tensors but the"
@@ -98,7 +108,7 @@ def _grad_preprocess(inputs, create_graph, need_graph):
 def _grad_postprocess(inputs, create_graph):
     # Postprocess the generated Tensors to avoid returning Tensors with history when the user did not
     # request it.
-    if isinstance(inputs[0], (jt.Var, jt.nn.ComplexNumber)):
+    if isinstance(inputs[0], (jt.Var, jt.nn.ComplexNumber, BatchedVar)):
         if not create_graph:
             return tuple(inp.detach() for inp in inputs)
         else:

@@ -223,19 +223,15 @@ def complex_qr(x):
     r"""
     do the qr factorization of x in the below formula:
     x = QR where Q has orthonormal columns and R is upper-triangular.
-    :param x (...,M,N), M>=N (reduced/"economy" QR; M<N is not supported --
-        the backward relies on R being square and invertible, which only
-        holds for the tall/square case):
-    :return: q (...,M,N), r (...,N,N).
+    :param x (...,M,N): forward and backward both work for any M, N
+        (tall/square M>=N and wide M<N).
+    :return: q (...,M,K), r (...,K,N), K=min(M,N).
     """
     assert isinstance(x, ComplexNumber), "linalg_qr is implemented for nn.ComplexNumber"
     assert x.real.dtype in (jt.float32, jt.float64) and x.imag.dtype == x.real.dtype, \
         "real and imag in ComplexNumber should both be jt.float32 (complex64) or both jt.float64 (complex128)"
     m, n = x.shape[-2:]
-    assert m >= n, (
-        f"complex_qr only supports M>=N (reduced QR of a tall/square matrix), got shape {tuple(x.shape)}. "
-        "R is square (N,N) only in this case; M<N (wide) reduced QR has no square-R backward here."
-    )
+    k = min(m, n)
     def forward_code(np, data):
         def _stack_to_complex(x):
             return x[..., 0] + 1j * x[..., 1]
@@ -255,6 +251,18 @@ def complex_qr(x):
         # single combined-output call. Verified for M>N (tall) and M==N
         # (square), batched and unbatched, against a numpy finite-difference
         # oracle.
+        #
+        # Wide (m<n, jittor-core-gaps.md §3.2): Q is square (...,m,m), R=[R1|R2]
+        # with R1 (...,m,m) upper triangular and R2 (...,m,n-m) the rest.
+        # A=[A1|A2], A1=Q@R1 is itself a square QR pair, A2=Q@R2. Matching
+        # coefficients of dA1/dA2 in the total differential (same derivation
+        # as the real `qr` backward above) gives gA2 = Q@gR2 directly, and
+        # gA1 = the SAME square-QR formula (`square_grad` below) applied to
+        # (Q, R1) with an effective gQ of G = gQ - Q @ gR2 @ H(R2) (the gR1
+        # part of the coupling stays inside the square formula unchanged).
+        # Reduces to the m>=n formula exactly when n==m. Verified against a
+        # numpy finite-difference oracle for complex64/complex128,
+        # batched/unbatched, several (m,n) shapes with m<n.
         def H(x):
             return np.conj(np.swapaxes(x, -1, -2))
         def _TriangularSolve(x, r):
@@ -272,29 +280,51 @@ def complex_qr(x):
         q, r = data["f_outputs"]
         q = _stack_to_complex(q)
         r = _stack_to_complex(r)
-        dq = dout if out_index == 0 else np.zeros_like(q)
-        dr = dout if out_index == 1 else np.zeros_like(r)
+        m_dim = q.shape[-2]; n_dim = r.shape[-1]
 
-        qdq = _dot(H(q), dq)
-        qdq_ = qdq - H(qdq)
-        rdr = _dot(r, H(dr))
-        rdr_ = rdr - H(rdr)
-        tril = np.tril(qdq_ + rdr_)
+        def square_grad(rr, dq, dr):
+            # Combined square-QR (A=Q@rr, rr square & invertible) adjoint
+            # from (dq, dr); the pre-existing tall/square-case formula,
+            # reused unchanged here for both the tall/square path and,
+            # applied to R1, the wide path below.
+            qdq = _dot(H(q), dq)
+            qdq_ = qdq - H(qdq)
+            rdr = _dot(rr, H(dr))
+            rdr_ = rdr - H(rdr)
+            tril = np.tril(qdq_ + rdr_)
+            grad_a = _dot(q, dr + _TriangularSolve(tril, rr))
+            grad_b = _TriangularSolve(dq - _dot(q, qdq), rr)
+            ret = grad_a + grad_b
+            m_ = rdr - H(qdq)
+            eyem = np.zeros_like(m_)
+            _diag(eyem)[:] = _diag(m_)
+            correction = eyem - np.real(eyem)
+            ret = ret + _TriangularSolve(_dot(q, H(correction)), rr)
+            return ret
 
-        grad_a = _dot(q, dr + _TriangularSolve(tril, r))
-        grad_b = _TriangularSolve(dq - _dot(q, qdq), r)
-        ret = grad_a + grad_b
-
-        m_ = rdr - H(qdq)
-        eyem = np.zeros_like(m_)
-        _diag(eyem)[:] = _diag(m_)
-        correction = eyem - np.real(eyem)
-        ret = ret + _TriangularSolve(_dot(q, H(correction)), r)
+        if m_dim >= n_dim:
+            dq = dout if out_index == 0 else np.zeros_like(q)
+            dr = dout if out_index == 1 else np.zeros_like(r)
+            ret = square_grad(r, dq, dr)
+        else:
+            r1 = r[..., :, :m_dim]
+            r2 = r[..., :, m_dim:]
+            if out_index == 0:
+                G = dout
+                gR1 = np.zeros_like(r1)
+                a2 = np.zeros_like(r2)
+            else:
+                gR1 = dout[..., :, :m_dim]
+                gR2 = dout[..., :, m_dim:]
+                G = -_dot(_dot(q, gR2), H(r2))
+                a2 = _dot(q, gR2)
+            a1 = square_grad(r1, G, gR1)
+            ret = np.concatenate([a1, a2], axis=-1)
 
         np.copyto(out, _complex_to_stack(ret))
 
-    sq = list(x.shape[:-2]) + [m, n, 2]
-    sr = list(x.shape[:-2]) + [n, n, 2]
+    sq = list(x.shape[:-2]) + [m, k, 2]
+    sr = list(x.shape[:-2]) + [k, n, 2]
     q, r = jt.numpy_code(
         [sq, sr],
         [x.value.dtype, x.value.dtype],
@@ -1326,8 +1356,10 @@ def solve(a,b):
         np.copyto(L, ans)
 
     def backward_code1(np, data):
+        # T is the conjugate transpose (Hermitian transpose); for real dtypes
+        # np.conj is a no-op so this also covers the real case.
         def T(x):
-            return np.swapaxes(x, -1, -2)
+            return np.conj(np.swapaxes(x, -1, -2))
         _dot = partial(np.einsum, '...ij,...jk->...ik')
         dout = data["dout"]
         out = data["outputs"][0]
@@ -1338,11 +1370,12 @@ def solve(a,b):
         np.copyto(out, t)
 
     def backward_code2(np, data):
-        # gradient wrt b: solve(A,b)=A^-1 b  =>  dL/db = A^-T @ dout.
-        # (was a stub writing 0 -> silently zero grad through the RHS, breaking
-        #  any training that backprops into b, e.g. differentiable solves / GP.)
+        # gradient wrt b: solve(A,b)=A^-1 b  =>  dL/db = A^-H @ dout for the
+        # Wirtinger-conjugate convention used throughout this file (T below
+        # is the conjugate transpose; np.conj is a no-op for real dtypes, so
+        # this also covers the real case unchanged).
         def T(x):
-            return np.swapaxes(x, -1, -2)
+            return np.conj(np.swapaxes(x, -1, -2))
         dout = data["dout"]
         out = data["outputs"][0]
         a = data["inputs"][0]
@@ -1363,8 +1396,8 @@ def qr(x):
     r"""
     do the qr factorization of x in the below formula:
     x = QR where Q has orthonormal columns and R is upper-triangular.
-    :param x (...,M,N): forward works for any M, N; backward requires M>=N
-        (tall or square -- R is only square, hence invertible, in that case).
+    :param x (...,M,N): forward and backward both work for any M, N
+        (tall/square M>=N and wide M<N).
     :return: q (...,M,K), r (...,K,N), K=min(M,N).
     """
     if _is_native_complex(x):
@@ -1381,14 +1414,27 @@ def qr(x):
         np.copyto(r,R)
 
     def backward_code(np, data):
-        # Reduced-QR backward (m>=n). A=QR, Q:(...,m,k), R:(...,k,n), k=min(m,n).
-        # Standard form (mirrors torch): with M = R gR^T - gQ^T Q,
+        # Reduced-QR backward. A=QR, Q:(...,m,k), R:(...,k,n), k=min(m,n).
+        #
+        # Tall/square (m>=n, k=n, R square mxn->nxn): standard form (mirrors
+        # torch), with M = R gR^T - gQ^T Q:
         #   gA = (gQ + Q copyltu(M)) R^{-T},  copyltu(X)=tril(X)+tril(X,-1)^T.
-        # jittor calls this once per output, so out_index selects the gQ-only /
-        # gR-only contribution (the total is linear in (gQ,gR), summed by autodiff).
-        # The OLD code assumed square R (output shapes were both x.shape) and the
-        # Q term lived entirely in span(Q) — wrong/crash for tall m>n. R was even
-        # allocated (m,n) instead of (k,n).
+        #
+        # Wide (m<n, k=m, Q is square mxm, R=[R1|R2] with R1 mxm upper
+        # triangular and R2 mx(n-m) the rest -- jittor-core-gaps.md §3.2):
+        # A=[A1|A2], A1=Q@R1 is itself a square QR pair, A2=Q@R2. Deriving
+        # the adjoint from dR1 = Q^T dA1 - Q^T dQ R1, dR2 = Q^T dA2 - Q^T dQ R2
+        # (and matching coefficients of dA1/dA2 in
+        #   dL = tr(gQ^T dQ) + tr(gR1^T dR1) + tr(gR2^T dR2)
+        #      = tr(gA1^T dA1) + tr(gA2^T dA2))
+        # gives gA2 = Q@gR2 directly, and gA1 = the SAME square-QR formula
+        # above applied to the pair (Q, R1) with an effective gQ of
+        #   G = gQ - Q @ gR2 @ R2^T
+        # (the gR1-only part of the coupling stays inside the square formula
+        # unchanged; only the R2/gR2 cross term needs folding into G). This
+        # reduces to the m>=n formula exactly when n==m (R2, gR2 are empty).
+        # Verified against a numpy finite-difference oracle for real/complex,
+        # batched/unbatched, several (m,n) shapes with m<n.
         def T(x):
             return np.swapaxes(x, -1, -2)
         _dot = partial(np.einsum, '...ij,...jk->...ik')
@@ -1397,22 +1443,38 @@ def qr(x):
         q, r = data["f_outputs"]
         out_index = data["out_index"]
         m = q.shape[-2]; n = r.shape[-1]
-        if m < n:
-            raise NotImplementedError(
-                "qr backward is only implemented for tall/square inputs (m>=n); "
-                f"got m={m} < n={n}. Forward works for all shapes.")
         def copyltu(X):
             return np.tril(X) + T(np.tril(X, -1))
-        def rinvT(X):           # X @ R^{-T}
-            return T(np.linalg.solve(r, T(X)))
-        if out_index == 0:      # contribution from gQ (gR=0)
-            gQ = dout
-            M = -_dot(T(gQ), q)
-            np.copyto(out, rinvT(gQ + _dot(q, copyltu(M))))
-        else:                   # contribution from gR (gQ=0)
-            gR = dout
-            M = _dot(r, T(gR))
-            np.copyto(out, rinvT(_dot(q, copyltu(M))))
+        if m >= n:
+            def rinvT(X):           # X @ R^{-T}
+                return T(np.linalg.solve(r, T(X)))
+            if out_index == 0:      # contribution from gQ (gR=0)
+                gQ = dout
+                M = -_dot(T(gQ), q)
+                np.copyto(out, rinvT(gQ + _dot(q, copyltu(M))))
+            else:                   # contribution from gR (gQ=0)
+                gR = dout
+                M = _dot(r, T(gR))
+                np.copyto(out, rinvT(_dot(q, copyltu(M))))
+        else:
+            r1 = r[..., :, :m]
+            r2 = r[..., :, m:]
+            def rinvT1(X):          # X @ R1^{-T}
+                return T(np.linalg.solve(r1, T(X)))
+            if out_index == 0:      # contribution from gQ (gR1=gR2=0)
+                gQ = dout
+                M = -_dot(T(gQ), q)
+                a1 = rinvT1(gQ + _dot(q, copyltu(M)))
+                a2 = np.zeros_like(r2)
+            else:                   # contribution from gR (gQ=0)
+                gR = dout
+                gR1 = gR[..., :, :m]
+                gR2 = gR[..., :, m:]
+                G = -_dot(_dot(q, gR2), T(r2))
+                M = _dot(r1, T(gR1)) - _dot(T(G), q)
+                a1 = rinvT1(G + _dot(q, copyltu(M)))
+                a2 = _dot(q, gR2)
+            np.copyto(out, np.concatenate([a1, a2], axis=-1))
 
     m, n = x.shape[-2:]
     k = min(m, n)
@@ -1426,6 +1488,42 @@ def qr(x):
         [backward_code],
     )
     return q, r
+
+
+def rq(x):
+    r"""
+    RQ factorization of x in the below formula:
+    x = R Q where R is upper-triangular (trapezoidal for the tall case
+    M>K: the top M-K rows are zero) and Q has orthonormal rows
+    (``Q @ Q^H == I``). Works for any M, N (square/wide M<=N and tall M>N),
+    complementing ``qr``'s M<=N/M>N coverage (jittor-core-gaps.md §3.2's
+    "wide QR / tall RQ" gap).
+
+    Implemented as a composition of 180-degree flips, (conjugate)
+    transposes, and the existing ``qr`` (correct for any M, N -- see
+    ``qr``'s own docstring): with ``H`` the (conjugate) transpose and
+    ``flip`` reversing the last two axes,
+    ``A' = flip(A)``, ``Q0, R0 = qr(H(A'))``, ``R = flip(H(R0))``,
+    ``Q = flip(H(Q0))``. Backward is therefore automatic and correct
+    through those already-differentiable, already wide/tall-verified
+    primitives, with no new analytic gradient code needed. Reduces to the
+    identity ``H(H(x)) == x`` machinery exactly, so real dtypes take the
+    plain-transpose branch and native/legacy complex dtypes take the
+    conjugate-transpose branch.
+
+    :param x (...,M,N):
+    :return: r (...,M,K), q (...,K,N), K=min(M,N).
+    """
+    if isinstance(x, ComplexNumber):
+        r, q = rq(_cn_to_native(x))
+        return _native_to_cn(r), _native_to_cn(q)
+    def h(v):
+        return v.transpose(-1, -2).conj() if _is_native_complex(v) else v.transpose(-1, -2)
+    a_prime = x.flip([-2, -1])
+    q0, r0 = qr(h(a_prime))
+    r = h(r0).flip([-2, -1])
+    q = h(q0).flip([-2, -1])
+    return r, q
 
 
 def einsum(equation, *operands):

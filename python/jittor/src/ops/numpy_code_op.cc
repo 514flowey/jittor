@@ -89,8 +89,21 @@ NumpyCodeOp::NumpyCodeOp(NanoVector shape, NanoString dtype, vector<Var*>&& inpu
 }
 
 VarPtr NumpyCodeOp::grad(Var* out, Var* dout, Var* v, int v_index) {
+    // A numpy_code op created to compute a backward pass (see the
+    // NumpyResult-taking constructor above) is built with an empty
+    // `backward` vector -- it has no registered gradient of its own.
+    // Differentiating through it again (i.e. requesting second-order
+    // gradients through a numpy_code op whose backward was not itself
+    // given an analytic backward) used to index `backward[v_index]` on
+    // that empty vector, invoke the resulting garbage NumpyFunc, and
+    // segfault the process instead of raising a catchable error.
+    if (v_index < 0 || v_index >= (int)backward.size())
+        LOGf << "numpy_code op" << this
+             << "has no registered backward for input" << v_index
+             << "(higher-order autograd through this numpy_code is not supported)";
+
     NumpyResult result;
-    
+
     int out_index=-1;
     for (int i=0; i<_outputs.size(); i++) {
         if (_outputs[i] == out) {

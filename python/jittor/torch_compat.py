@@ -1117,6 +1117,58 @@ def _install_safetensors_shim():
 
 
 def install(torch):
+    # `_install_impl` (and everything it calls, transitively the whole rest
+    # of this file's `_install_*` helpers) is written "additive only" for
+    # the `import jittor as torch` scenario: it unconditionally does
+    # `sys.modules["torch.xxx"] = <fake stub>` for dozens of submodules
+    # (torch.cuda, torch.library, torch.nn, torch.distributed, ...). That is
+    # correct when jittor IS acting as `torch`, but when a REAL PyTorch is
+    # already `sys.modules["torch"]` (using jittor and torch side by side,
+    # e.g. for DLPack interop), those unconditional writes clobber the real
+    # submodules already sitting in sys.modules.
+    #
+    # The concretely observed failure (jittor-core-gaps.md section 3.4.1):
+    # `_install_cuda` replaces sys.modules["torch.cuda"] with jittor's fake
+    # stub. PyTorch's own lazy CUDA init (torch.cuda._lazy_init(), triggered
+    # by the first `torch.tensor(..., device="cuda")`) resolves "the
+    # torch.cuda module" via the import system to inject native bindings
+    # (_get_device_properties, Triton kernel registration through
+    # torch.library, etc.) -- those land in jittor's stub instead of the
+    # real module, so the real torch.cuda._lazy_init() (reading its own
+    # module globals) fails with a confusing "module 'torch.cuda' has no
+    # attribute '_lazy_init'" / "name '_get_device_properties' is not
+    # defined" / "module 'torch.library' has no attribute
+    # 'fallthrough_kernel'" -- depending on exactly which queued lazy-init
+    # call runs first, none of which look CUDA-related on their face. The
+    # same class of clobbering applies to every other unconditional
+    # sys.modules["torch.xxx"] write below, not just torch.cuda.
+    #
+    # Rather than threading a "don't clobber" guard through every one of
+    # those call sites individually, snapshot every already-imported
+    # "torch"/"torch.*" sys.modules entry before running the installer and
+    # restore it afterward (even if the installer raises) -- this preserves
+    # the additive-only contract exactly (anything genuinely missing is
+    # still filled in and stays filled in) while guaranteeing a real
+    # torch's own submodules are never left clobbered.
+    g = torch
+    import sys as _sys_install_wrap
+    _real_torch = _sys_install_wrap.modules.get("torch")
+    _protect_real_torch = _real_torch is not None and _real_torch is not g
+    _torch_ns_snapshot = None
+    if _protect_real_torch:
+        _torch_ns_snapshot = {
+            k: v for k, v in _sys_install_wrap.modules.items()
+            if k == "torch" or k.startswith("torch.")
+        }
+    try:
+        return _install_impl(torch)
+    finally:
+        if _torch_ns_snapshot is not None:
+            for k, v in _torch_ns_snapshot.items():
+                _sys_install_wrap.modules[k] = v
+
+
+def _install_impl(torch):
     g = torch
     import sys as _sys_install
     if _sys_install.modules.get("torch") is None:
@@ -3840,19 +3892,27 @@ def _install_reductions(g):
         return _TopK(val, idx.int64())
     g.topk = topk
 
-    def sort(x, dim=-1, descending=False, **kw):
-        idx, val = _argsort(x, dim=dim, descending=descending)
+    def sort(x, dim=-1, descending=False, stable=False, **kw):
+        # torch.sort(..., stable=False) previously landed in **kw and was
+        # silently dropped here -- `stable=True` requests were never
+        # forwarded to the (now stable-capable, jittor-core-gaps.md §3.8)
+        # native jt.argsort, and silently behaved like stable=False instead
+        # of raising or honoring the request.
+        idx, val = _argsort(x, dim=dim, descending=descending, stable=stable)
         return _Sort(val, idx.int64())
     g.sort = sort
-    g.argsort = lambda x, dim=-1, descending=False, **kw: _argsort(x, dim=dim, descending=descending)[0].int64()
+    g.argsort = lambda x, dim=-1, descending=False, stable=False, **kw: _argsort(
+        x, dim=dim, descending=descending, stable=stable)[0].int64()
 
     # --- Tensor METHOD forms. jittor-core uses none of these as Var methods (only
     # the python list.sort builtin), so installing torch semantics here is safe;
     # it was verified that .max/.min methods ARE used internally, so those stay
     # native (values-only) and are intentionally NOT overridden. ---
     Var = _jt.Var
-    Var.sort = lambda self, dim=-1, descending=False, **kw: sort(self, dim=dim, descending=descending)
-    Var.argsort = lambda self, dim=-1, descending=False, **kw: g.argsort(self, dim=dim, descending=descending)
+    Var.sort = lambda self, dim=-1, descending=False, stable=False, **kw: sort(
+        self, dim=dim, descending=descending, stable=stable)
+    Var.argsort = lambda self, dim=-1, descending=False, stable=False, **kw: g.argsort(
+        self, dim=dim, descending=descending, stable=stable)
     Var.topk = lambda self, k, dim=-1, largest=True, sorted=True: topk(self, k, dim=dim, largest=largest, sorted=sorted)
     # Tensor.softmax/log_softmax accept a `dtype=` (cast before the op) which
     # jittor's native method rejects (vLLM's sampler: logits.softmax(dim=-1,
@@ -6125,6 +6185,11 @@ class _DeviceProps:
 
 
 def _install_cuda(g):
+    # NB: this unconditionally writes sys.modules["torch.cuda"] and several
+    # siblings below, which would clobber a REAL PyTorch's own "torch.cuda"
+    # when jittor and torch are used side by side -- that hazard is handled
+    # once, centrally, by install()'s snapshot/restore wrapper (see the
+    # comment there and jittor-core-gaps.md section 3.4.1), not here.
     import types as _types, contextlib
     cuda = _types.ModuleType("torch.cuda")
     def _cuda_visible_devices_empty():

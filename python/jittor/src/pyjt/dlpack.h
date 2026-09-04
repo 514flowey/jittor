@@ -4,13 +4,16 @@
  * \brief The common header of DLPack.
  *
  * Vendored verbatim from the dmlc/dlpack project (Apache License 2.0),
- * https://github.com/dmlc/dlpack, DLPack v1.0. Only DLManagedTensor (the
- * classic, unversioned struct) is implemented by Jittor's DLPack adapter
- * (src/pyjt/dlpack.cc) -- DLManagedTensorVersioned/DLPackVersion/the flag
- * bitmasks are kept here for ABI reference and forward-compat but unused,
- * since real-world producers (NumPy, CuPy, PyTorch) fall back to the
- * classic struct when no explicit version is negotiated (verified against
- * NumPy 2.5.2 and CuPy 14.2.0's __dlpack__() in this repo's dev environment).
+ * https://github.com/dmlc/dlpack, DLPack v1.0. Jittor's DLPack adapter
+ * (src/pyjt/dlpack.cc) implements both DLManagedTensor (the classic,
+ * unversioned struct) and DLManagedTensorVersioned (DLPack>=0.8's "current
+ * standard" struct) on export and import. Export defaults to the classic
+ * capsule -- DLPack's own mandated fallback, and what real-world producers'
+ * own from_dlpack() consume when no explicit version is negotiated (verified
+ * against NumPy 2.5.2, CuPy 14.2.0 and PyTorch 2.14's __dlpack__()/
+ * from_dlpack() in this repo's dev environment) -- and only returns the
+ * versioned capsule when a caller explicitly opts in via
+ * __dlpack__(max_version=(major,minor)) with major>=1.
  */
 #ifndef DLPACK_DLPACK_H_
 #define DLPACK_DLPACK_H_

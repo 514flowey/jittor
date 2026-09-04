@@ -32,13 +32,16 @@ static auto make_transpose = get_op_info("transpose")
     .get_constructor<VarPtr, Var*, NanoVector>();
 #endif
 
-ArgsortOp::ArgsortOp(Var* x, int dim, bool descending, NanoString dtype)
-    : x(x), dim(dim), descending(descending) {
+ArgsortOp::ArgsortOp(Var* x, int dim, bool descending, NanoString dtype, bool stable)
+    : x(x), dim(dim), descending(descending), stable(stable) {
     if  (this->dim == -1)
         this->dim = x->shape.size() ? x->shape.size() - 1 : 0;
     dim = this->dim;
     #ifdef HAS_CUDA
     if (use_cuda) {
+        // cub::DeviceSegmentedRadixSort is a stable sort (ties keep the
+        // relative order of the ascending `indexes` payload built below),
+        // so no separate code path is needed here for stable=true.
         static std::vector<VarPtr>(*cub_argsort)(Var*, Var*, Var*, bool, NanoString) = nullptr;
         if (!cub_argsort && has_op("cub_argsort")) {
             cub_argsort = get_op_info("cub_argsort")
@@ -140,6 +143,7 @@ void ArgsortOp::jit_prepare(JK& jk) {
     jk << "«XDIM=" << JK::hex1(x->kdim());
     jk << "«DIM=" << JK::hex1(dim);
     jk << "«CMP:" << (descending ? '>' : '<');
+    jk << "«STABLE:" << (stable ? '1' : '0');
 }
 
 #else // JIT
@@ -165,7 +169,7 @@ void ArgsortOp::jit_run() {
             tempx[i@DIM] = xp[xid];
             tempy[i@DIM] = i@DIM;
         }
-        std::sort(tempy.begin(), tempy.end(), [&](Ty i, Ty j) -> bool { return tempx[i]@CMP@@tempx[j]; });
+        @if(STABLE,std::stable_sort,std::sort)(tempy.begin(), tempy.end(), [&](Ty i, Ty j) -> bool { return tempx[i]@CMP@@tempx[j]; });
 
         for (index_t i@DIM=0; i@DIM < xshape@DIM; i@DIM++){
             auto xid = @for(d, 0, XDIM, + i@d * xstride@d);

@@ -152,9 +152,60 @@ def __index__(x):
 jt.Var.__index__ = __index__
 
 def sort(input, dim=-1, descending=False, stable=False):
-    index, value = jt.argsort(input, dim, descending)
+    index, value = jt.argsort(input, dim, descending, stable=stable)
     return value, index
 jt.Var.sort = sort
+
+def lexsort(keys):
+    ''' Perform an indirect stable sort using a sequence of 1-D keys,
+    device-resident and matching ``numpy.lexsort`` (jittor-core-gaps.md
+    §3.8): the last key in `keys` is the primary sort key, the second-to-last
+    is used to break ties in the primary key, and so on.
+
+    Composed from repeated calls to the now-stable ``jt.argsort`` (least
+    significant key first): each pass is a stable sort of one key against
+    the order fixed by all previously-applied (less significant) keys, which
+    is the standard multi-key stable-sort algorithm and requires no
+    ``.numpy()``/host synchronization -- the whole computation, including
+    the intermediate gathers, stays on the input's device.
+
+    :param keys: a sequence of 1-D vars of the same length (the array with
+        the fewest calls being `keys[-1]`, the primary key). A single var is
+        also accepted as a one-key sequence.
+    :return: an int32 index var `idx` such that `[k[idx] for k in keys]` is
+        lexicographically sorted ascending.
+
+    Example::
+
+        >>> a = jt.array([1, 5, 1, 4, 3, 4, 4])  # primary key
+        >>> b = jt.array([9, 4, 0, 4, 0, 2, 1])  # secondary key
+        >>> jt.lexsort([b, a])
+        jt.Var([2 0 4 6 5 3 1], dtype=int32)
+    '''
+    if isinstance(keys, jt.Var):
+        keys = [keys]
+    else:
+        keys = list(keys)
+    if len(keys) == 0:
+        raise RuntimeError("lexsort requires at least one key")
+    n = keys[0].shape[0]
+    for k in keys:
+        if k.ndim != 1 or k.shape[0] != n:
+            raise RuntimeError(
+                f"lexsort requires all keys to be 1-D vars of the same "
+                f"length, got shapes {[tuple(k.shape) for k in keys]}")
+    idx = jt.index((n,), 0)
+    if n == 0:
+        return idx
+    for k in keys:
+        res = jt.argsort(k[idx], dim=0, stable=True)
+        # jt.argsort may return either the index Var directly or a
+        # (index, value) tuple depending on the build; handle both (see
+        # randperm() above for the same pattern).
+        order = res[0] if isinstance(res, (tuple, list)) else res
+        idx = idx[order]
+    return idx
+jt.lexsort = lexsort
 
 def all(x, dim=()):
     return x.all_(dim).bool()

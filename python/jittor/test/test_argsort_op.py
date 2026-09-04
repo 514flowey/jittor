@@ -65,6 +65,38 @@ def check_cub_argsort(shape, dim, descending = False):
     assert np.allclose(y_key_, yk__)
     assert np.allclose(yk_, yk__)
 
+def _argsort_index(*args, **kw):
+    # jt.argsort may return the index Var directly or a (index, value)
+    # tuple depending on whether torch_compat has overridden it in this
+    # process -- see misc.py::randperm/lexsort for the same pattern.
+    res = jt.argsort(*args, **kw)
+    return res[0] if isinstance(res, (tuple, list)) else res
+
+def check_stable(n, num_distinct_keys, seed):
+    # jittor-core-gaps.md §3.8: jt.argsort(..., stable=True) must match
+    # numpy's stable sort exactly, including tie order, on CPU. `std::sort`
+    # (used when stable=False) is not guaranteed stable, so a large array
+    # with many repeated keys is used to make a real tie-order regression
+    # observable rather than accidentally passing via insertion-sort-sized
+    # inputs.
+    rng = np.random.RandomState(seed)
+    key = rng.randint(0, num_distinct_keys, size=n).astype("float32")
+    x = jt.array(key)
+    idx = _argsort_index(x, dim=0, descending=False, stable=True)
+    ref = np.argsort(key, kind="stable")
+    np.testing.assert_array_equal(idx.numpy(), ref)
+
+class TestArgsortOpStable(unittest.TestCase):
+    def test_stable_cpu(self):
+        check_stable(2000, 5, 0)
+        check_stable(2000, 2, 1)
+
+    @unittest.skipIf(not jt.has_cuda, "Cuda not found")
+    @jt.flag_scope(use_cuda=1)
+    def test_stable_cuda(self):
+        check_stable(2000, 5, 0)
+        check_stable(2000, 2, 1)
+
 def check_backward(shape, dim, descending = False):
     x = jt.random(shape)
     y, y_key = jt.argsort(x, dim=dim, descending=descending)

@@ -20,6 +20,34 @@ try:
 except Exception:
     has_cupy = False
 
+try:
+    import torch
+    has_torch = True
+except Exception:
+    has_torch = False
+
+
+def _torch_cuda_ready():
+    # Importing jittor first initializes CUDA via its own bundled runtime,
+    # dlopen'd RTLD_GLOBAL (see compiler.py's import_flags) -- when PyTorch's
+    # own *lazy* CUDA init (torch.cuda._lazy_init(), first triggered by e.g.
+    # `torch.tensor(..., device='cuda')`) subsequently runs in the same
+    # process, it can observe ELF-symbol-interposed CUDA runtime symbols and
+    # fail with an AttributeError/NameError deep inside torch.cuda, unrelated
+    # to DLPack itself. Warming torch's CUDA context before jittor is ever
+    # imported avoids it, but a test process that already imported jittor
+    # (as this whole file does) cannot retroactively do that -- so CUDA+torch
+    # tests probe readiness here and skip with a clear reason instead of
+    # crashing the suite when the hazard is present in this process' import
+    # order. See jittor-core-gaps.md section 3.4 for the full writeup.
+    if not has_torch or not jt.compiler.has_cuda:
+        return False
+    try:
+        torch.zeros(1, device="cuda")
+        return True
+    except Exception:
+        return False
+
 _ALL_DTYPES = [np.bool_, np.int8, np.int16, np.int32, np.int64,
     np.uint8, np.uint16, np.uint32, np.uint64,
     np.float16, np.float32, np.float64,
@@ -114,10 +142,86 @@ class TestDLPack(unittest.TestCase):
         n2 = jt.number_of_lived_vars()
         self.assertEqual(n2, n0)  # freed back to baseline, exactly once
 
-    def test_dlpack_copy_true_rejected(self):
+    def test_dlpack_copy_true_materializes_independent_buffer(self):
+        x = jt.array(np.array([1.0, 2.0, 3.0], dtype=np.float32))
+        cap = x.dlpack(copy=True)
+        y = jt.core.from_dlpack_capsule(cap)
+        np.testing.assert_allclose(y.numpy(), [1, 2, 3])
+        # mutating the original after export must NOT be visible through the
+        # copy -- unlike the default zero-copy export, copy=True must own
+        # independent memory.
+        x[0] = 999.0
+        x.sync()
+        np.testing.assert_allclose(y.numpy(), [1, 2, 3])
+
+    def test_dlpack_copy_true_zero_size(self):
+        z = jt.array(np.array([], dtype=np.float32))
+        cap = z.dlpack(copy=True)
+        y = jt.core.from_dlpack_capsule(cap)
+        self.assertEqual(tuple(y.shape), (0,))
+        np.testing.assert_allclose(y.numpy(), [])
+
+    def test_dlpack_versioned_capsule_roundtrip(self):
+        # DLPack>=0.8's DLManagedTensorVersioned, requested the way real
+        # consumers (NumPy>=2/CuPy/PyTorch's own __dlpack__) do.
+        x = jt.array(np.array([1.0, 2.0, 3.0], dtype=np.float32))
+        cap = x.dlpack(max_version=(1, 0))
+        import ctypes
+        name = ctypes.pythonapi.PyCapsule_GetName
+        name.restype = ctypes.c_char_p
+        name.argtypes = [ctypes.py_object]
+        self.assertEqual(name(cap), b"dltensor_versioned")
+        y = jt.core.from_dlpack_capsule(cap)
+        np.testing.assert_allclose(y.numpy(), [1, 2, 3])
+
+    def test_dlpack_versioned_capsule_single_consumption(self):
         x = jt.array(np.array([1.0], dtype=np.float32))
+        cap = x.dlpack(max_version=(1, 0))
+        jt.core.from_dlpack_capsule(cap)
         with self.assertRaises(Exception):
-            x.dlpack(copy=True)
+            jt.core.from_dlpack_capsule(cap)
+
+    def test_dlpack_old_max_version_falls_back_to_classic(self):
+        x = jt.array(np.array([1.0], dtype=np.float32))
+        cap = x.dlpack(max_version=(0, 8))
+        import ctypes
+        name = ctypes.pythonapi.PyCapsule_GetName
+        name.restype = ctypes.c_char_p
+        name.argtypes = [ctypes.py_object]
+        self.assertEqual(name(cap), b"dltensor")
+
+    def test_from_dlpack_prefers_versioned_capsule_from_numpy(self):
+        # jt.from_dlpack() requests max_version=(1,0); NumPy>=2's __dlpack__
+        # honors it and hands back a versioned capsule -- exercise the real
+        # negotiated path, not just a directly-built jittor->jittor capsule.
+        src = np.array([1.0, 2.0, 3.0], dtype=np.float32)
+        y = jt.from_dlpack(src)
+        np.testing.assert_allclose(y.numpy(), [1, 2, 3])
+        src[0] = 42.0
+        np.testing.assert_allclose(y.numpy(), [42, 2, 3])
+
+
+@unittest.skipIf(not has_torch, "No PyTorch found")
+class TestDLPackTorch(unittest.TestCase):
+    def test_cpu_roundtrip_dtype_coverage_via_torch_from_dlpack(self):
+        for dt in [torch.float32, torch.float64, torch.int32, torch.int64, torch.bool]:
+            src = torch.tensor([True, False, True], dtype=dt) if dt is torch.bool \
+                else torch.arange(1, 4, dtype=dt)
+            y = jt.from_dlpack(src)
+            np.testing.assert_array_equal(y.numpy(), src.numpy())
+
+    def test_jittor_to_torch_zero_copy_mutation_visible(self):
+        jt.flags.use_cuda = 0
+        x = jt.array(np.array([1.0, 2.0, 3.0], dtype=np.float32))
+        t = torch.from_dlpack(x)
+        t[0] = 42.0
+        np.testing.assert_allclose(x.numpy(), [42.0, 2.0, 3.0])
+
+    def test_torch_to_jittor_zero_copy_mutation_visible(self):
+        t = torch.tensor([1.0, 2.0, 3.0])
+        y = jt.from_dlpack(t)
+        t[0] = 77.0
+        np.testing.assert_allclose(y.numpy(), [77.0, 2.0, 3.0])
 
 
 @unittest.skipIf(not jt.compiler.has_cuda, "No CUDA found")
@@ -187,6 +291,57 @@ class TestDLPackCupy(unittest.TestCase):
         with cp.cuda.Device(1):
             c = cp.array([1.0, 2.0, 3.0], dtype=cp.float32)
         y = jt.from_dlpack(c)
+        self.assertEqual(y.device_id(), 1)
+        np.testing.assert_allclose(y.numpy(), [1, 2, 3])
+
+
+class TestDLPackTorchCuda(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        if not _torch_cuda_ready():
+            raise unittest.SkipTest(
+                "torch CUDA lazy-init failed in this process -- see "
+                "jittor-core-gaps.md section 3.4 (RTLD_GLOBAL/ELF symbol "
+                "interposition hazard between jittor_core and a co-loaded "
+                "PyTorch CUDA runtime when jittor is imported first)")
+
+    def setUp(self):
+        jt.flags.use_cuda = 1
+
+    def tearDown(self):
+        jt.flags.use_cuda = 0
+
+    def test_roundtrip_dtype_coverage(self):
+        for dt in [torch.float32, torch.float64, torch.int32, torch.int64,
+                   torch.bool, torch.complex64, torch.complex128]:
+            if dt is torch.bool:
+                src = torch.tensor([True, False, True], device="cuda")
+            elif dt in (torch.complex64, torch.complex128):
+                src = torch.tensor([1 + 2j, 3 + 4j], dtype=dt, device="cuda")
+            else:
+                src = torch.arange(1, 4, dtype=dt, device="cuda")
+            y = jt.from_dlpack(src)
+            self.assertEqual(y.device_id(), 0)
+            np.testing.assert_array_equal(y.numpy(), src.cpu().numpy())
+
+    def test_zero_copy_mutation_visible_both_ways(self):
+        x = jt.array(np.array([1.0, 2.0, 3.0], dtype=np.float32))
+        x.sync()
+        t = torch.from_dlpack(x)
+        self.assertEqual(t.device.type, "cuda")
+        t[0] = 99.0
+        np.testing.assert_allclose(x.numpy(), [99.0, 2.0, 3.0])
+
+    def test_multi_gpu_device_id_preserved(self):
+        if jt.get_device_count() < 2:
+            self.skipTest("needs >=2 GPUs")
+        # torch.Tensor.__dlpack__() itself refuses to export unless
+        # torch.cuda.current_device() matches the tensor's device (a
+        # torch-side restriction, not a jittor one) -- keep device 1 current
+        # for both the allocation and the export call.
+        with torch.cuda.device(1):
+            t = torch.tensor([1.0, 2.0, 3.0], device="cuda")
+            y = jt.from_dlpack(t)
         self.assertEqual(y.device_id(), 1)
         np.testing.assert_allclose(y.numpy(), [1, 2, 3])
 

@@ -192,5 +192,23 @@ class TestCodeOp(unittest.TestCase):
             assert numpy.allclose(dda.data,one)
             assert numpy.allclose(ddb.data,mone)
 
+    def test_second_order_grad_fails_loud(self):
+        # jittor-core-gaps.md §3.9: a numpy_code op's analytic backward is
+        # itself built as a *new* numpy_code op with no backward of its own
+        # (NumpyCodeOp::grad uses the NumpyResult-only constructor, which
+        # leaves `backward` empty). Requesting a second derivative through
+        # such a chain used to index that empty `backward` vector out of
+        # bounds and invoke a garbage NumpyFunc, segfaulting the whole
+        # process instead of raising a catchable error. `jt.linalg.inv` is a
+        # real, commonly used numpy_code consumer that hits this exactly as
+        # described by the doc's minimal repro.
+        x = jt.array([[2.0, 0.0], [0.0, 2.0]])
+        x.requires_grad = True
+        y = jt.linalg.inv(x).sum()
+        g1 = jt.grad(y, x)
+        with self.assertRaises(RuntimeError):
+            jt.grad(g1.sum(), x)
+
+
 if __name__ == "__main__":
     unittest.main()

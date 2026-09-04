@@ -668,13 +668,19 @@ def random(shape, dtype="float32", type="uniform"):
     for dim in shape:
         if dim < 0:
             raise RuntimeError(f"Trying to create tensor with negative dimension {dim}: {shape}")
-    ret = ops.random(shape, "float32", type)
-   ## TODO: move those code to core
-   #if dtype in ["float16", "bfloat16"]:
-   #    # TODO: make curand support fp16
-   #    ret = ops.random(shape, "float32", type).cast(dtype)
-   #else:
-   #    ret = ops.random(shape, dtype, type)
+    if callable(dtype):
+        dtype = dtype.__name__
+    if dtype in ("float32", "float64"):
+        # The CPU (std::uniform_real_distribution/normal_distribution<T>) and
+        # CUDA (curandGenerateUniform/NormalDouble) kernels natively support
+        # both of these -- generate the requested dtype directly instead of
+        # always sampling float32 and silently discarding a float64 request.
+        ret = ops.random(shape, dtype, type)
+    else:
+        # No native curand/CPU distribution kernel for this dtype (e.g.
+        # float16/bfloat16): sample in float32 and cast, matching prior
+        # behavior for these dtypes.
+        ret = ops.random(shape, "float32", type).cast(dtype)
     amp_reg = jt.flags.amp_reg
     if amp_reg:
         if amp_reg & 16:
@@ -719,7 +725,17 @@ def from_dlpack(obj):
     the data. The returned Var is explicitly pinned to the source's physical
     device (see Var.migrate_to_device) when that device is a GPU. '''
     if hasattr(obj, "__dlpack__"):
-        capsule = obj.__dlpack__()
+        # Advertise support for the DLPack>=0.8 versioned capsule (the
+        # "current standard" struct -- core.from_dlpack_capsule accepts
+        # either). NumPy/CuPy/PyTorch's own __dlpack__() all honor
+        # max_version and hand back a "dltensor_versioned" capsule once
+        # asked (verified against this repo's dev environment); a producer
+        # whose __dlpack__ doesn't accept the newer kwargs at all (pre-array
+        # API standard) falls back to the legacy no-argument call.
+        try:
+            capsule = obj.__dlpack__(max_version=(1, 0))
+        except TypeError:
+            capsule = obj.__dlpack__()
     else:
         capsule = obj
     return core.from_dlpack_capsule(capsule)

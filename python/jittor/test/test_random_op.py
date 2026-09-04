@@ -90,6 +90,29 @@ class TestRandomOp(unittest.TestCase):
     def test_normal_cuda(self):
         self.test_normal()
 
+    def test_random_dtype_not_silently_dropped(self):
+        # jittor-core-gaps.md §3.7: jt.random() used to hardcode the sampled
+        # dtype to float32 and ignore the caller's `dtype` argument entirely
+        # (a `dtype='float64'` request silently came back as float32). The
+        # underlying CPU (std::uniform_real_distribution/normal_distribution<T>)
+        # and CUDA (curandGenerateUniform/NormalDouble) kernels both natively
+        # support float64, so it should be generated directly rather than
+        # discarded.
+        for type_ in ("uniform", "normal"):
+            r32 = jt.random([8, 8], dtype="float32", type=type_)
+            r64 = jt.random([8, 8], dtype="float64", type=type_)
+            assert str(r32.dtype) == "float32", (type_, r32.dtype)
+            assert str(r64.dtype) == "float64", (type_, r64.dtype)
+        # dtypes with no native distribution kernel keep the existing
+        # sample-in-float32-then-cast fallback.
+        r16 = jt.random([8, 8], dtype="float16")
+        assert str(r16.dtype) == "float16"
+
+    @unittest.skipIf(not jt.has_cuda, "Cuda not found")
+    @jt.flag_scope(use_cuda=1)
+    def test_random_dtype_not_silently_dropped_cuda(self):
+        self.test_random_dtype_not_silently_dropped()
+
     def test_other_rand(self):
         a = jt.array([1.0,2.0,3.0])
         b = jt.rand_like(a)

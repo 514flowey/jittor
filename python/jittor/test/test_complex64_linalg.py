@@ -87,6 +87,54 @@ class _Mixin:
         rec = _dot(_dot(un, _diag_embed(sn)), vhn)
         np.testing.assert_allclose(rec, a, atol=1e-3, rtol=1e-3)
 
+    # ------------------------------------------------------------------ solve
+    def test_solve(self):
+        rng = np.random.RandomState(3)
+        a = rng.randn(4, 4) + 1j * rng.randn(4, 4)
+        b = rng.randn(4) + 1j * rng.randn(4)
+        za, zb = _to_complex64_var(a), jt.array(b.astype("complex64"))
+        x = linalg.solve(za, zb)
+        self.assertTrue("complex" in str(x.dtype), "solve must return native complex64")
+        np.testing.assert_allclose(a @ _np(x), b, atol=1e-3, rtol=1e-3)
+
+    # jittor-core-gaps.md §3.3: complex `solve` backward used a plain
+    # transpose (np.swapaxes only, no conjugate) instead of the conjugate
+    # transpose the Wirtinger convention requires, silently producing wrong
+    # A- and b-gradients for any complex dtype. Gradcheck against a numpy
+    # finite-difference oracle with a loss that is NOT gauge/phase invariant
+    # (unlike the svd/eigh gradchecks below) since solve has no such
+    # ambiguity -- a regression back to plain transpose would show up
+    # directly here, not be masked by a symmetric test.
+    def test_solve_backward_complex_conjugate(self):
+        rng = np.random.RandomState(4)
+        n = 4
+        a = rng.randn(n, n) + 1j * rng.randn(n, n)
+        b = rng.randn(n) + 1j * rng.randn(n)
+        p = (rng.randn(n) + 1j * rng.randn(n)) * 0.1
+
+        def loss_np(x):
+            return float(np.real(np.sum(x * np.conj(p))))
+
+        ref_a = self._fd_grad(lambda av: np.linalg.solve(av, b), a, loss_np)
+        ref_b = self._fd_grad(lambda bv: np.linalg.solve(a, bv), b, loss_np)
+        # Sanity check that the finite-difference oracle itself has a
+        # non-trivial imaginary part -- otherwise this test could not
+        # distinguish a conjugate transpose from a plain transpose.
+        self.assertGreater(np.abs(ref_a.imag).max(), 1e-3)
+
+        za = _to_complex64_var(a)
+        zb = jt.array(b.astype("complex64"))
+        za.requires_grad = True
+        zb.requires_grad = True
+        with jt.enable_grad():
+            x = linalg.solve(za, zb)
+            loss = (x * _to_complex64_var(p).conj()).real.sum()
+            gA, gb = jt.grad(loss, [za, zb])
+        np.testing.assert_allclose(_np(gA), ref_a, atol=3e-2, rtol=3e-2,
+                                   err_msg="solve backward wrt A vs finite-diff")
+        np.testing.assert_allclose(_np(gb), ref_b, atol=3e-2, rtol=3e-2,
+                                   err_msg="solve backward wrt b vs finite-diff")
+
     # ---------------------------------------------- svd backward (jittor-core-gaps.md §3.4)
     # Complex SVD/eigh backward were previously `raise NotImplementedError`. A per-column
     # unitary phase (u_i -> e^{i theta} u_i, v_i -> e^{i theta} v_i, A = U S V^H invariant)
@@ -235,6 +283,136 @@ class _Mixin:
             g = jt.grad(loss, [x])[0]
         got = _np(g)
         np.testing.assert_allclose(got, ref, atol=3e-2, rtol=3e-2)
+
+    # jittor-core-gaps.md §3.2: complex wide (M<N) reduced QR forward used to
+    # be rejected outright (`assert m >= n`), and backward for wide inputs
+    # was unimplemented even where forward worked. Both are now supported;
+    # gradcheck the wide-specific backward branch against a numpy
+    # finite-difference oracle, since it takes a structurally different code
+    # path (R split into R1|R2) from the tall/square formula already
+    # covered by test_qr_tall_forward_and_backward.
+    def _qr_gradcheck(self, shape, seed):
+        rng = np.random.RandomState(seed)
+        a = (rng.randn(*shape) + 1j * rng.randn(*shape)).astype("complex64")
+        m, n = shape[-2:]
+        k = min(m, n)
+        p_q = (rng.randn(*(shape[:-2] + (m, k))) +
+               1j * rng.randn(*(shape[:-2] + (m, k)))) * 0.1
+        p_r = (rng.randn(*(shape[:-2] + (k, n))) +
+               1j * rng.randn(*(shape[:-2] + (k, n)))) * 0.1
+
+        def fnp(av):
+            return np.linalg.qr(av)
+        def loss_np(qr):
+            q, r = qr
+            return float(np.real(np.sum(q * np.conj(p_q)) + np.sum(r * np.conj(p_r))))
+        ref = self._fd_grad(fnp, a, loss_np)
+
+        x = _to_complex64_var(a)
+        x.requires_grad = True
+        with jt.enable_grad():
+            q, r = linalg.qr(x)
+            loss = ((q * _to_complex64_var(p_q).conj()).real.sum() +
+                    (r * _to_complex64_var(p_r).conj()).real.sum())
+            g = jt.grad(loss, [x])[0]
+        np.testing.assert_allclose(_np(g), ref, atol=3e-2, rtol=3e-2,
+                                   err_msg=f"qr backward vs finite-diff, shape={shape}")
+
+    def test_qr_wide_forward_and_backward(self):
+        shape = (3, 6)
+        rng = np.random.RandomState(13)
+        a = (rng.randn(*shape) + 1j * rng.randn(*shape)).astype("complex64")
+        z = _to_complex64_var(a)
+        q, r = linalg.qr(z)
+        self.assertEqual(tuple(q.shape), (3, 3), "wide reduced QR: Q must be square")
+        self.assertEqual(tuple(r.shape), (3, 6))
+        qn, rn = _np(q), _np(r)
+        np.testing.assert_allclose(_dot(qn, rn), a, atol=1e-3, rtol=1e-3)
+        qhq = _dot(np.conj(np.swapaxes(qn, -1, -2)), qn)
+        np.testing.assert_allclose(qhq, np.eye(3), atol=1e-3, rtol=1e-3)
+        self._qr_gradcheck(shape, 13)
+
+    def test_qr_wide_backward_batched(self):
+        self._qr_gradcheck((2, 3, 6), 14)
+
+    # ---------------------------------------------------- rq (jittor-core-gaps.md §3.2)
+    # rq did not exist in this repo at all before this fix; it is implemented
+    # as a composition of flip/(conjugate-)transpose/qr (see linalg.py::rq's
+    # docstring), so these tests lock in the forward contract (R@Q==A,
+    # Q@Q^H==I, shapes) plus an independent backward gradcheck against a
+    # numpy finite-difference oracle.
+    def _rq_gradcheck(self, shape, seed):
+        rng = np.random.RandomState(seed)
+        a = (rng.randn(*shape) + 1j * rng.randn(*shape)).astype("complex64")
+        m, n = shape[-2:]
+        k = min(m, n)
+        p_r = (rng.randn(*(shape[:-2] + (m, k))) +
+               1j * rng.randn(*(shape[:-2] + (m, k)))) * 0.1
+        p_q = (rng.randn(*(shape[:-2] + (k, n))) +
+               1j * rng.randn(*(shape[:-2] + (k, n)))) * 0.1
+
+        def fnp(av):
+            m_, n_ = av.shape[-2:]
+            k_ = min(m_, n_)
+            def one(mat):
+                a_tilde = mat[::-1, ::-1]
+                q0, r0 = np.linalg.qr(np.conj(a_tilde.T))
+                r_ = np.conj(r0.T)[::-1, ::-1]
+                q_ = np.conj(q0.T)[::-1, ::-1]
+                return r_, q_
+            if av.ndim == 2:
+                return one(av)
+            batch = av.shape[:-2]
+            flat = av.reshape(-1, m_, n_)
+            rs, qs = zip(*(one(flat[i]) for i in range(flat.shape[0])))
+            return (np.stack(rs).reshape(batch + (m_, k_)),
+                    np.stack(qs).reshape(batch + (k_, n_)))
+
+        def loss_np(rq):
+            r, q = rq
+            return float(np.real(np.sum(r * np.conj(p_r)) + np.sum(q * np.conj(p_q))))
+        ref = self._fd_grad(fnp, a, loss_np)
+
+        x = _to_complex64_var(a)
+        x.requires_grad = True
+        with jt.enable_grad():
+            r, q = linalg.rq(x)
+            loss = ((r * _to_complex64_var(p_r).conj()).real.sum() +
+                    (q * _to_complex64_var(p_q).conj()).real.sum())
+            g = jt.grad(loss, [x])[0]
+        np.testing.assert_allclose(_np(g), ref, atol=3e-2, rtol=3e-2,
+                                   err_msg=f"rq backward vs finite-diff, shape={shape}")
+
+    def _rq_forward_check(self, shape, seed):
+        rng = np.random.RandomState(seed)
+        a = (rng.randn(*shape) + 1j * rng.randn(*shape)).astype("complex64")
+        z = _to_complex64_var(a)
+        r, q = linalg.rq(z)
+        m, n = shape[-2:]
+        k = min(m, n)
+        self.assertEqual(tuple(r.shape[-2:]), (m, k))
+        self.assertEqual(tuple(q.shape[-2:]), (k, n))
+        rn, qn = _np(r), _np(q)
+        np.testing.assert_allclose(_dot(rn, qn), a, atol=1e-3, rtol=1e-3)
+        qqh = _dot(qn, np.conj(np.swapaxes(qn, -1, -2)))
+        eye = np.broadcast_to(np.eye(k), qqh.shape)
+        np.testing.assert_allclose(qqh, eye, atol=1e-3, rtol=1e-3)
+
+    def test_rq_square(self):
+        self._rq_forward_check((4, 4), 20)
+        self._rq_gradcheck((4, 4), 20)
+
+    def test_rq_tall(self):
+        self._rq_forward_check((6, 3), 21)
+        self._rq_gradcheck((6, 3), 21)
+
+    def test_rq_wide(self):
+        self._rq_forward_check((3, 6), 22)
+        self._rq_gradcheck((3, 6), 22)
+
+    def test_rq_batched(self):
+        self._rq_forward_check((2, 6, 3), 23)
+        self._rq_gradcheck((2, 6, 3), 23)
 
     def test_svdvals(self):
         rng = np.random.RandomState(2)

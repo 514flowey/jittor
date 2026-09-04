@@ -294,6 +294,145 @@ class TestLinalgOp(unittest.TestCase):
                 print(tgq[0])
                 print(tgr[0])
 
+# jittor-core-gaps.md §3.2: real qr backward previously raised
+# NotImplementedError for wide (M<N) input, and `rq` did not exist at all.
+# Unlike TestLinalgOp above, this class needs neither torch nor autograd
+# (numpy is the finite-difference oracle), so it always runs.
+class TestQrRqWideOp(unittest.TestCase):
+    def setUp(self):
+        # CPU only: this sandbox has no cupy, and complex/real linalg's CUDA
+        # path in this repo depends on it for the numpy_code kernels; other
+        # linalg test files gate CUDA variants the same way (see
+        # test_complex128_linalg.py's _Mixin).
+        jt.flags.use_cuda = 0
+
+    def _fd_grad(self, f, a, loss_fn, eps=1e-5):
+        g = np.zeros_like(a)
+        for idx in np.ndindex(*a.shape):
+            ap = a.copy(); ap[idx] += eps
+            am = a.copy(); am[idx] -= eps
+            g[idx] = (loss_fn(f(ap)) - loss_fn(f(am))) / (2 * eps)
+        return g
+
+    def _qr_gradcheck(self, shape, seed):
+        rng = np.random.RandomState(seed)
+        a = rng.randn(*shape).astype('float64')
+        m, n = shape[-2:]
+        k = min(m, n)
+        p_q = rng.randn(*(shape[:-2] + (m, k))) * 0.1
+        p_r = rng.randn(*(shape[:-2] + (k, n))) * 0.1
+
+        def fnp(av):
+            return np.linalg.qr(av)
+        def loss_fn(qr):
+            q, r = qr
+            return float(np.sum(q * p_q) + np.sum(r * p_r))
+        ref = self._fd_grad(fnp, a, loss_fn)
+
+        with jt.flag_scope(auto_convert_64_to_32=0):
+            x = jt.array(a)
+        x.requires_grad = True
+        with jt.enable_grad():
+            q, r = jt.linalg.qr(x)
+            loss = (q * jt.array(p_q)).sum() + (r * jt.array(p_r)).sum()
+            g = jt.grad(loss, x)
+        np.testing.assert_allclose(g.numpy(), ref, atol=1e-5, rtol=1e-5,
+                                   err_msg=f"qr backward vs finite-diff, shape={shape}")
+
+    def test_qr_square(self):
+        self._qr_gradcheck((3, 3), 0)
+
+    def test_qr_tall(self):
+        self._qr_gradcheck((6, 3), 1)
+
+    def test_qr_wide(self):
+        m, n = 3, 6
+        rng = np.random.RandomState(2)
+        a = rng.randn(m, n).astype('float64')
+        with jt.flag_scope(auto_convert_64_to_32=0):
+            x = jt.array(a)
+        q, r = jt.linalg.qr(x)
+        self.assertEqual(tuple(q.shape), (m, m), "wide reduced QR: Q must be square")
+        self.assertEqual(tuple(r.shape), (m, n))
+        qn, rn = q.numpy(), r.numpy()
+        np.testing.assert_allclose(qn @ rn, a, atol=1e-8, rtol=1e-8)
+        np.testing.assert_allclose(qn.T @ qn, np.eye(m), atol=1e-8, rtol=1e-8)
+        self._qr_gradcheck((m, n), 2)
+
+    def test_qr_wide_batched(self):
+        self._qr_gradcheck((2, 4, 7), 3)
+
+    def _rq_gradcheck(self, shape, seed):
+        rng = np.random.RandomState(seed)
+        a = rng.randn(*shape).astype('float64')
+        m, n = shape[-2:]
+        k = min(m, n)
+        p_r = rng.randn(*(shape[:-2] + (m, k))) * 0.1
+        p_q = rng.randn(*(shape[:-2] + (k, n))) * 0.1
+
+        def fnp(av):
+            m_, n_ = av.shape[-2:]
+            k_ = min(m_, n_)
+            def one(mat):
+                a_tilde = mat[::-1, ::-1]
+                q0, r0 = np.linalg.qr(a_tilde.T)
+                return r0.T[::-1, ::-1], q0.T[::-1, ::-1]
+            if av.ndim == 2:
+                return one(av)
+            batch = av.shape[:-2]
+            flat = av.reshape(-1, m_, n_)
+            rs, qs = zip(*(one(flat[i]) for i in range(flat.shape[0])))
+            return (np.stack(rs).reshape(batch + (m_, k_)),
+                    np.stack(qs).reshape(batch + (k_, n_)))
+
+        def loss_fn(rq):
+            r, q = rq
+            return float(np.sum(r * p_r) + np.sum(q * p_q))
+        ref = self._fd_grad(fnp, a, loss_fn)
+
+        with jt.flag_scope(auto_convert_64_to_32=0):
+            x = jt.array(a)
+        x.requires_grad = True
+        with jt.enable_grad():
+            r, q = jt.linalg.rq(x)
+            loss = (r * jt.array(p_r)).sum() + (q * jt.array(p_q)).sum()
+            g = jt.grad(loss, x)
+        np.testing.assert_allclose(g.numpy(), ref, atol=1e-5, rtol=1e-5,
+                                   err_msg=f"rq backward vs finite-diff, shape={shape}")
+
+    def _rq_forward_check(self, shape, seed):
+        rng = np.random.RandomState(seed)
+        a = rng.randn(*shape).astype('float64')
+        with jt.flag_scope(auto_convert_64_to_32=0):
+            x = jt.array(a)
+        r, q = jt.linalg.rq(x)
+        m, n = shape[-2:]
+        k = min(m, n)
+        self.assertEqual(tuple(r.shape[-2:]), (m, k))
+        self.assertEqual(tuple(q.shape[-2:]), (k, n))
+        rn, qn = r.numpy(), q.numpy()
+        np.testing.assert_allclose(np.matmul(rn, qn), a, atol=1e-8, rtol=1e-8)
+        qqt = np.matmul(qn, np.swapaxes(qn, -1, -2))
+        eye = np.broadcast_to(np.eye(k), qqt.shape)
+        np.testing.assert_allclose(qqt, eye, atol=1e-8, rtol=1e-8)
+
+    def test_rq_square(self):
+        self._rq_forward_check((4, 4), 10)
+        self._rq_gradcheck((4, 4), 10)
+
+    def test_rq_tall(self):
+        self._rq_forward_check((6, 3), 11)
+        self._rq_gradcheck((6, 3), 11)
+
+    def test_rq_wide(self):
+        self._rq_forward_check((3, 6), 12)
+        self._rq_gradcheck((3, 6), 12)
+
+    def test_rq_batched(self):
+        self._rq_forward_check((2, 6, 3), 13)
+        self._rq_gradcheck((2, 6, 3), 13)
+
+
 @unittest.skipIf(not jt.has_cuda, "No cuda found.")
 class TestBUG4_2Op(unittest.TestCase):
     def test(self):

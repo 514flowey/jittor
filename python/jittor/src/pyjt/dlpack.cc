@@ -30,8 +30,23 @@
 //    ever row-major contiguous) -- importing a DLTensor with non-null,
 //    non-contiguous strides is rejected outright rather than silently
 //    misread or silently copied.
+//  - Versioning: both the classic (unversioned) DLManagedTensor and the
+//    DLPack>=0.8 DLManagedTensorVersioned capsule are supported, on export
+//    and import. Export only produces the versioned form when the consumer
+//    explicitly opts in via __dlpack__(max_version=(major,minor)) with
+//    major>=1; the default remains the classic capsule (DLPack's own
+//    mandated fallback, and what NumPy/CuPy/PyTorch's own from_dlpack()
+//    consume when they don't request a version). Import accepts either
+//    capsule name a producer hands back and, for the versioned form, checks
+//    DLPackVersion.major before touching any other field (a major mismatch
+//    only guarantees the deleter is safe to call, per spec).
+//  - copy=True: honored by materializing an independent buffer (real
+//    memcpy/cudaMemcpy on the same device, not an aliasing op) instead of
+//    rejecting the request -- see make_materialized_copy().
 #include <Python.h>
 #include <vector>
+#include <cstring>
+#include <functional>
 #include "pyjt/dlpack.h"
 #include "pyjt/dlpack_api.h"
 #include "var_holder.h"
@@ -43,6 +58,7 @@
 #include <cuda_runtime.h>
 #include "helper_cuda.h"
 #include "misc/cuda_guard.h"
+#include "mem/allocator/cuda_device_allocator.h"
 #endif
 
 namespace jittor {
@@ -157,7 +173,73 @@ static void jittor_dlpack_capsule_destructor(PyObject* capsule) {
     if (managed && managed->deleter) managed->deleter(managed);
 }
 
-static PyObject* to_dlpack_capsule(VarHolder* v) {
+// Versioned counterparts (DLPack >=0.8's DLManagedTensorVersioned, the
+// "current standard" struct per dlpack.h) -- same ownership/deleter idiom as
+// the classic pair above, just a distinct capsule name ("dltensor_versioned")
+// and struct layout, since consumers that opt into a version via
+// __dlpack__(max_version=...) expect that exact ABI back.
+static void jittor_dlpack_deleter_versioned(DLManagedTensorVersioned* self) {
+    if (!self) return;
+    delete (JittorDLManagerCtx*)self->manager_ctx;
+    delete self;
+}
+
+static void jittor_dlpack_capsule_destructor_versioned(PyObject* capsule) {
+    if (!PyCapsule_IsValid(capsule, "dltensor_versioned")) return;
+    auto* managed = (DLManagedTensorVersioned*)PyCapsule_GetPointer(capsule, "dltensor_versioned");
+    if (managed && managed->deleter) managed->deleter(managed);
+}
+
+// __dlpack__(copy=True): materialize an independent buffer (same device,
+// real memcpy/cudaMemcpy -- not an aliasing op like clone_op's share_with)
+// so the exported capsule owns memory nobody else can mutate or free out
+// from under it. `var` must already be synced/materialized by the caller.
+static VarPtr make_materialized_copy(Var* var) {
+    VarPtr vp(var->shape, var->dtype());
+    vp->finish_pending_liveness();
+    // Still allocate (rather than leaving mem_ptr null) even when num==0:
+    // Jittor's own allocators hand back a valid non-null pointer for a
+    // zero-byte request, and the rest of the Var/DLPack machinery (the
+    // ASSERT in resolve_export, downstream fetch_sync()) relies on that --
+    // an early-return-with-null-mem_ptr here would make an empty Var look
+    // "unmaterialized" instead of "genuinely empty".
+#ifdef HAS_CUDA
+    if (var->allocator->is_cuda()) {
+        int dev_id = var->allocator->device_id();
+        CudaDeviceGuard guard(dev_id);
+        Allocation a(&get_cuda_device_allocator(dev_id), var->size);
+        if (var->size)
+            checkCudaErrors(cudaMemcpy(a.ptr, var->mem_ptr, var->size, cudaMemcpyDeviceToDevice));
+        vp->mem_ptr = a.ptr;
+        vp->allocator = a.allocator;
+        vp->allocation = a.allocation;
+        a.ptr = nullptr;
+        return vp;
+    }
+#endif
+    Allocation a(cpu_allocator, var->size);
+    if (var->size)
+        std::memcpy(a.ptr, var->mem_ptr, var->size);
+    vp->mem_ptr = a.ptr;
+    vp->allocator = a.allocator;
+    vp->allocation = a.allocation;
+    a.ptr = nullptr;
+    return vp;
+}
+
+// Shared resolution step for both the classic and versioned export paths:
+// sync, resolve device/dtype (can throw -- must happen before any heap
+// allocation below, else a rejected export would leak ctx/managed), apply
+// copy=True's materialization, and build the ctx that owns the exported
+// Var's liveness plus the shape buffer DLTensor.shape points into.
+struct ResolvedExport {
+    JittorDLManagerCtx* ctx;
+    Var* var;
+    DLDevice dev;
+    DLDataType dtype;
+};
+
+static ResolvedExport resolve_export(VarHolder* v, bool force_copy) {
     // Forces pending computation AND a device sync -- the producer-side half
     // of the "stream" contract: by the time this returns, every earlier op
     // Jittor queued against this Var (on its one and only implicit stream)
@@ -167,33 +249,72 @@ static PyObject* to_dlpack_capsule(VarHolder* v) {
     Var* var = v->var;
     ASSERT(var->mem_ptr || var->num == 0) << "dlpack: exporting an unmaterialized Var";
 
-    // Resolve device/dtype BEFORE any heap allocation below: both can throw
-    // (unsupported dtype, swapped-to-disk location), and if that happened
-    // after ctx/managed were already allocated, ctx's VarPtr would keep the
-    // underlying storage pinned forever with nothing left to free it.
     DLDevice dev = var_to_dldevice(v);
     DLDataType dtype = ns_to_dltype(var->dtype());
+
+    // Keeps a materialized-copy Var alive across the ctx construction below;
+    // JittorDLManagerCtx takes its own independent reference (own_both_liveness
+    // inside VarPtr(Var*)), so releasing copy_holder at function exit is safe.
+    VarPtr copy_holder;
+    if (force_copy) {
+        copy_holder = make_materialized_copy(var);
+        var = copy_holder.ptr;
+    }
 
     auto* ctx = new JittorDLManagerCtx(var);
     ctx->shape.reserve(var->shape.size());
     for (int i = 0; i < var->shape.size(); i++)
         ctx->shape.push_back(var->shape[i]);
+    return {ctx, var, dev, dtype};
+}
 
-    auto* managed = new DLManagedTensor();
-    managed->manager_ctx = ctx;
-    managed->deleter = jittor_dlpack_deleter;
-    DLTensor& t = managed->dl_tensor;
-    t.data = var->mem_ptr;
-    t.device = dev;
-    t.ndim = (int32_t)ctx->shape.size();
-    t.dtype = dtype;
-    t.shape = ctx->shape.empty() ? nullptr : ctx->shape.data();
+static void fill_dl_tensor(DLTensor& t, const ResolvedExport& r) {
+    t.data = r.var->mem_ptr;
+    t.device = r.dev;
+    t.ndim = (int32_t)r.ctx->shape.size();
+    t.dtype = r.dtype;
+    t.shape = r.ctx->shape.empty() ? nullptr : r.ctx->shape.data();
     t.strides = nullptr;   // Jittor Vars are always row-major contiguous
     t.byte_offset = 0;
+}
+
+static PyObject* to_dlpack_capsule(VarHolder* v, bool force_copy=false) {
+    auto r = resolve_export(v, force_copy);
+    auto* managed = new DLManagedTensor();
+    managed->manager_ctx = r.ctx;
+    managed->deleter = jittor_dlpack_deleter;
+    fill_dl_tensor(managed->dl_tensor, r);
 
     PyObject* capsule = PyCapsule_New(managed, "dltensor", jittor_dlpack_capsule_destructor);
     if (!capsule) {
         jittor_dlpack_deleter(managed);
+        return nullptr;
+    }
+    return capsule;
+}
+
+// DLPack >=0.8 "current standard" capsule, produced only when a consumer
+// opts in via __dlpack__(max_version=(major,minor>=... )) with major>=1 --
+// see VarHolder::dlpack(). Real-world default consumers (NumPy/CuPy's own
+// from_dlpack, and torch.from_dlpack against a raw capsule) still get the
+// classic capsule from to_dlpack_capsule() above; this path only fires when
+// the caller explicitly asked for the versioned ABI.
+static PyObject* to_dlpack_capsule_versioned(VarHolder* v, bool force_copy=false) {
+    auto r = resolve_export(v, force_copy);
+    auto* managed = new DLManagedTensorVersioned();
+    managed->version.major = DLPACK_MAJOR_VERSION;
+    managed->version.minor = DLPACK_MINOR_VERSION;
+    managed->manager_ctx = r.ctx;
+    managed->deleter = jittor_dlpack_deleter_versioned;
+    // IS_COPIED accurately reflects make_materialized_copy(): the consumer
+    // can treat that buffer as solely theirs. READ_ONLY is never set --
+    // Jittor Vars carry no read-only concept to report truthfully.
+    managed->flags = force_copy ? DLPACK_FLAG_BITMASK_IS_COPIED : 0;
+    fill_dl_tensor(managed->dl_tensor, r);
+
+    PyObject* capsule = PyCapsule_New(managed, "dltensor_versioned", jittor_dlpack_capsule_destructor_versioned);
+    if (!capsule) {
+        jittor_dlpack_deleter_versioned(managed);
         return nullptr;
     }
     return capsule;
@@ -211,15 +332,27 @@ PyObject* VarHolder::dlpack(PyObject* stream, PyObject* max_version, PyObject* d
     // regardless of what stream the consumer intends to use next -- see the
     // design doc for why this is a sound simplification given Jittor's
     // execution model, not a shortcut around a real cross-stream hazard.
-    // `max_version` is accepted and ignored: this adapter only ever produces
-    // the classic unversioned DLManagedTensor, which is DLPack's own
-    // mandated fallback for a consumer that didn't get a version match (and
-    // is what NumPy/CuPy actually consume by default -- verified against
-    // this repo's dev environment).
-    (void)stream; (void)max_version;
-    if (copy && copy != Py_None && PyObject_IsTrue(copy))
-        LOGf << "dlpack: __dlpack__(copy=True) is not supported -- Jittor's "
-             << "DLPack export is always zero-copy";
+    // `max_version=(major,minor)`: per the DLPack spec, a producer MAY
+    // return the versioned DLManagedTensorVersioned capsule once the
+    // consumer advertises major>=1 support; otherwise it must fall back to
+    // the classic capsule (DLPack's own mandated default -- and what
+    // NumPy/CuPy/PyTorch's own from_dlpack() consume when they don't pass
+    // max_version at all, verified against this repo's dev environment).
+    (void)stream;
+    bool want_versioned = false;
+    if (max_version && max_version != Py_None) {
+        int req_major = 0, req_minor = 0;
+        if (!PyArg_ParseTuple(max_version, "ii", &req_major, &req_minor))
+            LOGf << "dlpack: __dlpack__(max_version=...) must be a (major, minor) tuple";
+        want_versioned = req_major >= 1;
+    }
+    // copy=True: export a freshly materialized, independently-owned buffer
+    // (real memcpy/cudaMemcpy, same device) instead of aliasing this Var's
+    // own storage -- see make_materialized_copy(). copy=False would mean
+    // "the consumer requires zero-copy or must fail"; Jittor's default path
+    // is already zero-copy, so False (and None, DLPack's "copy if needed"
+    // default) both take the normal aliasing export.
+    bool force_copy = copy && copy != Py_None && PyObject_IsTrue(copy);
     if (dl_device && dl_device != Py_None) {
         int req_type = 0, req_id = 0;
         if (!PyArg_ParseTuple(dl_device, "ii", &req_type, &req_id))
@@ -230,7 +363,8 @@ PyObject* VarHolder::dlpack(PyObject* stream, PyObject* max_version, PyObject* d
                  << "where this Var actually lives is not supported; "
                  << "call .migrate_to_device() explicitly first";
     }
-    return to_dlpack_capsule(this);
+    return want_versioned ? to_dlpack_capsule_versioned(this, force_copy)
+                          : to_dlpack_capsule(this, force_copy);
 }
 
 PyObject* VarHolder::dlpack_device() {
@@ -254,13 +388,42 @@ static bool dl_tensor_is_contiguous(const DLTensor& t) {
 }
 
 VarHolder* from_dlpack_capsule(PyObject* capsule) {
-    if (!PyCapsule_IsValid(capsule, "dltensor"))
-        LOGf << "dlpack: expected a live \"dltensor\" capsule (it may already "
-             << "have been consumed by an earlier from_dlpack() call -- a "
-             << "DLPack capsule can only be imported once)";
-    auto* managed = (DLManagedTensor*)PyCapsule_GetPointer(capsule, "dltensor");
+    // Accept either capsule flavor a producer might hand back: the classic
+    // "dltensor" (still the default from NumPy/CuPy/PyTorch's own
+    // __dlpack__() when the caller doesn't opt into a version) or the
+    // "current standard" "dltensor_versioned" (DLManagedTensorVersioned) --
+    // see VarHolder::dlpack()/to_dlpack_capsule_versioned() for the export
+    // side of the same pair. Only one of these two names can ever be valid
+    // on a given capsule.
+    bool versioned = PyCapsule_IsValid(capsule, "dltensor_versioned");
+    if (!versioned && !PyCapsule_IsValid(capsule, "dltensor"))
+        LOGf << "dlpack: expected a live \"dltensor\" or \"dltensor_versioned\" "
+             << "capsule (it may already have been consumed by an earlier "
+             << "from_dlpack() call -- a DLPack capsule can only be imported once)";
 
-    DLTensor& t = managed->dl_tensor;
+    DLManagedTensor* managed = nullptr;
+    DLManagedTensorVersioned* managed_v = nullptr;
+    DLTensor* t_ptr;
+    if (versioned) {
+        managed_v = (DLManagedTensorVersioned*)PyCapsule_GetPointer(capsule, "dltensor_versioned");
+        if (managed_v->version.major != DLPACK_MAJOR_VERSION) {
+            // Per the DLPack spec: on a major-version mismatch it is only
+            // safe to call the deleter, not to read any other field (the
+            // ABI layout itself may have changed) -- consume the capsule
+            // and fail loud rather than misreading a struct we don't
+            // understand.
+            PyCapsule_SetName(capsule, "used_dltensor_versioned");
+            if (managed_v->deleter) managed_v->deleter(managed_v);
+            LOGf << "dlpack: unsupported DLPack major version " << managed_v->version.major
+                 << " (this build understands major version " << DLPACK_MAJOR_VERSION << ")";
+        }
+        t_ptr = &managed_v->dl_tensor;
+    } else {
+        managed = (DLManagedTensor*)PyCapsule_GetPointer(capsule, "dltensor");
+        t_ptr = &managed->dl_tensor;
+    }
+    DLTensor& t = *t_ptr;
+
     if (!dl_tensor_is_contiguous(t))
         LOGf << "dlpack: importing a non-contiguous (strided) tensor is not "
              << "supported -- Jittor's Var has no stride concept, only "
@@ -285,7 +448,11 @@ VarHolder* from_dlpack_capsule(PyObject* capsule) {
     // looking "consumed" (jittor_dlpack_capsule_destructor no-ops on it)
     // while nothing ever took ownership of the producer's buffer, permanently
     // leaking it (real GPU memory, for a CUDA producer).
-    PyCapsule_SetName(capsule, "used_dltensor");
+    PyCapsule_SetName(capsule, versioned ? "used_dltensor_versioned" : "used_dltensor");
+
+    std::function<void()> fire_deleter = versioned
+        ? std::function<void()>([managed_v]() { managed_v->deleter(managed_v); })
+        : std::function<void()>([managed]() { managed->deleter(managed); });
 
     VarPtr vp(shape, dtype);
     vp->finish_pending_liveness();
@@ -294,8 +461,7 @@ VarHolder* from_dlpack_capsule(PyObject* capsule) {
     Allocation allocation;
     int target_device_id = -1;
     if (t.device.device_type == kDLCPU) {
-        make_foreign_allocation(allocation, vp->mem_ptr, vp->size,
-            [managed]() { managed->deleter(managed); });
+        make_foreign_allocation(allocation, vp->mem_ptr, vp->size, std::move(fire_deleter));
     }
 #ifdef HAS_CUDA
     else {
@@ -308,8 +474,7 @@ VarHolder* from_dlpack_capsule(PyObject* capsule) {
             CudaDeviceGuard guard(target_device_id);
             checkCudaErrors(cudaDeviceSynchronize());
         }
-        make_foreign_allocation(allocation, vp->mem_ptr, vp->size,
-            [managed]() { managed->deleter(managed); },
+        make_foreign_allocation(allocation, vp->mem_ptr, vp->size, std::move(fire_deleter),
             &get_foreign_allocator(target_device_id));
     }
 #endif
