@@ -81,7 +81,9 @@ ArrayOp::ArrayOp(ArrayArgs&& args) {
 }
 
 void ArrayOp::jit_prepare(JK& jk) {
-    if (output->flags.get(NodeFlags::_force_fuse)) {
+    // Shared scalars can lose _force_fuse during graph optimization while
+    // remaining element ops. Their compiled kernels still depend on dtype.
+    if (type() == OpType::element) {
         jk << "«T:" << output->dtype();
 
         // fill or find cbuffer for const var pass
