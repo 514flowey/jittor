@@ -297,6 +297,79 @@ class TestVmap(unittest.TestCase):
         out2 = jt.vmap(lambda xx: xx @ U)(x)
         np.testing.assert_allclose(out2.numpy(), x.numpy() @ U.numpy(), atol=1e-5)
 
+    # jittor-core-gaps.md 2026-09-05 §3.2: native (non-looping) vmap batching
+    # rules for the single-input factorizations qr/svd/svdvals/eigh/inv.
+    # These ops are already implemented batch-dim-agnostic (linalg.py wraps
+    # np.linalg.* via numpy_code, which treats any leading dims as batch
+    # dims), so the batching rule is a pure pass-through with no reshaping,
+    # verified here per-sample against plain (unbatched) calls -- not against
+    # a Python-loop fallback, so this actually exercises the "one real op
+    # graph" native path, not the vmap docstring's own loop-based decoy.
+    #
+    # `vmap(lambda a: jt.linalg.qr(a))`, not the bare `vmap(jt.linalg.qr)`:
+    # see the `func` parameter note on `vmap()`'s own docstring -- a bare op
+    # reference is resolved before this module's lazy first-call patching,
+    # so on this test file's very first vmap call it would capture the
+    # original, BatchedVar-oblivious op and fail with a confusing low-level
+    # jt.numpy_code overload-resolution error instead of exercising the
+    # batching rule this test is actually meant to check.
+    def test_vmap_qr_matches_per_sample(self):
+        rng = np.random.RandomState(11)
+        X = jt.array(rng.randn(4, 6, 3).astype(np.float32))
+        q, r = jt.vmap(lambda a: jt.linalg.qr(a))(X)
+        for i in range(4):
+            Q, R = jt.linalg.qr(X[i])
+            np.testing.assert_allclose(q[i].numpy(), Q.numpy(), atol=1e-4)
+            np.testing.assert_allclose(r[i].numpy(), R.numpy(), atol=1e-4)
+            np.testing.assert_allclose(q[i].numpy() @ r[i].numpy(), X[i].numpy(), atol=1e-4)
+
+    def test_vmap_eigh_matches_per_sample(self):
+        # jt.array of a float64 array is, by default, silently downcast to
+        # float32 (jt.flags.auto_convert_64_to_32) -- that's fine for most
+        # tests, but comparing "batched eigh" against "4 separate eigh
+        # calls" at float32 precision picks up ~1e-6 LAPACK-routine-order
+        # noise unrelated to the batching rule itself (see __init__.py's own
+        # `with jt.flag_scope(auto_convert_64_to_32=0)` uses for the same
+        # reason). Disable it here so this actually tests the batching rule
+        # at the float64 precision the inputs were built at.
+        with jt.flag_scope(auto_convert_64_to_32=0):
+            rng = np.random.RandomState(12)
+            A = rng.randn(4, 5, 5).astype(np.float64)
+            A = A + A.transpose(0, 2, 1)
+            X = jt.array(A)
+            w, v = jt.vmap(lambda a: jt.linalg.eigh(a))(X)
+            for i in range(4):
+                W, V = jt.linalg.eigh(X[i])
+                np.testing.assert_allclose(np.sort(w[i].numpy()), np.sort(W.numpy()), atol=1e-9)
+
+    def test_vmap_inv_matches_per_sample(self):
+        with jt.flag_scope(auto_convert_64_to_32=0):
+            rng = np.random.RandomState(13)
+            A = rng.randn(4, 5, 5).astype(np.float64) + 5 * np.eye(5)[None]
+            X = jt.array(A)
+            out = jt.vmap(lambda a: jt.linalg.inv(a))(X)
+            for i in range(4):
+                np.testing.assert_allclose(out[i].numpy(), jt.linalg.inv(X[i]).numpy(), atol=1e-9)
+
+    def test_vmap_svdvals_matches_per_sample(self):
+        with jt.flag_scope(auto_convert_64_to_32=0):
+            rng = np.random.RandomState(14)
+            X = jt.array(rng.randn(4, 5, 3).astype(np.float64))
+            out = jt.vmap(lambda a: jt.linalg.svdvals(a))(X)
+            for i in range(4):
+                np.testing.assert_allclose(out[i].numpy(), jt.linalg.svdvals(X[i]).numpy(), atol=1e-9)
+
+    def test_vmap_svd_matches_per_sample(self):
+        with jt.flag_scope(auto_convert_64_to_32=0):
+            rng = np.random.RandomState(15)
+            X = jt.array(rng.randn(4, 5, 3).astype(np.float64))
+            u, s, v = jt.vmap(lambda a: jt.linalg.svd(a))(X)
+            for i in range(4):
+                U, S, V = jt.linalg.svd(X[i])
+                np.testing.assert_allclose(s[i].numpy(), S.numpy(), atol=1e-9)
+                recon = u[i].numpy() @ np.diag(s[i].numpy()) @ v[i].numpy()
+                np.testing.assert_allclose(recon, X[i].numpy(), atol=1e-8)
+
     def test_complex64_vmap_vjp_expectation_value(self):
         # 2026-08-26-core-gaps-3.1-3.8-verification.md §6.2(b): conj/real/
         # imag were not batchable, so no complex-valued (quantum-state-

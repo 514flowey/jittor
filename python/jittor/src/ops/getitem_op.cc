@@ -34,7 +34,7 @@ static auto make_setitem = get_op_info("setitem")
     .get_constructor<VarPtr, Var*, VarSlices&&, Var*, NanoString>();
 
 GetitemOp::GetitemOp(Var* x, VarSlices&& slices)
-    : vs(move(slices)) {
+    : x(x), y(nullptr), vs(move(slices)) {
     flags.set(NodeFlags::_cpu);
     flags.set(NodeFlags::_cuda);
     flags.set(NodeFlags::_has_gopt);
@@ -45,8 +45,8 @@ GetitemOp::GetitemOp(Var* x, VarSlices&& slices)
     create_output(nullptr, x->dtype());
 }
 
-GetitemOp::GetitemOp(Var* x, VarSlices&& slices, int _) 
-    : vs(move(slices)) {
+GetitemOp::GetitemOp(Var* x, VarSlices&& slices, int _)
+    : x(x), y(nullptr), vs(move(slices)) {
     flags.set(NodeFlags::_cpu);
     flags.set(NodeFlags::_cuda);
     flags.set(NodeFlags::_has_gopt);
@@ -67,7 +67,7 @@ void GetitemOp::infer_slices(
     StackVector<>& __restrict__ i_to_o,
     StackVector<>& __restrict__ out_shape
 ) {
-    auto in = inputs().front();
+    auto in = x;
     auto in_shape = in->shape;
     auto nin = in_shape.size();
     i_to_vs.n = i_to_o.n = nin;
@@ -283,6 +283,16 @@ void GetitemOp::_compile_optimize(string& src) {
             if (startswith(rvalue, "input")
                 || startswith(rvalue, "output")
                 || startswith(rvalue, "vs.")
+                // GetitemOp::x / SetitemOp::x,y (see getitem_op.h, setitem_op.h):
+                // cached Op-member pointers, only valid in host (Op member
+                // function) scope, just like inputs()/outputs() used to be
+                // before they were replaced by these members. Must be
+                // treated the same as the "input"/"output" cases above:
+                // computed host-side and passed into the CUDA kernel as a
+                // plain argument, never cloned into the free-standing
+                // __global__ slice_func, which has no `this`.
+                || rvalue == "x"
+                || rvalue == "y"
                 || rvalue.back() == ')'
                 || rvalue.back() == ']')
             {
@@ -359,7 +369,7 @@ void GetitemOp::_compile_optimize(string& src) {
 }
 
 void GetitemOp::infer_shape() {
-    auto in = inputs().front();
+    auto in = x;
     auto out = outputs().front();
     auto in_shape = in->shape;
     auto nin = in_shape.size();
@@ -431,7 +441,7 @@ void GetitemOp::grads(Var** dout, VarPtr* dins) {
     VarPtr x = dout[1];
     VarPtr y = dout[0];
     if (!x) {
-        auto in = inputs().front();
+        auto in = this->x;
         // ns.data represents this is the last split var
         if (ns.data)
             x = make_empty(in->shape, in->dtype());
@@ -445,7 +455,16 @@ void GetitemOp::grads(Var** dout, VarPtr* dins) {
 }
 
 void GetitemOp::jit_prepare(JK& jk) {
-    auto in = inputs().front();
+    // x is a cached member (see getitem_op.h), not inputs().front(): the
+    // generic executor may reset this op's _inputs edge list once it
+    // considers the op "finished" even though the op can legitimately be
+    // asked to jit_prepare again later (e.g. its output is shared with a
+    // later, separate sync that still needs this op's jit key). Fail loud
+    // rather than let a future regression silently reintroduce the old
+    // inputs().front()-on-empty-list segfault (#P0, 2026-09-05-core-gaps.md
+    // sec 3.1).
+    ASSERT(x) << "GetitemOp::jit_prepare: primary input is null, this=" << (void*)this;
+    auto in = x;
     int idim = i_to_vs.size();
     jk << "«Ti:" << in->dtype();
     jk << "«IDIM=" << JK::hex1(i_to_vs.size());
@@ -510,7 +529,7 @@ void GetitemOp::jit_prepare(JK& jk) {
 #pragma GCC diagnostic ignored "-Wunused-variable"
 
 void GetitemOp::jit_run() {
-    auto in = inputs().front();
+    auto in = x;
     auto out = outputs().front();
     if (out->num == 0) return;
     if (ns.get(GetitemOp::_inplace) &&

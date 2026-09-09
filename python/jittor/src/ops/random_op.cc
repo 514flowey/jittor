@@ -15,19 +15,19 @@
 namespace jittor {
 
 #ifndef JIT
-RandomOp::RandomOp(NanoVector shape, NanoString dtype, NanoString type) {
+RandomOp::RandomOp(NanoVector shape, NanoString dtype, NanoString type, RandomGenerator* generator) {
     // auto curand_random = get_op_info("curand_random")
     // .get_constructor<NanoVector, NanoString>();
     // output = curand_random(shape, dtype);
     #ifdef HAS_CUDA
     if (use_cuda) {
-        static VarPtr(*curand_random)(NanoVector, NanoString, NanoString) = nullptr;
+        static VarPtr(*curand_random)(NanoVector, NanoString, NanoString, RandomGenerator*) = nullptr;
         if (!curand_random && has_op("curand_random")) {
             curand_random = get_op_info("curand_random")
-                .get_constructor<VarPtr, NanoVector, NanoString, NanoString>();
+                .get_constructor<VarPtr, NanoVector, NanoString, NanoString, RandomGenerator*>();
         }
         if (curand_random) {
-            auto var = curand_random(shape, dtype, type);
+            auto var = curand_random(shape, dtype, type, generator);
             forward(var);
             return;
         }
@@ -35,6 +35,7 @@ RandomOp::RandomOp(NanoVector shape, NanoString dtype, NanoString type) {
     #endif
     output = create_output(shape, dtype);
     this->type = type;
+    if (generator) this->gen = generator->state;
     ASSERT(type == ns_normal || type == ns_uniform);
 }
 
@@ -46,7 +47,7 @@ void RandomOp::jit_prepare(JK& jk) {
 #else // JIT
 #ifdef JIT_cpu
 void RandomOp::jit_run() {
-    auto* generator = get_random_engine();
+    auto* generator = gen ? &gen->cpu_engine : get_random_engine();
     @if(@strcmp(@R,uniform)==0,
         std::uniform_real_distribution<T> distribution(0.0,1.0);,
         std::normal_distribution<T> distribution(0.0,1.0);

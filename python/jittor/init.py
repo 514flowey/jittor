@@ -263,7 +263,7 @@ def uniform_(var, low=0, high=1):
     return var.assign(uniform(var.shape, var.dtype, low, high))
 Var.uniform_ = uniform_
 
-def gauss(shape, dtype="float32", mean=0.0, std=1.0):
+def gauss(shape, dtype="float32", mean=0.0, std=1.0, generator=None):
     ''' Return Jittor Var initialize by random gauss.
 
     Args:
@@ -284,9 +284,9 @@ def gauss(shape, dtype="float32", mean=0.0, std=1.0):
         print(a)
 
     '''
-    return jt.random(NanoVector(shape), dtype, "normal") * std + mean
+    return jt.random(NanoVector(shape), dtype, "normal", generator) * std + mean
 
-def gauss_(var, mean=0.0, std=1.0):
+def gauss_(var, mean=0.0, std=1.0, generator=None):
     ''' Inplace initialize Jittor Var by random gauss.
 
     Args:
@@ -307,7 +307,7 @@ def gauss_(var, mean=0.0, std=1.0):
         linear.weight.gauss_(0.0, 1.0) # This is ok too
 
     '''
-    return var.assign(gauss(var.shape, var.dtype, mean, std))
+    return var.assign(gauss(var.shape, var.dtype, mean, std, generator))
 Var.gauss_ = gauss_
 Var.normal_ = gauss_
 

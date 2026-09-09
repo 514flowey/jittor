@@ -647,7 +647,7 @@ def array(data, dtype=None, device=None):
                     return ret.float16()
     return ret
 
-def random(shape, dtype="float32", type="uniform"):
+def random(shape, dtype="float32", type="uniform", generator=None):
     ''' Constructs a random jittor Var.
 
     :param shape: The shape of the random Var.
@@ -656,6 +656,12 @@ def random(shape, dtype="float32", type="uniform"):
     :type dtype: str, jittor type-cast function, or None.
     :param type: The random distribution, can be 'uniform' or 'normal'.
     :type type: str
+    :param generator: an optional jt.Generator (jittor-core-gaps.md §3.6):
+        when given, draws consume (and advance) that generator's own
+        independent, device-native RNG state instead of the global one --
+        two generators seeded identically produce identical sequences, and
+        interleaved draws from different generators never share state.
+    :type generator: jt.Generator, optional
 
     ----------------
 
@@ -675,12 +681,12 @@ def random(shape, dtype="float32", type="uniform"):
         # CUDA (curandGenerateUniform/NormalDouble) kernels natively support
         # both of these -- generate the requested dtype directly instead of
         # always sampling float32 and silently discarding a float64 request.
-        ret = ops.random(shape, dtype, type)
+        ret = ops.random(shape, dtype, type, generator)
     else:
         # No native curand/CPU distribution kernel for this dtype (e.g.
         # float16/bfloat16): sample in float32 and cast, matching prior
         # behavior for these dtypes.
-        ret = ops.random(shape, "float32", type).cast(dtype)
+        ret = ops.random(shape, "float32", type, generator).cast(dtype)
     amp_reg = jt.flags.amp_reg
     if amp_reg:
         if amp_reg & 16:
@@ -713,17 +719,80 @@ Var.__dlpack__ = Var.dlpack
 Var.__dlpack_device__ = Var.dlpack_device
 to_dlpack = core.to_dlpack
 
+def _dlpack_is_contiguous(shape, strides):
+    # Mirrors dlpack.cc::dl_tensor_is_contiguous() exactly (same algorithm,
+    # same "size-1 axes don't constrain their stride" rule), since this is
+    # the read-only Python-side half of the same contiguity decision -- the
+    # C++ side re-derives it independently from the same DLTensor as a
+    # defense-in-depth check, but the *choice* of which import path to take
+    # is made here, before the capsule is consumed.
+    if strides is None:
+        return True
+    expect = 1
+    for i in range(len(shape) - 1, -1, -1):
+        if shape[i] != 1 and strides[i] != expect:
+            return False
+        expect *= shape[i]
+    return True
+
+
+def _dlpack_flat_span(shape, strides):
+    # The minimum and maximum ELEMENT offset (relative to the DLTensor's own
+    # byte_offset) reachable by any legal index into `shape` under `strides`
+    # -- i.e. the inclusive [min_off, max_off] range of flat positions a
+    # producer's strided view can touch. Handles negative strides (a
+    # reversed/flipped view) correctly, not just the common "all strides >=
+    # 0" case. Zero-length axes are excluded from both min and max: an axis
+    # with shape[i]==0 contributes no actual index (0..shape[i]-1 is empty),
+    # so its stride must not be allowed to inflate/deflate the span -- the
+    # caller special-cases a wholly empty (0 total element) tensor before
+    # this is ever called with such a shape for exactly this reason.
+    min_off = 0
+    max_off = 0
+    for s, st in zip(shape, strides):
+        if s <= 1:
+            continue
+        term = st * (s - 1)
+        if term < 0:
+            min_off += term
+        else:
+            max_off += term
+    return min_off, max_off
+
+
 def from_dlpack(obj):
-    ''' Import a tensor from another array library via the DLPack protocol,
-    zero-copy. Accepts either a raw DLPack capsule (the legacy
+    ''' Import a tensor from another array library via the DLPack protocol.
+    Accepts either a raw DLPack capsule (the legacy
     torch.utils.dlpack.from_dlpack(capsule) style) or any object
     implementing __dlpack__/__dlpack_device__ (numpy/cupy ndarrays, torch
     tensors, ...), matching numpy.from_dlpack/torch.from_dlpack's own dual
-    calling convention. The source tensor must be row-major contiguous
-    (Jittor's Var has no stride concept) and located on CPU or a CUDA
-    device; anything else raises rather than silently copying or misreading
-    the data. The returned Var is explicitly pinned to the source's physical
-    device (see Var.migrate_to_device) when that device is a GPU. '''
+    calling convention, on CPU or a CUDA device.
+
+    A row-major contiguous source is imported zero-copy, aliasing the
+    producer's own memory directly (freed via the producer's DLPack deleter
+    once this Var's storage is no longer referenced).
+
+    A non-contiguous source (jittor-core-gaps.md 2026-09-05 §3.4 -- e.g. a
+    transposed/permuted/sliced-with-a-step PyTorch tensor, which PyTorch's
+    own __dlpack__() happily exports with real, non-default strides) is
+    real, first-class supported here too: since Jittor's Var has no stride
+    concept at all (only ever row-major contiguous storage), it cannot alias
+    such a view zero-copy, but it CAN and does correctly import its values,
+    by (1) importing the minimal flat span of raw elements the given strides
+    can reach as a genuinely contiguous 1-D buffer (still zero-copy at this
+    stage -- an ordinary foreign-memory import, same as the contiguous
+    path), then (2) gathering the producer's logical (strided) shape out of
+    that flat buffer with one ordinary, already-differentiable jittor
+    advanced-index op (jt.index()-built offsets + a single getitem), which
+    performs the actual element reordering as a real device-side (CPU or
+    CUDA) op -- never a host round-trip, and never a silent misread of the
+    data. The result is a new, independently-owned contiguous Var with
+    correct values; the "zero-copy aliasing" property is the only thing not
+    preserved, because it is fundamentally impossible without giving Jittor
+    a real stride model (see the doc for why that is out of scope here).
+
+    The returned Var is explicitly pinned to the source's physical device
+    (see Var.migrate_to_device) when that device is a GPU. '''
     if hasattr(obj, "__dlpack__"):
         # Advertise support for the DLPack>=0.8 versioned capsule (the
         # "current standard" struct -- core.from_dlpack_capsule accepts
@@ -738,7 +807,53 @@ def from_dlpack(obj):
             capsule = obj.__dlpack__()
     else:
         capsule = obj
-    return core.from_dlpack_capsule(capsule)
+
+    shape, strides = core.dlpack_peek(capsule)
+    if _dlpack_is_contiguous(shape, strides):
+        return core.from_dlpack_capsule(capsule)
+
+    # Strided producer: materialize a real, correctly-valued, independently
+    # owned contiguous copy instead of rejecting the tensor -- see the
+    # docstring above for the full design rationale.
+    total = 1
+    for s in shape:
+        total *= s
+    if total == 0:
+        # An empty tensor has no bytes to read regardless of its strides
+        # (any per-axis stride*[shape-1] term would be spurious for a
+        # zero-length axis) -- import an empty flat buffer and reshape,
+        # which is well-defined between any two shapes with the same
+        # (zero) total element count.
+        return core.from_dlpack_capsule(capsule, 0, 0).reshape(shape)
+
+    min_off, max_off = _dlpack_flat_span(shape, strides)
+    flat_len = max_off - min_off + 1
+    flat = core.from_dlpack_capsule(capsule, flat_len, min_off)
+
+    idx = None
+    for d, st in enumerate(strides):
+        if st == 0:
+            continue
+        term = jt.index(shape, d, dtype="int64") * st
+        idx = term if idx is None else idx + term
+    if idx is None:
+        # Every stride is 0 -- a fully broadcast/degenerate view where every
+        # logical element aliases the same single underlying element.
+        idx = jt.zeros(shape, dtype="int64")
+    else:
+        idx = idx - min_off
+    result = flat[idx]
+    # Jittor's execution is lazy: without forcing this now, the gather above
+    # would only actually run (reading `flat`, which zero-copy aliases the
+    # producer's own memory) whenever the caller first materializes the
+    # result -- an arbitrarily later point at which the producer may already
+    # have mutated or reused that memory. That would make the "independent
+    # copy" semantics documented above a race rather than a guarantee, unlike
+    # copy=True's export path (also an immediate, eager memcpy). Sync here so
+    # the gather -- and therefore the real, owned copy -- happens NOW, before
+    # from_dlpack() returns, matching an eager copy's usual guarantee.
+    result.sync()
+    return result
 
 def grad(loss, targets, retain_graph=True):
     if type(targets) == core.Var:
@@ -1390,7 +1505,7 @@ def argmin(x, dim: int, keepdims:bool=False):
     return jt.arg_reduce(x, "min", dim, keepdims)
 Var.argmin = argmin
 
-def randn(*size, dtype="float32", requires_grad=True) -> Var:
+def randn(*size, dtype="float32", requires_grad=True, generator=None) -> Var:
     ''' samples random numbers from a standard normal distribution.
     
     :param size: shape of the output.
@@ -1414,11 +1529,11 @@ def randn(*size, dtype="float32", requires_grad=True) -> Var:
     for dim in size:
         if dim < 0:
             raise RuntimeError(f"Trying to create tensor with negative dimension {dim}: {size}")
-    arr = jt.random(size, dtype, "normal")
+    arr = jt.random(size, dtype, "normal", generator)
     if not requires_grad: return arr.stop_grad()
     return arr
 
-def rand(*size, dtype="float32", requires_grad=True) -> Var:
+def rand(*size, dtype="float32", requires_grad=True, generator=None) -> Var:
     ''' samples random numbers from a uniform distribution on the interval [0, 1).
 
     :param size: shape of the output.
@@ -1439,11 +1554,11 @@ def rand(*size, dtype="float32", requires_grad=True) -> Var:
          [0.05658621 0.04449705 0.86190987]], dtype=float32)
     '''
     if isinstance(size, tuple) and isinstance(size[0], (tuple, list, NanoVector)): size = size[0]
-    arr = jt.random(size, dtype)
+    arr = jt.random(size, dtype, generator=generator)
     if not requires_grad: return arr.stop_grad()
     return arr
 
-def rand_like(x, dtype=None) -> Var:
+def rand_like(x, dtype=None, generator=None) -> Var:
     ''' samples random values from standard uniform distribution with the same shape as x.
         
     :param x: reference variable.
@@ -1461,9 +1576,9 @@ def rand_like(x, dtype=None) -> Var:
          [0.58626485 0.35345772 0.5638483 ]], dtype=float32)
     ''' 
     if dtype is None: dtype = x.dtype
-    return jt.random(x.shape, dtype)
+    return jt.random(x.shape, dtype, generator=generator)
 
-def randn_like(x, dtype=None) -> Var:
+def randn_like(x, dtype=None, generator=None) -> Var:
     ''' samples random values from standard normal distribution with the same shape as x.
 
     :param x: reference variable.
@@ -1481,9 +1596,9 @@ def randn_like(x, dtype=None) -> Var:
          [ 1.068085   -0.34366122  0.13172573]], dtype=float32)
     ''' 
     if dtype is None: dtype = x.dtype
-    return jt.random(x.shape, dtype, "normal")
+    return jt.random(x.shape, dtype, "normal", generator)
 
-def randint(low, high=None, shape=(1,), dtype="int32") -> Var:
+def randint(low, high=None, shape=(1,), dtype="int32", generator=None) -> Var:
     ''' samples random integers from a uniform distribution on the interval [low, high).
 
     :param low: lowest intergers to be drawn from the distribution, defaults to 0.
@@ -1513,11 +1628,11 @@ def randint(low, high=None, shape=(1,), dtype="int32") -> Var:
     for dim in shape:
         if dim < 0:
             raise RuntimeError(f"Trying to create tensor with negative dimension {dim}: {shape}")
-    v = (jt.random(shape) * (high - low) + low).clamp(low, high-0.5)
+    v = (jt.random(shape, generator=generator) * (high - low) + low).clamp(low, high-0.5)
     v = jt.floor_int(v)
     return v.astype(dtype)
 
-def randint_like(x, low, high=None) -> Var:
+def randint_like(x, low, high=None, generator=None) -> Var:
     ''' samples random values from standard normal distribution with the same shape as x.
 
     :param x: reference variable.
@@ -1540,9 +1655,9 @@ def randint_like(x, low, high=None) -> Var:
                 [14. 17. 15.]], dtype=float32)
      ''' 
 
-    return randint(low, high, x.shape, x.dtype)
+    return randint(low, high, x.shape, x.dtype, generator)
 
-def normal(mean, std, size=None, dtype="float32") -> Var:
+def normal(mean, std, size=None, dtype="float32", generator=None) -> Var:
     ''' samples random values from a normal distribution.
 
     :param mean: means of the normal distributions.
@@ -1577,7 +1692,7 @@ def normal(mean, std, size=None, dtype="float32") -> Var:
         else:
             if isinstance(mean, Var): size = mean.shape
             if isinstance(std, Var): size = std.shape
-    return jt.init.gauss(size, dtype, mean, std)
+    return jt.init.gauss(size, dtype, mean, std, generator)
 
 def attrs(var):
     return {

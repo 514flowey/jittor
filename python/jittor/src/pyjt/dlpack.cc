@@ -26,10 +26,23 @@
 //    exactly once" enforcement (rename "dltensor"->"used_dltensor" on
 //    import; a capsule destructor fires the same deleter exactly once if
 //    the capsule is garbage-collected without ever being imported).
-//  - Contiguity: Jittor's Var/Allocation have no stride concept at all (only
-//    ever row-major contiguous) -- importing a DLTensor with non-null,
-//    non-contiguous strides is rejected outright rather than silently
-//    misread or silently copied.
+//  - Contiguity (jittor-core-gaps.md 2026-09-05 §3.4): Jittor's Var/
+//    Allocation have no stride concept at all (only ever row-major
+//    contiguous) -- so a non-contiguous producer (e.g. a transposed/
+//    permuted/step-sliced PyTorch tensor) can never be aliased zero-copy.
+//    It IS, however, real, first-class supported by materializing a
+//    correctly-valued contiguous copy: dlpack_peek() lets from_dlpack()'s
+//    Python wrapper read the producer's shape/strides without consuming the
+//    capsule, decide it is non-contiguous, compute the minimal flat element
+//    span the strides can reach, import THAT span as a genuinely contiguous
+//    1-D foreign buffer via from_dlpack_capsule(capsule, flat_len,
+//    elem_offset) (this function's own low-level entry point, still
+//    zero-copy at this stage), and finally gather the producer's real
+//    (strided) shape out of it with one ordinary jittor advanced-index op
+//    (device-side, CPU or CUDA, never a host round-trip). Calling
+//    from_dlpack_capsule() directly (bypassing the Python wrapper) on a
+//    non-contiguous capsule still fails loud rather than silently
+//    misreading -- only jt.from_dlpack() implements the fallback.
 //  - Versioning: both the classic (unversioned) DLManagedTensor and the
 //    DLPack>=0.8 DLManagedTensorVersioned capsule are supported, on export
 //    and import. Export only produces the versioned form when the consumer
@@ -387,7 +400,57 @@ static bool dl_tensor_is_contiguous(const DLTensor& t) {
     return true;
 }
 
-VarHolder* from_dlpack_capsule(PyObject* capsule) {
+// Shared capsule unwrap: validates the capsule is live (either flavor),
+// resolves version, and returns the DLTensor* plus the two possible managed
+// pointers (exactly one of which is non-null) -- used by both the read-only
+// peek and the real (consuming) import below, so the "which flavor, which
+// version" logic exists in exactly one place.
+static DLTensor* unwrap_capsule(PyObject* capsule, bool& versioned,
+        DLManagedTensor*& managed, DLManagedTensorVersioned*& managed_v) {
+    versioned = PyCapsule_IsValid(capsule, "dltensor_versioned");
+    if (!versioned && !PyCapsule_IsValid(capsule, "dltensor"))
+        LOGf << "dlpack: expected a live \"dltensor\" or \"dltensor_versioned\" "
+             << "capsule (it may already have been consumed by an earlier "
+             << "from_dlpack() call -- a DLPack capsule can only be imported once)";
+    managed = nullptr;
+    managed_v = nullptr;
+    if (versioned) {
+        managed_v = (DLManagedTensorVersioned*)PyCapsule_GetPointer(capsule, "dltensor_versioned");
+        return &managed_v->dl_tensor;
+    }
+    managed = (DLManagedTensor*)PyCapsule_GetPointer(capsule, "dltensor");
+    return &managed->dl_tensor;
+}
+
+// jittor-core-gaps.md 2026-09-05 §3.4: read-only inspection used by
+// from_dlpack()'s Python wrapper to decide, *before* committing to consume
+// the capsule, whether the producer's tensor is contiguous (fast, aliasing
+// import below) or strided (Python materializes a contiguous copy honoring
+// the strides, then imports THAT via the flat_len/elem_offset path below).
+// Must never rename the capsule or touch the deleter -- a capsule can still
+// be imported normally afterwards.
+PyObject* dlpack_peek(PyObject* capsule) {
+    bool versioned; DLManagedTensor* managed; DLManagedTensorVersioned* managed_v;
+    DLTensor& t = *unwrap_capsule(capsule, versioned, managed, managed_v);
+    PyObject* shape_tuple = PyTuple_New(t.ndim);
+    for (int32_t i = 0; i < t.ndim; i++)
+        PyTuple_SET_ITEM(shape_tuple, i, PyLong_FromLongLong((long long)t.shape[i]));
+    PyObject* strides_obj;
+    if (t.strides == nullptr) {
+        strides_obj = Py_None;
+        Py_INCREF(Py_None);
+    } else {
+        strides_obj = PyTuple_New(t.ndim);
+        for (int32_t i = 0; i < t.ndim; i++)
+            PyTuple_SET_ITEM(strides_obj, i, PyLong_FromLongLong((long long)t.strides[i]));
+    }
+    PyObject* result = PyTuple_Pack(2, shape_tuple, strides_obj);
+    Py_DECREF(shape_tuple);
+    Py_DECREF(strides_obj);
+    return result;
+}
+
+VarHolder* from_dlpack_capsule(PyObject* capsule, PyObject* flat_len, int64 elem_offset) {
     // Accept either capsule flavor a producer might hand back: the classic
     // "dltensor" (still the default from NumPy/CuPy/PyTorch's own
     // __dlpack__() when the caller doesn't opt into a version) or the
@@ -395,39 +458,45 @@ VarHolder* from_dlpack_capsule(PyObject* capsule) {
     // see VarHolder::dlpack()/to_dlpack_capsule_versioned() for the export
     // side of the same pair. Only one of these two names can ever be valid
     // on a given capsule.
-    bool versioned = PyCapsule_IsValid(capsule, "dltensor_versioned");
-    if (!versioned && !PyCapsule_IsValid(capsule, "dltensor"))
-        LOGf << "dlpack: expected a live \"dltensor\" or \"dltensor_versioned\" "
-             << "capsule (it may already have been consumed by an earlier "
-             << "from_dlpack() call -- a DLPack capsule can only be imported once)";
-
-    DLManagedTensor* managed = nullptr;
-    DLManagedTensorVersioned* managed_v = nullptr;
-    DLTensor* t_ptr;
-    if (versioned) {
-        managed_v = (DLManagedTensorVersioned*)PyCapsule_GetPointer(capsule, "dltensor_versioned");
-        if (managed_v->version.major != DLPACK_MAJOR_VERSION) {
-            // Per the DLPack spec: on a major-version mismatch it is only
-            // safe to call the deleter, not to read any other field (the
-            // ABI layout itself may have changed) -- consume the capsule
-            // and fail loud rather than misreading a struct we don't
-            // understand.
-            PyCapsule_SetName(capsule, "used_dltensor_versioned");
-            if (managed_v->deleter) managed_v->deleter(managed_v);
-            LOGf << "dlpack: unsupported DLPack major version " << managed_v->version.major
-                 << " (this build understands major version " << DLPACK_MAJOR_VERSION << ")";
-        }
-        t_ptr = &managed_v->dl_tensor;
-    } else {
-        managed = (DLManagedTensor*)PyCapsule_GetPointer(capsule, "dltensor");
-        t_ptr = &managed->dl_tensor;
+    bool versioned; DLManagedTensor* managed; DLManagedTensorVersioned* managed_v;
+    DLTensor& t = *unwrap_capsule(capsule, versioned, managed, managed_v);
+    if (versioned && managed_v->version.major != DLPACK_MAJOR_VERSION) {
+        // Per the DLPack spec: on a major-version mismatch it is only
+        // safe to call the deleter, not to read any other field (the
+        // ABI layout itself may have changed) -- consume the capsule
+        // and fail loud rather than misreading a struct we don't
+        // understand.
+        PyCapsule_SetName(capsule, "used_dltensor_versioned");
+        if (managed_v->deleter) managed_v->deleter(managed_v);
+        LOGf << "dlpack: unsupported DLPack major version " << managed_v->version.major
+             << " (this build understands major version " << DLPACK_MAJOR_VERSION << ")";
     }
-    DLTensor& t = *t_ptr;
 
-    if (!dl_tensor_is_contiguous(t))
-        LOGf << "dlpack: importing a non-contiguous (strided) tensor is not "
-             << "supported -- Jittor's Var has no stride concept, only "
-             << "row-major contiguous storage";
+    // jittor-core-gaps.md 2026-09-05 §3.4: `flat_len` (a Python int) is set
+    // only by from_dlpack()'s own strided-import fallback, which has already
+    // decided (via dlpack_peek()) that the producer's tensor is
+    // non-contiguous, computed the flattened element span that covers every
+    // byte the given strides can reach, and will gather the real (target)
+    // shape out of this flat buffer itself with an ordinary jittor advanced-
+    // index op afterwards. Importing "shape=[flat_len]" here, with the
+    // *original* strides validation skipped, is safe precisely because nothing
+    // downstream of this function ever treats this Var as tensor with the
+    // producer's logical shape -- it is only ever a flat, genuinely
+    // contiguous 1-D buffer of raw elements, honoring Jittor's real
+    // contiguous-only Var invariant. `elem_offset` shifts the imported
+    // pointer to the true minimum byte reachable via the strides (which can
+    // be negative-offset from `data+byte_offset` for a reversed/negative-
+    // stride view), so index 0 of the flat buffer is well-defined.
+    bool use_flat = flat_len && flat_len != Py_None;
+    int64 flat_n = 0;
+    if (use_flat) {
+        flat_n = PyLong_AsLongLong(flat_len);
+    } else if (!dl_tensor_is_contiguous(t)) {
+        LOGf << "dlpack: importing a non-contiguous (strided) tensor directly via "
+             << "from_dlpack_capsule() is not supported -- Jittor's Var has no stride "
+             << "concept, only row-major contiguous storage. Use jt.from_dlpack(), which "
+             << "detects this and materializes a contiguous copy honoring the strides.";
+    }
     if (t.device.device_type != kDLCPU && t.device.device_type != kDLCUDA)
         LOGf << "dlpack: unsupported DLDevice.device_type=" << (int)t.device.device_type
              << " (only kDLCPU and kDLCUDA are supported)";
@@ -437,7 +506,9 @@ VarHolder* from_dlpack_capsule(PyObject* capsule) {
 #endif
     NanoString dtype = dltype_to_ns(t.dtype);
     NanoVector shape;
-    if (t.ndim > 0)
+    if (use_flat)
+        shape = NanoVector(flat_n);
+    else if (t.ndim > 0)
         shape = NanoVector::make(t.shape, t.ndim);
     else
         shape.clear();
@@ -456,7 +527,7 @@ VarHolder* from_dlpack_capsule(PyObject* capsule) {
 
     VarPtr vp(shape, dtype);
     vp->finish_pending_liveness();
-    vp->mem_ptr = (char*)t.data + t.byte_offset;
+    vp->mem_ptr = (char*)t.data + t.byte_offset + elem_offset * (int64)dtype.dsize();
 
     Allocation allocation;
     int target_device_id = -1;

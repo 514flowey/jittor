@@ -39,6 +39,27 @@ def _cn_to_native(cn):
     return jt.nn._real2_to_complex64(cn.value)
 
 
+def _reconnect(cached, live):
+    # jittor-core-gaps.md §3.3: standard "stop-gradient trick" used by every
+    # numpy_code-based op below that needs real higher-order AD (inv/det/
+    # solve). `cached` is a value already computed once during `execute()`
+    # (via jt.Function, so it is permanently stop-grad'd -- see the `_Inv`
+    # docstring for why); `live` is the SAME mathematical quantity
+    # recomputed via a live, autograd-connected recursive call (e.g.
+    # `inv(x)` called again from inside `inv`'s own `grad()`). Returns a Var
+    # whose VALUE is exactly `cached` (bit-identical -- `live - live.detach()`
+    # is a subtraction of a tensor from its own detached copy, so it is
+    # exactly zero regardless of `live`'s own numerical precision) but whose
+    # GRADIENT w.r.t. `live`'s inputs matches `live`'s. This avoids a real,
+    # observed regression: recomputing e.g. `solve(a, b)` a second time (via
+    # cupy on CUDA) can differ from the first computation at the ~1e-7
+    # relative level -- using `cached` for the value while `live` supplies
+    # only the (still exact, since it's a real op graph) gradient path keeps
+    # first-order precision identical to before this fix while still making
+    # second/third-order derivatives available.
+    return cached + (live - live.detach())
+
+
 def complex_inv(x:ComplexNumber):
     r"""
     calculate the inverse of x.
@@ -800,26 +821,37 @@ def inv(x):
         t_a = np.linalg.inv(a)
         np.copyto(m_a, t_a)
 
-    def backward_code(np, data):
-        def T(x):
-            return np.swapaxes(x, -1, -2)
-        _dot = partial(np.einsum, '...ij,...jk->...ik')
-        dout = data["dout"]
-        out = data["outputs"][0]
-        lmx = data["f_outputs"]
-        mx = lmx[0]
-        t = -_dot(_dot(T(mx), dout), T(mx))
-        np.copyto(out, t)
+    class _Inv(jt.Function):
+        # jittor-core-gaps.md §3.3: a numpy_code op's analytic backward used to
+        # be built as an opaque *second* numpy_code call with no backward of
+        # its own (NumpyCodeOp::grad's NumpyResult-only constructor leaves
+        # `backward` empty), so a second derivative through `inv` raised
+        # instead of computing a real answer (see
+        # test_numpy_code_op.py::test_second_order_grad_fails_loud). Real
+        # higher-order AD instead: express the backward *formula* with
+        # ordinary differentiable jittor ops (matmul/transpose) and recompute
+        # `inv(x)` via a live, non-taped recursive call to this same function.
+        # `jt.Function` tapes and stop-grads its own `execute()` inputs/
+        # outputs (so a value cached as `self.something` is permanently
+        # detached from x's autograd graph) -- but a value computed by
+        # calling `inv(x)` again, closing over the *outer*, still-live `x`,
+        # is not, so it reconnects the backward expression to x's real graph.
+        # `jt.grad(jt.grad(loss, x), x)` then differentiates straight through
+        # it like any composed op, verified to 2nd/3rd order against finite
+        # differences (test_numpy_code_op.py::test_inv_gradgradcheck). The
+        # one-time cost is recomputing the inversion during backward (the
+        # cached forward value can't be reused for this) -- the standard
+        # trade-off for a recompute-based higher-order-differentiable op.
+        def execute(self, xt):
+            self.mx = jt.numpy_code([xt.shape], [xt.dtype], [xt], forward_code)[0]
+            return self.mx
 
-    lmx = jt.numpy_code(
-        [x.shape],
-        [x.dtype],
-        [x],
-        forward_code,
-        [backward_code],
-    )
-    mx = lmx[0]
-    return mx
+        def grad(self, dout):
+            mx = _reconnect(self.mx, inv(x))
+            mxT = mx.transpose(-1, -2)
+            return -jt.matmul(jt.matmul(mxT, dout), mxT)
+
+    return _Inv()(x)
 
 
 def inv_ex(x, *, check_errors=False, out=None):
@@ -1228,32 +1260,33 @@ def det(x):
         tL = np.linalg.det(a)
         np.copyto(L, tL)
 
-    def backward_code(np, data):
-        def T(x):
-            return np.swapaxes(x, -1, -2)
-        _dot = partial(np.einsum, '...ij,...jk->...ik')
-        dout = data["dout"]
-        out = data["outputs"][0]
-        f_out = data["f_outputs"][0]
-        inp = data["inputs"][0]
-        n_d = np.reshape(dout, np.shape(dout) + (1, 1))
-        n_o = np.reshape(f_out, np.shape(f_out) + (1, 1))
-        s = n_d * n_o * T(np.linalg.inv(inp))
-        np.copyto(out, s)
-
     s = x.shape
     x_s = s[:-2]
     if len(s) == 2:
         x_s.append(1)
-    l_det = jt.numpy_code(
-        [x_s],
-        [x.dtype],
-        [x],
-        forward_code,
-        [backward_code],
-    )
-    det = l_det[0]
-    return det
+
+    class _Det(jt.Function):
+        # jittor-core-gaps.md §3.3: see `inv`/`_Inv` above for the general
+        # real-higher-order-AD pattern (live recursive call instead of an
+        # opaque numpy_code backward-of-backward). `d(det)/dx = dout * det(x)
+        # * inv(x)^T`; both `det(x)` and `inv(x)` recurse into their own
+        # (now higher-order-differentiable) public functions, closing over
+        # the live `x`, so this composes to any order.
+        def execute(self, xt):
+            self.d = jt.numpy_code([x_s], [xt.dtype], [xt], forward_code)[0]
+            return self.d
+
+        def grad(self, dout):
+            d = _reconnect(self.d, det(x))
+            n_d = dout.reshape(list(dout.shape) + [1, 1])
+            n_o = d.reshape(list(d.shape) + [1, 1])
+            # inv(x) was never cached during forward (det's forward never
+            # computes it) -- this recompute is not new, the original numpy
+            # backward_code called np.linalg.inv(inp) fresh every time too.
+            xinvT = inv(x).transpose(-1, -2)
+            return (n_d * n_o * xinvT).reshape(x.shape)
+
+    return _Det()(x)
 
 
 def slogdet(x):
@@ -1355,41 +1388,39 @@ def solve(a,b):
         ans = np.linalg.solve(a, b)
         np.copyto(L, ans)
 
-    def backward_code1(np, data):
-        # T is the conjugate transpose (Hermitian transpose); for real dtypes
-        # np.conj is a no-op so this also covers the real case.
-        def T(x):
-            return np.conj(np.swapaxes(x, -1, -2))
-        _dot = partial(np.einsum, '...ij,...jk->...ik')
-        dout = data["dout"]
-        out = data["outputs"][0]
-        f_out = data["f_outputs"][0]
-        inp = data["inputs"][0]
-        updim = lambda x: x if x.ndim == a.ndim else x[..., None]
-        t = -_dot(updim(np.linalg.solve(T(inp), dout)), T(updim(f_out)))
-        np.copyto(out, t)
+    def _T(v):
+        # conjugate (Hermitian) transpose; .conj() is a no-op for real
+        # dtypes, so this also covers the real case unchanged, matching the
+        # Wirtinger-conjugate convention used throughout this file.
+        return v.transpose(-1, -2).conj()
 
-    def backward_code2(np, data):
-        # gradient wrt b: solve(A,b)=A^-1 b  =>  dL/db = A^-H @ dout for the
-        # Wirtinger-conjugate convention used throughout this file (T below
-        # is the conjugate transpose; np.conj is a no-op for real dtypes, so
-        # this also covers the real case unchanged).
-        def T(x):
-            return np.conj(np.swapaxes(x, -1, -2))
-        dout = data["dout"]
-        out = data["outputs"][0]
-        a = data["inputs"][0]
-        np.copyto(out, np.linalg.solve(T(a), dout))
+    class _Solve(jt.Function):
+        # jittor-core-gaps.md §3.3: see `inv`/`_Inv` above for the general
+        # real-higher-order-AD pattern. dL/db = A^-H @ dout = solve(A^H,
+        # dout); dL/dA = -db @ x^H (x = solve(A,b)), with a vector rhs
+        # promoted to a column vector for the outer product and squeezed
+        # back for the return shape, matching the original numpy backward's
+        # `updim` handling. Both `solve(...)` recursive calls close over the
+        # live `a`/`b`, so this composes to any order.
+        def execute(self, at, bt):
+            self.x = jt.numpy_code([bt.shape], [bt.dtype], [at, bt], forward_code)[0]
+            return self.x
 
-    l_ans = jt.numpy_code(
-        [b.shape],
-        [b.dtype],
-        [a, b],
-        forward_code,
-        [backward_code1, backward_code2],
-    )
-    ans = l_ans[0]
-    return ans
+        def grad(self, dout):
+            aH = _T(a)
+            # db has no cached forward value to reuse (it depends on dout,
+            # only known at backward time) -- this is not a new recompute,
+            # the original numpy backward already called np.linalg.solve
+            # independently for the a- and b-gradients.
+            db = solve(aH, dout)
+            x = _reconnect(self.x, solve(a, b))
+            need_squeeze = db.ndim == a.ndim - 1
+            db_col = db.unsqueeze(-1) if need_squeeze else db
+            x_col = x.unsqueeze(-1) if need_squeeze else x
+            dA = -jt.matmul(db_col, _T(x_col))
+            return dA.reshape(a.shape), db.reshape(b.shape)
+
+    return _Solve()(a, b)
 
 
 def qr(x):
@@ -1413,7 +1444,23 @@ def qr(x):
         np.copyto(q,Q)
         np.copyto(r,R)
 
-    def backward_code(np, data):
+    m, n = x.shape[-2:]
+    k = min(m, n)
+    sq = list(x.shape[:-2]) + [m, k]
+    sr = list(x.shape[:-2]) + [k, n]
+
+    def _copyltu(X):
+        return jt.tril(X) + jt.tril(X, -1).transpose(-1, -2)
+
+    def _rinvT(X, r_):
+        # X @ r_^{-T}, expressed via solve so it stays differentiable
+        # (jittor-core-gaps.md §3.3: this is what makes the whole backward
+        # below a real, further-differentiable op graph instead of an
+        # opaque numpy_code callback -- see `inv`/`_Inv` above for the
+        # general pattern this and det/solve/qr all share).
+        return jt.linalg.solve(r_, X.transpose(-1, -2)).transpose(-1, -2)
+
+    class _QR(jt.Function):
         # Reduced-QR backward. A=QR, Q:(...,m,k), R:(...,k,n), k=min(m,n).
         #
         # Tall/square (m>=n, k=n, R square mxn->nxn): standard form (mirrors
@@ -1433,60 +1480,55 @@ def qr(x):
         # (the gR1-only part of the coupling stays inside the square formula
         # unchanged; only the R2/gR2 cross term needs folding into G). This
         # reduces to the m>=n formula exactly when n==m (R2, gR2 are empty).
-        # Verified against a numpy finite-difference oracle for real/complex,
-        # batched/unbatched, several (m,n) shapes with m<n.
-        def T(x):
-            return np.swapaxes(x, -1, -2)
-        _dot = partial(np.einsum, '...ij,...jk->...ik')
-        dout = data["dout"]
-        out = data["outputs"][0]
-        q, r = data["f_outputs"]
-        out_index = data["out_index"]
-        m = q.shape[-2]; n = r.shape[-1]
-        def copyltu(X):
-            return np.tril(X) + T(np.tril(X, -1))
-        if m >= n:
-            def rinvT(X):           # X @ R^{-T}
-                return T(np.linalg.solve(r, T(X)))
-            if out_index == 0:      # contribution from gQ (gR=0)
-                gQ = dout
-                M = -_dot(T(gQ), q)
-                np.copyto(out, rinvT(gQ + _dot(q, copyltu(M))))
-            else:                   # contribution from gR (gQ=0)
-                gR = dout
-                M = _dot(r, T(gR))
-                np.copyto(out, rinvT(_dot(q, copyltu(M))))
-        else:
-            r1 = r[..., :, :m]
-            r2 = r[..., :, m:]
-            def rinvT1(X):          # X @ R1^{-T}
-                return T(np.linalg.solve(r1, T(X)))
-            if out_index == 0:      # contribution from gQ (gR1=gR2=0)
-                gQ = dout
-                M = -_dot(T(gQ), q)
-                a1 = rinvT1(gQ + _dot(q, copyltu(M)))
-                a2 = np.zeros_like(r2)
-            else:                   # contribution from gR (gQ=0)
-                gR = dout
-                gR1 = gR[..., :, :m]
-                gR2 = gR[..., :, m:]
-                G = -_dot(_dot(q, gR2), T(r2))
-                M = _dot(r1, T(gR1)) - _dot(T(G), q)
-                a1 = rinvT1(G + _dot(q, copyltu(M)))
-                a2 = _dot(q, gR2)
-            np.copyto(out, np.concatenate([a1, a2], axis=-1))
+        # Verified against a numpy finite-difference oracle for real,
+        # batched/unbatched, several (m,n) shapes with m<n (native complex
+        # takes the separate `complex_qr` bridge above, untouched here).
+        #
+        # jittor-core-gaps.md §3.3: unlike the original numpy_code
+        # `backward_code` (which built a SEPARATE opaque, non-further-
+        # differentiable op per output, dispatched on `out_index`), a
+        # `jt.Function`'s `grad()` receives BOTH outputs' cotangents (gq,
+        # gr) at once, either of which may be None if that output wasn't
+        # used downstream -- so the two `out_index` branches below collapse
+        # into ONE combined formula by linearity of the QR vjp (gQ-only and
+        # gR-only are just the special cases gr=0 / gq=0). Expressed with
+        # ordinary differentiable jittor ops (solve/matmul/transpose/tril)
+        # and a live recursive call to `qr(x)`, so `jt.grad(jt.grad(loss,
+        # x), x)` differentiates straight through it -- see `inv`/`_Inv`'s
+        # docstring above for why the live recursive call (rather than the
+        # taped/stop-grad'd `self.q`/`self.r`) is what makes this work.
+        def execute(self, xt):
+            self.q, self.r = jt.numpy_code([sq, sr], [xt.dtype, xt.dtype], [xt], forward_code)
+            return self.q, self.r
 
-    m, n = x.shape[-2:]
-    k = min(m, n)
-    sq = list(x.shape[:-2]) + [m, k]
-    sr = list(x.shape[:-2]) + [k, n]
-    q, r = jt.numpy_code(
-        [sq, sr],
-        [x.dtype, x.dtype],
-        [x],
-        forward_code,
-        [backward_code],
-    )
+        def grad(self, gq, gr):
+            q_live, r_live = qr(x)
+            q = _reconnect(self.q, q_live)
+            r = _reconnect(self.r, r_live)
+            if gq is None:
+                gq = jt.zeros_like(q)
+            if gr is None:
+                gr = jt.zeros_like(r)
+            if m >= n:
+                M = jt.matmul(r, gr.transpose(-1, -2)) - jt.matmul(gq.transpose(-1, -2), q)
+                dA = _rinvT(gq + jt.matmul(q, _copyltu(M)), r)
+            else:
+                r1 = r[..., :, :m]
+                r2 = r[..., :, m:]
+                gr1 = gr[..., :, :m]
+                gr2 = gr[..., :, m:]
+                G = gq - jt.matmul(jt.matmul(q, gr2), r2.transpose(-1, -2))
+                M = jt.matmul(r1, gr1.transpose(-1, -2)) - jt.matmul(G.transpose(-1, -2), q)
+                a1 = _rinvT(G + jt.matmul(q, _copyltu(M)), r1)
+                a2 = jt.matmul(q, gr2)
+                dA = jt.concat([a1, a2], dim=-1)
+            return dA.reshape(x.shape)
+
+    # jt.Function returns a plain list (not a tuple) for a multi-output
+    # execute(); convert back to a tuple to preserve qr()'s established
+    # (q, r) return contract (e.g. `isinstance(..., tuple)` checks and
+    # code doing `q, r = qr(x)` both keep working identically).
+    q, r = _QR()(x)
     return q, r
 
 

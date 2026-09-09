@@ -70,6 +70,43 @@ class _Mixin:
         with self.assertRaises(RuntimeError):
             jt.lexsort([])
 
+    # jittor-core-gaps.md 2026-09-05 §3.9: N-D keys with an `axis` argument,
+    # matching numpy.lexsort(keys, axis=...) -- every index along the
+    # non-`axis` axes is an independent lexsort, computed as one batched
+    # device op (no Python loop over the batch).
+    def _check_axis(self, keys_np, axis):
+        keys = [jt.array(k) for k in keys_np]
+        got = jt.lexsort(keys, axis=axis).numpy()
+        ref = np.lexsort(keys_np, axis=axis)
+        np.testing.assert_array_equal(got, ref)
+
+    def test_2d_axis_last(self):
+        rng = np.random.RandomState(3)
+        a = rng.randint(0, 4, (5, 20)).astype("int32")
+        b = rng.randint(0, 4, (5, 20)).astype("int32")
+        self._check_axis([b, a], axis=-1)
+        self._check_axis([b, a], axis=1)
+
+    def test_2d_axis_zero(self):
+        rng = np.random.RandomState(4)
+        a = rng.randint(0, 4, (20, 5)).astype("int32")
+        b = rng.randint(0, 4, (20, 5)).astype("int32")
+        self._check_axis([b, a], axis=0)
+
+    def test_3d_axis_middle(self):
+        rng = np.random.RandomState(5)
+        a = rng.randint(0, 3, (3, 8, 4)).astype("int32")
+        b = rng.randint(0, 3, (3, 8, 4)).astype("int32")
+        self._check_axis([b, a], axis=1)
+
+    def test_nd_axis_out_of_range_raises(self):
+        with self.assertRaises(RuntimeError):
+            jt.lexsort([jt.array(np.zeros((3, 4), dtype="int32"))], axis=5)
+
+    def test_nd_empty_row(self):
+        keys_np = [np.zeros((3, 0), dtype="int32")]
+        self._check_axis(keys_np, axis=-1)
+
 
 class TestLexsortCPU(_Mixin, unittest.TestCase):
     use_cuda = 0

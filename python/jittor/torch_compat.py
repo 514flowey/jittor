@@ -14,6 +14,26 @@ from collections.abc import Mapping
 import numbers
 import numpy as np
 
+# jittor-core-gaps.md §3.6: the real, independent-state RNG generator class
+# (misc/random_generator.h, exposed as jt.Generator via `from jittor_core
+# import *` in __init__.py) -- captured here, at torch_compat's own
+# module-import time, BEFORE _install_impl() below overwrites jt.Generator
+# with the torch-facing wrapper that uses it. Capturing at module scope
+# (rather than inside _install_impl) keeps this correct even if
+# _install_impl() runs more than once.
+_NativeGenerator = jt.Generator
+
+def _unwrap_gen(gen):
+    """Unwrap a torch_compat Generator (thin wrapper) down to the native
+    jt.Generator its ops actually expect. Module-level (not nested inside
+    _install_random_and_linspace) so every generator-accepting shim defined
+    anywhere in this file -- Var.normal_/uniform_, init.normal_/uniform_/
+    trunc_normal_, the torch.randn/rand/... wrappers -- can share it."""
+    if gen is None:
+        return None
+    native = getattr(gen, "_native", None)
+    return native if native is not None else gen
+
 
 class dtype(str):
     """A torch-like dtype that IS the jittor dtype string.
@@ -1473,25 +1493,48 @@ def _install_impl(torch):
         return jt.array(_npc.ascontiguousarray(r))
     g.corrcoef = corrcoef
 
-    # torch.Generator (RNG handle) -- jittor uses a global seed; provide a
-    # lightweight stand-in that supports manual_seed and is accepted where a
-    # generator is passed (it is otherwise ignored).
+    # torch.Generator (RNG handle) -- jittor-core-gaps.md §3.6: wraps the
+    # real native jt.Generator (misc/random_generator.h), which holds its
+    # own independent, device-native RNG state (CPU: std::default_random_
+    # engine; CUDA: its own curandGenerator_t) -- NOT the single global seed
+    # this used to silently reseed on every draw. Two Generators with the
+    # same seed now produce the same sequence, and interleaved draws from
+    # different generators never share state, matching torch.Generator's
+    # actual contract instead of only its call signature.
     class Generator:
         def __init__(self, device=None):
             self.device = globals()["device"](device or "cpu")
-            self._seed = 0
+            devstr = "cuda" if str(self.device.type) == "cuda" else "cpu"
+            self._native = _NativeGenerator(devstr)
         def manual_seed(self, s):
-            self._seed = int(s)
-            return self
-        def get_state(self):
-            return jt.array([self._seed])
-        def set_state(self, s):
+            self._native.manual_seed(int(s))
             return self
         def seed(self):
-            return self._seed
+            return self._native.seed()
         def initial_seed(self):
-            return self._seed
+            return self._native.initial_seed()
+        def get_state(self):
+            # native get_state() is a plain-ASCII decimal string (seed,
+            # device, offset, engine state -- see random_generator.cc); torch
+            # returns a ByteTensor, so expose it the same way instead of as
+            # a raw Python str some torch code wouldn't expect.
+            s = self._native.get_state()
+            b = np.frombuffer(s.encode("ascii"), dtype=np.uint8).copy()
+            return jt.array(b)
+        def set_state(self, state):
+            arr = state.numpy() if hasattr(state, "numpy") else np.asarray(state)
+            s = bytes(arr.astype(np.uint8).tobytes()).decode("ascii")
+            self._native.set_state(s)
+            return self
     g.Generator = Generator
+    # default_generator: torch exposes a process-wide implicit generator
+    # (torch.default_generator) that manual_seed(...) at module level also
+    # reseeds; jittor's own global RNG (jt.set_global_seed) already plays
+    # that role for draws made with no explicit generator=, so this is a
+    # thin, real Generator instance provided for API completeness/identity
+    # checks (`g is torch.default_generator`), not a second independent seed
+    # path -- it is not wired into ops.random's no-generator branch.
+    g.default_generator = Generator()
 
     # numeric / misc top-level constants and small types
     import math as _math
@@ -4281,36 +4324,23 @@ def _install_random_and_linspace(g):
             return r
         g.linspace = linspace
 
-    # torch.randn/rand/randint(..., generator=) -- jittor samplers seed off the
-    # global RNG and reject `generator`. When a Generator is given, seed the
-    # global RNG from it (initial_seed()/seed) so the draw is reproducible,
-    # then restore nothing (matches torch users who pass a seeded generator for
-    # determinism). Without a generator, behavior is unchanged.
-    def _seed_from(gen):
-        if gen is None:
-            return
-        s = None
-        for attr in ("initial_seed", "seed"):
-            fn = getattr(gen, attr, None)
-            if callable(fn):
-                try:
-                    s = fn()
-                    break
-                except Exception:
-                    s = None
-        if s is None:
-            s = getattr(gen, "_seed", None)
-        if s is not None and hasattr(jt, "set_global_seed"):
-            jt.set_global_seed(int(s))
-
+    # torch.randn/rand/randint(..., generator=) -- jittor-core-gaps.md §3.6:
+    # jt.randn/rand/randint/randperm/normal/randn_like/rand_like/multinomial/
+    # bernoulli now all accept a real generator= (see __init__.py/misc.py),
+    # which consumes and advances THAT generator's own independent RNG state
+    # instead of the global one -- so this just needs to unwrap a
+    # torch_compat Generator (a thin wrapper, see above) down to the native
+    # jt.Generator its ops actually expect, no more reseeding the global RNG
+    # as a side effect of a draw (which broke independence/interleaving for
+    # any two generators, and silently perturbed the global stream for every
+    # OTHER caller not passing a generator at all).
     def wrap_gen(name):
         orig = getattr(g, name, None)
         if orig is None:
             return
         @functools.wraps(orig)
         def wrapped(*args, generator=None, **kwargs):
-            _seed_from(generator)
-            return orig(*args, **kwargs)
+            return orig(*args, generator=_unwrap_gen(generator), **kwargs)
         setattr(g, name, wrapped)
 
     for name in ("randn", "rand", "randint", "randperm", "normal",
@@ -5900,10 +5930,10 @@ def _install_init_aliases():
         return not isinstance(t, _jt2.Var)
     def normal_(tensor, mean=0.0, std=1.0, generator=None):
         if _not_var(tensor): return tensor
-        return _assign(tensor, _jt2.normal(float(mean), float(std), tensor.shape).cast(str(tensor.dtype)))
+        return _assign(tensor, _jt2.normal(float(mean), float(std), tensor.shape, generator=_unwrap_gen(generator)).cast(str(tensor.dtype)))
     def uniform_(tensor, a=0.0, b=1.0, generator=None):
         if _not_var(tensor): return tensor
-        return _assign(tensor, (_jt2.rand(tensor.shape) * (b - a) + a).cast(str(tensor.dtype)))
+        return _assign(tensor, (_jt2.rand(tensor.shape, generator=_unwrap_gen(generator)) * (b - a) + a).cast(str(tensor.dtype)))
     def zeros_(tensor):
         if _not_var(tensor): return tensor
         return _assign(tensor, _jt2.zeros(tensor.shape, tensor.dtype))
@@ -5915,11 +5945,11 @@ def _install_init_aliases():
         return _assign(tensor, _jt2.ones(tensor.shape, tensor.dtype) * val)
     def trunc_normal_(tensor, mean=0.0, std=1.0, a=-2.0, b=2.0, generator=None):
         if _not_var(tensor): return tensor
-        import numpy as _np
-        # simple clamp of a normal sample (no scipy dependency)
-        x = _np.random.normal(mean, std, tensor.shape).astype("float32")
-        x = _np.clip(x, mean + a * std, mean + b * std)
-        return _assign(tensor, _jt2.array(x).cast(str(tensor.dtype)))
+        # simple clamp of a normal sample (no scipy dependency); routed through
+        # jt.normal (rather than numpy) so `generator=` is actually honored.
+        x = _jt2.normal(float(mean), float(std), tensor.shape, generator=_unwrap_gen(generator))
+        x = x.clamp(mean + a * std, mean + b * std)
+        return _assign(tensor, x.cast(str(tensor.dtype)))
     # override with the tolerant versions (also covers jittor's own names)
     for name, fn in [("normal_", normal_), ("uniform_", uniform_),
                      ("zeros_", zeros_), ("ones_", ones_), ("constant_", constant_),
@@ -7344,8 +7374,8 @@ def _install_tensor_methods(g, Var, _DTYPE_OBJS=None):
         g.argwhere = lambda input: _nonzero(input, as_tuple=False)
     if not hasattr(Var, "argwhere"):
         Var.argwhere = lambda self: _nonzero(self, as_tuple=False)
-    Var.normal_ = lambda self, mean=0.0, std=1.0, generator=None: _ip(self, jt.normal(float(mean), float(std), self.shape).cast(str(self.dtype)))
-    Var.uniform_ = lambda self, a=0.0, b=1.0, generator=None: _ip(self, (jt.rand(self.shape)*(b-a)+a).cast(str(self.dtype)))
+    Var.normal_ = lambda self, mean=0.0, std=1.0, generator=None: _ip(self, jt.normal(float(mean), float(std), self.shape, generator=_unwrap_gen(generator)).cast(str(self.dtype)))
+    Var.uniform_ = lambda self, a=0.0, b=1.0, generator=None: _ip(self, (jt.rand(self.shape, generator=_unwrap_gen(generator))*(b-a)+a).cast(str(self.dtype)))
 
     # torch tensors are hashable by identity (they define __eq__ elementwise but
     # keep an id-based __hash__). jittor's Var defines __eq__ and so becomes

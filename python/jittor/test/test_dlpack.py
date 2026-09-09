@@ -104,12 +104,67 @@ class TestDLPack(unittest.TestCase):
         src[1] = 42.0
         np.testing.assert_allclose(y.numpy(), [1, 42, 3])
 
-    def test_non_contiguous_import_rejected(self):
+    # jittor-core-gaps.md 2026-09-05 §3.4: non-contiguous import used to be
+    # rejected outright; jt.from_dlpack() now materializes a real,
+    # correctly-valued contiguous copy instead (see its docstring for the
+    # full design -- Jittor's Var still has no stride concept, so this can
+    # never be zero-copy, but the *values* are exactly correct for any
+    # stride pattern, not just the common "transpose/basic slice" case).
+    def test_non_contiguous_import_transpose(self):
+        a = np.arange(20, dtype=np.float32).reshape(4, 5)
+        t = a.T
+        self.assertFalse(t.flags["C_CONTIGUOUS"])
+        y = jt.from_dlpack(t)
+        np.testing.assert_array_equal(y.numpy(), t)
+
+    def test_non_contiguous_import_step_slice(self):
         a = np.arange(20, dtype=np.float32).reshape(4, 5)
         sliced = a[:, ::2]
         self.assertFalse(sliced.flags["C_CONTIGUOUS"])
-        with self.assertRaises(Exception):
-            jt.from_dlpack(sliced)
+        y = jt.from_dlpack(sliced)
+        np.testing.assert_array_equal(y.numpy(), sliced)
+
+    def test_non_contiguous_import_negative_stride(self):
+        # A reversed view has a genuinely negative stride -- exercises the
+        # min/max flat-span computation's negative-offset branch, not just
+        # the common "all strides >= 0" case.
+        a = np.arange(20, dtype=np.float64).reshape(4, 5)
+        rev = a[:, ::-1]
+        self.assertLess(rev.strides[1], 0)
+        y = jt.from_dlpack(rev)
+        np.testing.assert_array_equal(y.numpy(), rev)
+
+    def test_non_contiguous_import_broadcast_stride_zero(self):
+        # A broadcast view has stride 0 along the broadcast axis -- every
+        # logical element aliases the same source element.
+        a = np.arange(4, dtype=np.float32).reshape(4, 1)
+        b = np.broadcast_to(a, (4, 6))
+        self.assertEqual(b.strides[1], 0)
+        y = jt.from_dlpack(b)
+        np.testing.assert_array_equal(y.numpy(), b)
+
+    def test_non_contiguous_import_3d_mixed_strides(self):
+        a = np.arange(60, dtype=np.float64).reshape(3, 4, 5)
+        mixed = a[:, ::2, ::-1]  # one plain axis, one step, one reversed
+        y = jt.from_dlpack(mixed)
+        np.testing.assert_array_equal(y.numpy(), mixed)
+
+    def test_non_contiguous_import_empty(self):
+        a = np.arange(20, dtype=np.float32).reshape(4, 5)
+        empty = a[:0, ::2]
+        y = jt.from_dlpack(empty)
+        self.assertEqual(tuple(y.shape), empty.shape)
+        np.testing.assert_array_equal(y.numpy(), empty)
+
+    def test_non_contiguous_import_is_independent_copy(self):
+        # Unlike the contiguous fast path (test_cpu_zero_copy_mutation_
+        # visible_on_import), a materialized strided import cannot alias the
+        # source -- mutating the source afterwards must NOT be visible.
+        a = np.arange(20, dtype=np.float32).reshape(4, 5)
+        view = a.T
+        y = jt.from_dlpack(view)
+        a[0, 0] = 999.0
+        self.assertNotEqual(y.numpy()[0, 0], 999.0)
 
     def test_capsule_consumed_exactly_once(self):
         x = jt.array(np.array([1.0], dtype=np.float32))
@@ -216,6 +271,41 @@ class TestDLPackTorch(unittest.TestCase):
         t = torch.from_dlpack(x)
         t[0] = 42.0
         np.testing.assert_allclose(x.numpy(), [42.0, 2.0, 3.0])
+
+    # jittor-core-gaps.md 2026-09-05 §3.4: a real, non-toy producer of
+    # non-contiguous DLPack tensors -- torch's own __dlpack__() happily
+    # exports a transposed/permuted/step-sliced tensor with real, non-null
+    # strides (unlike, say, a framework that refuses to export those at
+    # all), which is exactly the "supported on the wire, unsupported on
+    # import" gap this fix closes.
+    def test_non_contiguous_torch_transpose(self):
+        jt.flags.use_cuda = 0
+        t = torch.arange(24, dtype=torch.float32).reshape(4, 6)
+        tt = t.T
+        self.assertFalse(tt.is_contiguous())
+        y = jt.from_dlpack(tt)
+        np.testing.assert_array_equal(y.numpy(), tt.numpy())
+
+    def test_non_contiguous_torch_step_slice(self):
+        jt.flags.use_cuda = 0
+        t = torch.arange(24, dtype=torch.float32).reshape(4, 6)
+        s = t[:, ::2]
+        y = jt.from_dlpack(s)
+        np.testing.assert_array_equal(y.numpy(), s.numpy())
+
+    def test_non_contiguous_torch_permute_3d(self):
+        jt.flags.use_cuda = 0
+        t = torch.arange(60, dtype=torch.float64).reshape(3, 4, 5).permute(2, 0, 1)
+        self.assertFalse(t.is_contiguous())
+        y = jt.from_dlpack(t)
+        np.testing.assert_array_equal(y.numpy(), t.numpy())
+
+    def test_non_contiguous_torch_expand_stride_zero(self):
+        jt.flags.use_cuda = 0
+        t = torch.arange(4, dtype=torch.float32).reshape(4, 1).expand(4, 6)
+        self.assertEqual(t.stride(1), 0)
+        y = jt.from_dlpack(t)
+        np.testing.assert_array_equal(y.numpy(), t.numpy())
 
     def test_torch_to_jittor_zero_copy_mutation_visible(self):
         t = torch.tensor([1.0, 2.0, 3.0])
@@ -331,6 +421,30 @@ class TestDLPackTorchCuda(unittest.TestCase):
         self.assertEqual(t.device.type, "cuda")
         t[0] = 99.0
         np.testing.assert_allclose(x.numpy(), [99.0, 2.0, 3.0])
+
+    # jittor-core-gaps.md 2026-09-05 §3.4: the strided-import fallback's
+    # device-side gather must actually run on CUDA (not silently fall back
+    # to a host round-trip) for a CUDA producer -- checked both by asserting
+    # correct values AND that the resulting Var's own location is "device".
+    def test_non_contiguous_torch_cuda_transpose(self):
+        t = torch.arange(24, dtype=torch.float32, device="cuda").reshape(4, 6)
+        tt = t.T
+        y = jt.from_dlpack(tt)
+        y.sync()
+        self.assertEqual(y.location(), "device")
+        self.assertEqual(y.device_id(), 0)
+        np.testing.assert_array_equal(y.numpy(), tt.cpu().numpy())
+
+    def test_non_contiguous_torch_cuda_permute_3d(self):
+        t = torch.arange(60, dtype=torch.float64, device="cuda").reshape(3, 4, 5).permute(2, 0, 1)
+        y = jt.from_dlpack(t)
+        np.testing.assert_array_equal(y.numpy(), t.cpu().numpy())
+
+    def test_non_contiguous_torch_cuda_step_slice(self):
+        t = torch.arange(24, dtype=torch.float32, device="cuda").reshape(4, 6)
+        s = t[:, ::2]
+        y = jt.from_dlpack(s)
+        np.testing.assert_array_equal(y.numpy(), s.cpu().numpy())
 
     def test_multi_gpu_device_id_preserved(self):
         if jt.get_device_count() < 2:

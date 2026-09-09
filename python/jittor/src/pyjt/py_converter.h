@@ -459,6 +459,30 @@ DEF_IS(VarHolder*, T) from_py_object(PyObject* obj, unique_ptr<VarHolder>& holde
     return holder.get();
 }
 
+// RandomGenerator (jittor-core-gaps.md §3.6): lets RandomOp/CurandRandomOp
+// accept a `jt.Generator` instance directly as a constructor argument, the
+// same way ops already accept Var*/VarHolder* -- mirrors the VarHolder*
+// converter immediately above (a PyHeapTypeObject-backed heaptype whose C++
+// payload sits right after the PyObject header, per GET_RAW_PTR), minus the
+// array-coercion fallback VarHolder's second overload provides (a Generator
+// argument is never optional/coercible from other Python types: either the
+// caller passed a real jt.Generator or they didn't).
+struct RandomGenerator;
+EXTERN_LIB PyHeapTypeObject PyjtRandomGenerator;
+
+DEF_IS(RandomGenerator*, bool) is_type(PyObject* obj) {
+    // None is accepted (and converts to nullptr below) so `generator=None`,
+    // the default at every Python call site, can be passed through
+    // explicitly rather than requiring the caller to omit the argument.
+    return obj == Py_None || Py_TYPE(obj) == &PyjtRandomGenerator.ht_type;
+}
+
+DEF_IS(RandomGenerator*, T) from_py_object(PyObject* obj) {
+    if (obj == Py_None) return nullptr;
+    CHECK(Py_TYPE(obj) == &PyjtRandomGenerator.ht_type);
+    return GET_RAW_PTR(RandomGenerator, obj);
+}
+
 struct DataView;
 DEF_IS(DataView, PyObject*) to_py_object(T a) {
 #if defined(__linux__) || defined(_WIN32)
