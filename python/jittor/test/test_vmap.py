@@ -3,7 +3,7 @@
 # This file is subject to the terms and conditions defined in
 # file 'LICENSE.txt', which is part of this source code package.
 # ***************************************************************
-# Tests for jt.vmap (jittor-core-gaps.md section 3.1): a real batching
+# Tests for jt.vmap (jittor-core-gaps.md section 3.5): a real batching
 # transform that builds one batched op graph, instead of the loop-based
 # fallback in torch_compat.py's vmap. Core-set scope agreed with the user:
 # elementwise unary/binary, reduce, cast, reshape/transpose/broadcast,
@@ -23,16 +23,124 @@ class TestVmap(unittest.TestCase):
         np.testing.assert_allclose(out.numpy(), np.sin(x.numpy()) * 2 + 1, atol=1e-5)
 
     def test_cast_and_astype(self):
-        x_numpy = np.arange(8, dtype=np.float32).reshape(4, 2)
-        x = jt.array(x_numpy)
+        casts = (
+            lambda value, dtype: value.cast(dtype),
+            lambda value, dtype: value.astype(dtype),
+            lambda value, dtype: jt.cast(value, dtype),
+        )
+        pairs = (
+            ("float32", "float64"),
+            ("float32", "complex64"),
+            ("float64", "complex128"),
+            ("complex64", "complex128"),
+            ("complex64", "float32"),
+            ("int32", "float32"),
+            ("bool", "float32"),
+        )
+        with jt.flag_scope(auto_convert_64_to_32=0):
+            for source, target in pairs:
+                data = (np.arange(8).reshape(4, 2) / 4 - 0.5).astype(source)
+                if "complex" in source:
+                    data += 0.25j
+                expected = (
+                    data.real
+                    if "complex" in source and "complex" not in target
+                    else data
+                )
+                expected = expected.astype(target)
+                for entry, cast in enumerate(casts):
+                    with self.subTest(source=source, target=target, entry=entry):
+                        calls = []
 
-        astype_out = jt.vmap(lambda value: value.astype("complex64"))(x)
-        cast_out = jt.vmap(lambda value: jt.cast(value, "float64"))(x)
+                        def f(value):
+                            calls.append(tuple(value.shape))
+                            return cast(value, target)
 
-        self.assertEqual(str(astype_out.dtype), "complex64")
-        self.assertEqual(str(cast_out.dtype), "float64")
-        np.testing.assert_array_equal(astype_out.numpy(), x_numpy.astype("complex64"))
-        np.testing.assert_array_equal(cast_out.numpy(), x_numpy.astype("float64"))
+                        x = jt.array(data, dtype=source)
+                        result = jt.vmap(f)(x)
+                        self.assertEqual(calls, [(2,)])
+                        self.assertEqual(str(result.dtype), target)
+                        np.testing.assert_array_equal(result.numpy(), expected)
+                        # Installing batching must not change plain Var casts.
+                        plain = cast(x, target)
+                        self.assertEqual(str(plain.dtype), target)
+                        np.testing.assert_array_equal(plain.numpy(), expected)
+
+    def test_cast_keyword_arguments_after_install(self):
+        data = np.arange(6, dtype=np.float32).reshape(2, 3)
+        x = jt.array(data)
+        jt.vmap(lambda value: value)(x).sync()
+        casts = (
+            lambda value: value.cast(op="float64"),
+            lambda value: value.astype(op="float64"),
+            lambda value: jt.cast(value, op="float64"),
+            lambda value: jt.Var.cast(value, op="float64"),
+        )
+        for entry, cast in enumerate(casts):
+            with self.subTest(entry=entry):
+                for result in (cast(x), jt.vmap(cast)(x)):
+                    self.assertEqual(str(result.dtype), "float64")
+                    np.testing.assert_array_equal(
+                        result.numpy(), data.astype("float64")
+                    )
+
+    def test_cast_nested_vmap_and_axes(self):
+        data = np.arange(24, dtype=np.float32).reshape(2, 3, 4) / 8
+        calls = []
+
+        def f(value):
+            calls.append(tuple(value.shape))
+            return value.astype("complex128")
+
+        inner = jt.vmap(f, in_dims=-1, out_dims=0)
+        result = jt.vmap(inner, in_dims=1, out_dims=-1)(jt.array(data))
+        self.assertEqual(calls, [(2,)])
+        self.assertEqual(str(result.dtype), "complex128")
+        np.testing.assert_array_equal(
+            result.numpy(), data.transpose(2, 0, 1).astype("complex128")
+        )
+
+    def test_cast_gradients_and_vjp(self):
+        # Complex-width casts above are forward-only: native UnaryOp does
+        # not yet provide their backward. Batching must retain, not extend,
+        # the native differentiability contract.
+        pairs = (
+            ("float32", "float64"),
+            ("float32", "complex64"),
+            ("float64", "complex128"),
+            ("complex64", "float32"),
+        )
+        with jt.flag_scope(auto_convert_64_to_32=0):
+            for source, target in pairs:
+                with self.subTest(source=source, target=target):
+                    data = (np.arange(6).reshape(2, 3) / 4 - 0.5).astype(source)
+                    if "complex" in source:
+                        data += 0.25j
+                    x = jt.array(data, dtype=source)
+
+                    def loss(value):
+                        converted = value.cast(target)
+                        if "complex" in target:
+                            return (converted.conj() * converted).real.sum()
+                        return (converted * converted).sum()
+
+                    expected = (2 * data.real).astype(source)
+                    gradient = jt.grad(jt.vmap(loss)(x).sum(), x)
+                    self.assertEqual(str(gradient.dtype), source)
+                    np.testing.assert_allclose(gradient.numpy(), expected, atol=1e-6)
+                    values, gradients = jt.vmap(
+                        lambda value: vjp(loss, value, create_graph=True)
+                    )(x)
+                    self.assertEqual(str(gradients.dtype), source)
+                    np.testing.assert_allclose(
+                        values.numpy(), (data.real**2).sum(-1), atol=1e-6
+                    )
+                    np.testing.assert_allclose(gradients.numpy(), expected, atol=1e-6)
+                    if "complex" not in source:
+                        second = jt.grad(gradients.sum(), x)
+                        np.testing.assert_allclose(
+                            second.numpy(), np.full_like(data, 2), atol=1e-6
+                        )
 
     def test_install_preserves_plain_transpose_calling_conventions(self):
         x_numpy = np.arange(24, dtype=np.float32).reshape(2, 3, 4)
@@ -308,6 +416,79 @@ class TestVmap(unittest.TestCase):
         np.testing.assert_allclose(out.numpy(), (U.numpy() @ x.numpy().T).T, atol=1e-5)
         out2 = jt.vmap(lambda xx: xx @ U)(x)
         np.testing.assert_allclose(out2.numpy(), x.numpy() @ U.numpy(), atol=1e-5)
+
+    # jittor-core-gaps.md 2026-09-05 §3.2: native (non-looping) vmap batching
+    # rules for the single-input factorizations qr/svd/svdvals/eigh/inv.
+    # These ops are already implemented batch-dim-agnostic (linalg.py wraps
+    # np.linalg.* via numpy_code, which treats any leading dims as batch
+    # dims), so the batching rule is a pure pass-through with no reshaping,
+    # verified here per-sample against plain (unbatched) calls -- not against
+    # a Python-loop fallback, so this actually exercises the "one real op
+    # graph" native path, not the vmap docstring's own loop-based decoy.
+    #
+    # `vmap(lambda a: jt.linalg.qr(a))`, not the bare `vmap(jt.linalg.qr)`:
+    # see the `func` parameter note on `vmap()`'s own docstring -- a bare op
+    # reference is resolved before this module's lazy first-call patching,
+    # so on this test file's very first vmap call it would capture the
+    # original, BatchedVar-oblivious op and fail with a confusing low-level
+    # jt.numpy_code overload-resolution error instead of exercising the
+    # batching rule this test is actually meant to check.
+    def test_vmap_qr_matches_per_sample(self):
+        rng = np.random.RandomState(11)
+        X = jt.array(rng.randn(4, 6, 3).astype(np.float32))
+        q, r = jt.vmap(lambda a: jt.linalg.qr(a))(X)
+        for i in range(4):
+            Q, R = jt.linalg.qr(X[i])
+            np.testing.assert_allclose(q[i].numpy(), Q.numpy(), atol=1e-4)
+            np.testing.assert_allclose(r[i].numpy(), R.numpy(), atol=1e-4)
+            np.testing.assert_allclose(q[i].numpy() @ r[i].numpy(), X[i].numpy(), atol=1e-4)
+
+    def test_vmap_eigh_matches_per_sample(self):
+        # jt.array of a float64 array is, by default, silently downcast to
+        # float32 (jt.flags.auto_convert_64_to_32) -- that's fine for most
+        # tests, but comparing "batched eigh" against "4 separate eigh
+        # calls" at float32 precision picks up ~1e-6 LAPACK-routine-order
+        # noise unrelated to the batching rule itself (see __init__.py's own
+        # `with jt.flag_scope(auto_convert_64_to_32=0)` uses for the same
+        # reason). Disable it here so this actually tests the batching rule
+        # at the float64 precision the inputs were built at.
+        with jt.flag_scope(auto_convert_64_to_32=0):
+            rng = np.random.RandomState(12)
+            A = rng.randn(4, 5, 5).astype(np.float64)
+            A = A + A.transpose(0, 2, 1)
+            X = jt.array(A)
+            w, v = jt.vmap(lambda a: jt.linalg.eigh(a))(X)
+            for i in range(4):
+                W, V = jt.linalg.eigh(X[i])
+                np.testing.assert_allclose(np.sort(w[i].numpy()), np.sort(W.numpy()), atol=1e-9)
+
+    def test_vmap_inv_matches_per_sample(self):
+        with jt.flag_scope(auto_convert_64_to_32=0):
+            rng = np.random.RandomState(13)
+            A = rng.randn(4, 5, 5).astype(np.float64) + 5 * np.eye(5)[None]
+            X = jt.array(A)
+            out = jt.vmap(lambda a: jt.linalg.inv(a))(X)
+            for i in range(4):
+                np.testing.assert_allclose(out[i].numpy(), jt.linalg.inv(X[i]).numpy(), atol=1e-9)
+
+    def test_vmap_svdvals_matches_per_sample(self):
+        with jt.flag_scope(auto_convert_64_to_32=0):
+            rng = np.random.RandomState(14)
+            X = jt.array(rng.randn(4, 5, 3).astype(np.float64))
+            out = jt.vmap(lambda a: jt.linalg.svdvals(a))(X)
+            for i in range(4):
+                np.testing.assert_allclose(out[i].numpy(), jt.linalg.svdvals(X[i]).numpy(), atol=1e-9)
+
+    def test_vmap_svd_matches_per_sample(self):
+        with jt.flag_scope(auto_convert_64_to_32=0):
+            rng = np.random.RandomState(15)
+            X = jt.array(rng.randn(4, 5, 3).astype(np.float64))
+            u, s, v = jt.vmap(lambda a: jt.linalg.svd(a))(X)
+            for i in range(4):
+                U, S, V = jt.linalg.svd(X[i])
+                np.testing.assert_allclose(s[i].numpy(), S.numpy(), atol=1e-9)
+                recon = u[i].numpy() @ np.diag(s[i].numpy()) @ v[i].numpy()
+                np.testing.assert_allclose(recon, X[i].numpy(), atol=1e-8)
 
     def test_complex64_vmap_vjp_expectation_value(self):
         # 2026-08-26-core-gaps-3.1-3.8-verification.md §6.2(b): conj/real/

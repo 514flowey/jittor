@@ -39,7 +39,7 @@ static auto make_unary = get_op_info("unary")
     .get_constructor<VarPtr, Var*, NanoString>();
 
 SetitemOp::SetitemOp(Var* x, VarSlices&& slices, Var* y, NanoString op)
-    : vs(move(slices)), op(op) {
+    : x(x), y(y), vs(move(slices)), op(op) {
     flags.set(NodeFlags::_cpu);
     flags.set(NodeFlags::_cuda);
     flags.set(NodeFlags::_has_gopt);
@@ -57,8 +57,8 @@ SetitemOp::SetitemOp(Var* x, VarSlices&& slices, Var* y, NanoString op)
 }
 
 void SetitemOp::infer_shape() {
-    auto in = inputs().front();
-    auto data = input(1);
+    auto in = this->x;
+    auto data = this->y;
     auto out = outputs().front();
     auto in_shape = in->shape;
     auto nin = in_shape.size();
@@ -167,24 +167,24 @@ VarPtr SetitemOp::grad(Var* out, Var* dout, Var* v, int v_index) {
     }
     if (op == ns_multiply) {
         if (v_index == 0) {
-            return make_setitem(dout, VarSlices(vs, true), input(1), ns_multiply);
+            return make_setitem(dout, VarSlices(vs, true), this->y, ns_multiply);
         } else {
             return make_binary(
-                make_getitem(inputs().front(), VarSlices(vs, true)),
+                make_getitem(this->x, VarSlices(vs, true)),
                 make_getitem(dout, VarSlices(vs, true)), ns_multiply);
         }
     }
     if (op == ns_divide) {
         if (v_index == 0) {
-            return make_setitem(dout, VarSlices(vs, true), input(1), ns_divide);
+            return make_setitem(dout, VarSlices(vs, true), this->y, ns_divide);
         } else {
             // dy = -dz*x / y^2
             auto dout2 = make_getitem(dout, VarSlices(vs, true));
-            auto x = make_getitem(inputs().front(), VarSlices(vs, true));
-            auto y = v;
+            auto gx = make_getitem(this->x, VarSlices(vs, true));
+            auto gy = v;
             auto ndz = make_unary(dout2, ns_negative);
-            auto ndzx = make_binary(ndz, x, ns_multiply);
-            auto y2 = make_binary(y, y, ns_multiply);
+            auto ndzx = make_binary(ndz, gx, ns_multiply);
+            auto y2 = make_binary(gy, gy, ns_multiply);
             return make_binary(ndzx, y2, ns_divide);
         }
     }
@@ -193,6 +193,9 @@ VarPtr SetitemOp::grad(Var* out, Var* dout, Var* v, int v_index) {
 }
 
 void SetitemOp::jit_prepare(JK& jk) {
+    // x/y are cached members (see setitem_op.h); see GetitemOp::jit_prepare
+    // for why this must not go through inputs().front()/input(1).
+    ASSERT(x && y) << "SetitemOp::jit_prepare: input is null, this=" << (void*)this;
     for (int i=0; i<o_shape.size(); i++)
         if (o_shape[i]<0) {
             // because output shape is inferd, check in
@@ -201,12 +204,12 @@ void SetitemOp::jit_prepare(JK& jk) {
             infer_shape();
             break;
         }
-    auto data = input(1);
+    auto data = this->y;
     jk << "«OP:" << op
         << "«Td:" << data->dtype()
         << "«BMASK=" << JK::hex(bmask);
     // TODO: merge code
-    auto in = inputs().front();
+    auto in = this->x;
     int idim = i_to_vs.size();
     jk << "«Ti:" << in->dtype();
     jk << "«IDIM=" << JK::hex1(i_to_vs.size());
@@ -275,8 +278,8 @@ void SetitemOp::compile_optimize(string& src) {
 #pragma GCC diagnostic ignored "-Wunused-variable"
 
 void SetitemOp::jit_run() {
-    auto in = inputs().front();
-    auto data = input(1);
+    auto in = x;
+    auto data = y;
     auto out = outputs().front();
     if (out->num == 0) return;
 

@@ -17,10 +17,11 @@
 namespace jittor {
 
 #ifndef JIT
-CurandRandomOp::CurandRandomOp(NanoVector shape, NanoString dtype, NanoString type) {
+CurandRandomOp::CurandRandomOp(NanoVector shape, NanoString dtype, NanoString type, RandomGenerator* generator) {
     flags.set(NodeFlags::_cuda, 1);
     output = create_output(shape, dtype);
     this->type = type;
+    if (generator) this->rand_gen = generator->state;
     ASSERT(type == ns_normal || type == ns_uniform);
 }
 
@@ -43,10 +44,26 @@ void CurandRandomOp::jit_run() {
     // because allocator will make odd chunks, so this wouldn't cause
     // segmentation fault
     num += num&1;
+    // jittor-core-gaps.md §3.6: draw from this op's own generator (an
+    // INDEPENDENT curandGenerator_t, lazily created/positioned via
+    // RandomGeneratorState::get_cuda_generator()) when one was passed in,
+    // instead of the single global `gen` every other draw shares.
+    curandGenerator_t local_gen = rand_gen ?
+        (curandGenerator_t)rand_gen->get_cuda_generator() : gen;
     @if(@strcmp(@R,uniform)==0,
-        checkCudaErrors(curandGenerateUniform@TT (gen, x, num));,
-        checkCudaErrors(curandGenerateNormal@TT (gen, x, num, 0, 1));
+        checkCudaErrors(curandGenerateUniform@TT (local_gen, x, num));,
+        checkCudaErrors(curandGenerateNormal@TT (local_gen, x, num, 0, 1));
     )
+    // curandSetGeneratorOffset() counts in the generator's raw stream units,
+    // not output values: curandGenerateUniform consumes 1 raw unit per
+    // output, but curandGenerateNormal's Box-Muller step consumes 2 output
+    // values per raw unit (confirmed empirically against the CUDA sample
+    // generator: continuing a stream naturally after N normal outputs lines
+    // up with curandSetGeneratorOffset(gen, N/2), not N). `num` is already
+    // padded to even above, so this divides exactly. Track the *raw* offset
+    // here so a later set_state()'s curandSetGeneratorOffset() lands on
+    // exactly the position the next draw would have reached naturally.
+    if (rand_gen) rand_gen->advance_cuda_offset(num / @if(@strcmp(@R,uniform)==0,1,2));
 }
 #endif // JIT_cpu
 #endif // JIT

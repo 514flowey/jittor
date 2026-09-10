@@ -156,24 +156,36 @@ def sort(input, dim=-1, descending=False, stable=False):
     return value, index
 jt.Var.sort = sort
 
-def lexsort(keys):
-    ''' Perform an indirect stable sort using a sequence of 1-D keys,
+def lexsort(keys, axis=-1):
+    ''' Perform an indirect stable sort using a sequence of keys,
     device-resident and matching ``numpy.lexsort`` (jittor-core-gaps.md
-    §3.8): the last key in `keys` is the primary sort key, the second-to-last
-    is used to break ties in the primary key, and so on.
+    2026-09-05 §3.9): the last key in `keys` is the primary sort key, the
+    second-to-last is used to break ties in the primary key, and so on.
 
-    Composed from repeated calls to the now-stable ``jt.argsort`` (least
+    Composed from repeated calls to the stable ``jt.argsort`` (least
     significant key first): each pass is a stable sort of one key against
     the order fixed by all previously-applied (less significant) keys, which
     is the standard multi-key stable-sort algorithm and requires no
     ``.numpy()``/host synchronization -- the whole computation, including
     the intermediate gathers, stays on the input's device.
 
-    :param keys: a sequence of 1-D vars of the same length (the array with
-        the fewest calls being `keys[-1]`, the primary key). A single var is
-        also accepted as a one-key sequence.
-    :return: an int32 index var `idx` such that `[k[idx] for k in keys]` is
-        lexicographically sorted ascending.
+    Unlike the earlier 1-D-only version, `keys` may be N-D: matching
+    ``numpy.lexsort``'s own `axis` generalization, each key is sorted along
+    `axis` independently for every index along the other axes (so e.g. a
+    (B, N) key with the default `axis=-1` performs B independent length-N
+    lexsorts, one per row, in a single batched device op -- no Python loop
+    over the batch).
+
+    :param keys: a sequence of vars of the same shape (the array with the
+        fewest ties being `keys[-1]`, the primary key). A single var is also
+        accepted as a one-key sequence.
+    :param axis: the axis of each key to sort along; every other axis is
+        treated as an independent batch of lexsorts, matching
+        ``numpy.lexsort(keys, axis=...)``.
+    :return: an int32 index var `idx` of the same shape as the keys such
+        that, for every fixed index along the non-`axis` axes, gathering
+        each key with `idx` along `axis` gives that row lexicographically
+        sorted ascending.
 
     Example::
 
@@ -188,22 +200,42 @@ def lexsort(keys):
         keys = list(keys)
     if len(keys) == 0:
         raise RuntimeError("lexsort requires at least one key")
-    n = keys[0].shape[0]
+    shape = tuple(keys[0].shape)
+    ndim = len(shape)
+    ax = axis if axis >= 0 else axis + ndim
+    if not (0 <= ax < max(ndim, 1)):
+        raise RuntimeError(f"lexsort: axis {axis} out of range for shape {shape}")
     for k in keys:
-        if k.ndim != 1 or k.shape[0] != n:
+        if tuple(k.shape) != shape:
             raise RuntimeError(
-                f"lexsort requires all keys to be 1-D vars of the same "
-                f"length, got shapes {[tuple(k.shape) for k in keys]}")
-    idx = jt.index((n,), 0)
-    if n == 0:
-        return idx
-    for k in keys:
-        res = jt.argsort(k[idx], dim=0, stable=True)
-        # jt.argsort may return either the index Var directly or a
-        # (index, value) tuple depending on the build; handle both (see
-        # randperm() above for the same pattern).
-        order = res[0] if isinstance(res, (tuple, list)) else res
-        idx = idx[order]
+                f"lexsort requires all keys to have the same shape, "
+                f"got shapes {[tuple(k.shape) for k in keys]}")
+    if ndim == 0:
+        raise RuntimeError("lexsort requires keys with at least 1 dimension")
+    n = shape[ax]
+    last = ndim - 1
+    # Move the sort axis to the last position (a no-op transpose when
+    # ax==last), so a single `dim=last` argsort/gather batches over every
+    # other axis exactly like jt.argsort already does for any N-D input.
+    if ax != last:
+        perm = [i for i in range(ndim) if i != ax] + [ax]
+        keys = [k.transpose(perm) for k in keys]
+    idx = jt.index(keys[0].shape, last)
+    if n > 0:
+        for k in keys:
+            kg = k.gather(last, idx)
+            res = jt.argsort(kg, dim=last, stable=True)
+            # jt.argsort may return either the index Var directly or a
+            # (index, value) tuple depending on the build; handle both (see
+            # randperm() above for the same pattern).
+            order = res[0] if isinstance(res, (tuple, list)) else res
+            idx = idx.gather(last, order)
+    if ax != last:
+        # invert `perm` to move the sort axis back to its original position.
+        inv_perm = [0] * ndim
+        for i, p in enumerate(perm):
+            inv_perm[p] = i
+        idx = idx.transpose(inv_perm)
     return idx
 jt.lexsort = lexsort
 
@@ -215,8 +247,8 @@ def any(x,dim=()):
     return x.any_(dim).bool()
 jt.Var.any = any
     
-def bernoulli(input):
-    return (input>jt.rand_like(input)).cast(input.dtype)
+def bernoulli(input, generator=None):
+    return (input>jt.rand_like(input, generator=generator)).cast(input.dtype)
 
 def repeat(x, *shape):
     r'''
@@ -1454,23 +1486,36 @@ def _prod(x,dim=0):
 
 def numpy_cumsum(x, dim=None):
     ''' cumsum implemented with numpy or cupy.
-    
+
         This function should not be called directly. Instead, jittor.misc.cumsum is recommended.
     '''
+    if (dim == None):
+        dim = -1
+    assert(dim >= -1 and dim < len(x.shape))
+
     def cumsum_forward(np, data):
         a = data['inputs'][0]
         b = data['outputs'][0]
         np.cumsum(a, axis=dim, out=b)
 
-    def cumsum_backward(np, data):
-        dout = data['dout']
-        out = data['outputs'][0]
-        np.cumsum(np.flip(dout, dim), axis=dim, out=out)
-        np.copyto(out, np.flip(out, dim))
-    if (dim == None):
-        dim = -1
-    assert(dim >= -1 and dim < len(x.shape))
-    return jt.numpy_code(x.shape, x.dtype, [x], cumsum_forward, [cumsum_backward])
+    class _Cumsum(jt.Function):
+        # jittor-core-gaps.md §3.3: see linalg.py's `inv`/`_Inv` for the
+        # general real-higher-order-AD pattern (a numpy_code op's analytic
+        # backward is otherwise an opaque second numpy_code call with no
+        # backward of its own, so a second derivative used to raise instead
+        # of computing a real answer). cumsum's backward is linear
+        # (flip+cumsum+flip of dout, no dependence on x at all), so it is
+        # already expressible with ordinary differentiable jittor ops --
+        # only a recursive call into this same (now higher-order-
+        # differentiable) cumsum is needed, no "live x" required since
+        # there is no x-dependence to reconnect.
+        def execute(self, xt):
+            return jt.numpy_code(xt.shape, xt.dtype, [xt], cumsum_forward)
+
+        def grad(self, dout):
+            return jt.flip(cumsum(jt.flip(dout, dim), dim), dim)
+
+    return _Cumsum()(x)
 
 def cub_cumsum(x, dim=None):
     ''' cumsum implemented with CUB.
@@ -1985,8 +2030,8 @@ def linspace(start, end, steps):
         res = jt.array([start])
     return res
 
-def randperm(n, dtype="int32"):
-    key = jt.random((n,))
+def randperm(n, dtype="int32", generator=None):
+    key = jt.random((n,), generator=generator)
     res = jt.argsort(key)
     # jt.argsort may return either the index Var directly or a
     # (index, value) tuple depending on the build; handle both.
@@ -2820,7 +2865,7 @@ The returned var has the same number of dimensions as the original var (x). The 
     return x.getitem(((slice(None),)*dim)+(index,))
 jt.index_select = index_select
 
-def multinomial(weights: jt.Var, num_samples: int, replacement: bool=False) -> jt.Var:
+def multinomial(weights: jt.Var, num_samples: int, replacement: bool=False, generator=None) -> jt.Var:
     ''' Returns a var where each row contains num_samples indices sampled from the multinomial probability distribution located in the corresponding row of input weights.
 
     :param weights: the input probability.
@@ -2846,7 +2891,7 @@ def multinomial(weights: jt.Var, num_samples: int, replacement: bool=False) -> j
         cum_probs_l = cum_probs[..., :-1]
         cum_probs_r = cum_probs[..., 1:]
         shape = weights.shape[:-1] + (num_samples, 1)
-        rand = jt.rand(shape) * cum_probs[..., :1, -1:]
+        rand = jt.rand(shape, generator=generator) * cum_probs[..., :1, -1:]
         one_hot = jt.logical_and(cum_probs_l < rand, rand <= cum_probs_r)
         index = one_hot.index(one_hot.ndim - 1) + 1
         return (one_hot * index).sum(-1)
@@ -2855,7 +2900,7 @@ def multinomial(weights: jt.Var, num_samples: int, replacement: bool=False) -> j
         # Pavlos S. Efraimidis and Paul G. Spirakis, 2006, Weighted random sampling with a reservoir
         assert num_samples <= weights.shape[-1], "num_samples larger than the input"
         # prevent rand generate 1, 1^inf = 1, with override other result
-        a = jt.rand(weights.shape).minimum(0.999999)
+        a = jt.rand(weights.shape, generator=generator).minimum(0.999999)
         rand = a ** (1/weights)
         _, indices = jt.topk(rand, num_samples)
         return indices

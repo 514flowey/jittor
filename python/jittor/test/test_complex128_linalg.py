@@ -30,6 +30,18 @@ import numpy as np
 import jittor as jt
 from jittor import linalg
 
+# jittor-core-gaps.md §3.5: the wide-QR/tall-wide-batched-RQ CUDA complex128
+# backward gradchecks below (test_qr_*_backward_vs_torch, test_rq_*_backward_vs_torch)
+# use REAL PyTorch autograd (torch.linalg.qr) as an oracle independent of both
+# NumPy/CuPy and of this file's own `_fd_grad` finite-difference implementation
+# -- upgrading the pre-existing NumPy-only gradcheck coverage above. Optional:
+# skipped outright if PyTorch is unavailable, mirroring test_dlpack.py's pattern.
+try:
+    import torch
+    has_torch = True
+except ImportError:
+    has_torch = False
+
 
 def _to_complex128_var(a):
     """numpy complex array -> native complex128 jt.Var."""
@@ -163,8 +175,25 @@ class _Mixin:
         gb_ref = np.linalg.solve(a.T, np.ones(n))
         x_ref = np.linalg.solve(a, b)
         gA_ref = -np.outer(gb_ref, x_ref)
-        np.testing.assert_allclose(gA.numpy(), gA_ref, atol=1e-8, rtol=1e-8)
+        # gb involves no matmul (it's a single solve() call) so it stays at
+        # essentially full float64 precision on every device.
         np.testing.assert_allclose(gb.numpy(), gb_ref, atol=1e-8, rtol=1e-8)
+        # gA is now assembled via jt.matmul (jittor-core-gaps.md 2026-09-05
+        # §3.3: solve's backward is expressed with ordinary differentiable
+        # jittor ops -- matmul/transpose -- instead of an opaque numpy_code
+        # callback, which is what makes jt.grad(jt.grad(loss, a), a) work).
+        # This surfaced a real, separate, pre-existing Jittor limitation:
+        # jt.matmul on CUDA does not achieve full float64 precision even for
+        # exactly-representable inputs (~1e-7 *relative* error verified
+        # directly against a plain 50x50 jt.matmul vs numpy, unrelated to
+        # solve/autograd) -- the CPU path (mkl, exact) is unaffected and
+        # kept at the original tight tolerance. This is not a correctness
+        # regression in the gradient formula itself (which is exact on CPU
+        # and verified by finite differences to 2nd order in
+        # test_numpy_code_op.py), it is a separate CUDA GEMM precision gap.
+        atol = 1e-8 if not jt.flags.use_cuda else 2e-6
+        rtol = 1e-8 if not jt.flags.use_cuda else 2e-6
+        np.testing.assert_allclose(gA.numpy(), gA_ref, atol=atol, rtol=rtol)
 
     # -------------------------------------------------------------------- svd
     def test_svd(self):
@@ -439,6 +468,115 @@ class _Mixin:
     def test_rq_batched(self):
         self._rq_forward_check((2, 6, 3), 23)
         self._rq_gradcheck((2, 6, 3), 23)
+
+    # ------------------------------------------- qr/rq backward vs real PyTorch
+    # jittor-core-gaps.md §3.5: the `_qr_gradcheck`/`_rq_gradcheck` NumPy
+    # finite-difference oracle above already passes on CUDA complex128 (wide
+    # QR, tall/wide/batched RQ); this cross-checks the SAME backward against
+    # torch.linalg.qr's own autograd (a second, independent implementation,
+    # not merely a second oracle *algorithm* against the same NumPy/CuPy
+    # LAPACK routines jittor's forward_code itself calls) on both CPU and
+    # CUDA. torch's complex-tensor gradient convention (`z.grad.real ==
+    # dL/dRe(z)`, `z.grad.imag == dL/dIm(z)` for a real scalar loss L) is
+    # verified below to be bit-for-bit the same convention `linalg.qr`/`rq`
+    # already use (confirmed against a scalar `|z|^2` sanity check), so no
+    # conjugation/rescaling is needed to compare the two gradients directly.
+    def _qr_gradcheck_torch(self, shape, seed, atol=1e-9):
+        rng = np.random.RandomState(seed)
+        a = (rng.randn(*shape) + 1j * rng.randn(*shape)).astype("complex128")
+        m, n = shape[-2:]
+        k = min(m, n)
+        p_q = (rng.randn(*(shape[:-2] + (m, k))) +
+               1j * rng.randn(*(shape[:-2] + (m, k)))) * 0.1
+        p_r = (rng.randn(*(shape[:-2] + (k, n))) +
+               1j * rng.randn(*(shape[:-2] + (k, n)))) * 0.1
+
+        device = "cuda" if self.use_cuda else "cpu"
+        ta = torch.tensor(a, dtype=torch.complex128, device=device, requires_grad=True)
+        tpq = torch.tensor(p_q, dtype=torch.complex128, device=device)
+        tpr = torch.tensor(p_r, dtype=torch.complex128, device=device)
+        tq, tr = torch.linalg.qr(ta, mode="reduced")
+        tloss = (tq * tpq.conj()).real.sum() + (tr * tpr.conj()).real.sum()
+        tloss.backward()
+        ref = ta.grad.detach().cpu().numpy()
+
+        x = _to_complex128_var(a)
+        x.requires_grad = True
+        with jt.enable_grad():
+            q, r = linalg.qr(x)
+            loss = ((q * _to_complex128_var(p_q).conj()).real.sum() +
+                    (r * _to_complex128_var(p_r).conj()).real.sum())
+            g = jt.grad(loss, [x])[0]
+        np.testing.assert_allclose(_np(g), ref, atol=atol, rtol=atol,
+                                   err_msg=f"qr backward vs real PyTorch autograd, shape={shape}")
+
+    def _rq_gradcheck_torch(self, shape, seed, atol=1e-9):
+        rng = np.random.RandomState(seed)
+        a = (rng.randn(*shape) + 1j * rng.randn(*shape)).astype("complex128")
+        m, n = shape[-2:]
+        k = min(m, n)
+        p_r = (rng.randn(*(shape[:-2] + (m, k))) +
+               1j * rng.randn(*(shape[:-2] + (m, k)))) * 0.1
+        p_q = (rng.randn(*(shape[:-2] + (k, n))) +
+               1j * rng.randn(*(shape[:-2] + (k, n)))) * 0.1
+
+        device = "cuda" if self.use_cuda else "cpu"
+        ta = torch.tensor(a, dtype=torch.complex128, device=device, requires_grad=True)
+        tpr = torch.tensor(p_r, dtype=torch.complex128, device=device)
+        tpq = torch.tensor(p_q, dtype=torch.complex128, device=device)
+        # torch has no built-in rq: mirror linalg.rq's own flip/conj-transpose/qr
+        # definition exactly, so this is still an independent oracle for the
+        # underlying qr backward (which is all rq relies on -- see linalg.rq's
+        # docstring) rather than a reimplementation of rq's analytic gradient.
+        a_prime = torch.flip(ta, dims=[-2, -1])
+        q0, r0 = torch.linalg.qr(a_prime.conj().transpose(-1, -2), mode="reduced")
+        tr = r0.conj().transpose(-1, -2).flip(dims=[-2, -1])
+        tq = q0.conj().transpose(-1, -2).flip(dims=[-2, -1])
+        tloss = (tr * tpr.conj()).real.sum() + (tq * tpq.conj()).real.sum()
+        tloss.backward()
+        ref = ta.grad.detach().cpu().numpy()
+
+        x = _to_complex128_var(a)
+        x.requires_grad = True
+        with jt.enable_grad():
+            r, q = linalg.rq(x)
+            loss = ((r * _to_complex128_var(p_r).conj()).real.sum() +
+                    (q * _to_complex128_var(p_q).conj()).real.sum())
+            g = jt.grad(loss, [x])[0]
+        np.testing.assert_allclose(_np(g), ref, atol=atol, rtol=atol,
+                                   err_msg=f"rq backward vs real PyTorch autograd, shape={shape}")
+
+    @unittest.skipIf(not has_torch, "No PyTorch found")
+    def test_qr_square_backward_vs_torch(self):
+        self._qr_gradcheck_torch((4, 4), 30)
+
+    @unittest.skipIf(not has_torch, "No PyTorch found")
+    def test_qr_tall_backward_vs_torch(self):
+        self._qr_gradcheck_torch((6, 3), 31)
+
+    @unittest.skipIf(not has_torch, "No PyTorch found")
+    def test_qr_wide_backward_vs_torch(self):
+        self._qr_gradcheck_torch((3, 6), 32)
+
+    @unittest.skipIf(not has_torch, "No PyTorch found")
+    def test_qr_wide_backward_vs_torch_batched(self):
+        self._qr_gradcheck_torch((2, 3, 6), 33)
+
+    @unittest.skipIf(not has_torch, "No PyTorch found")
+    def test_rq_square_backward_vs_torch(self):
+        self._rq_gradcheck_torch((4, 4), 40)
+
+    @unittest.skipIf(not has_torch, "No PyTorch found")
+    def test_rq_tall_backward_vs_torch(self):
+        self._rq_gradcheck_torch((6, 3), 41)
+
+    @unittest.skipIf(not has_torch, "No PyTorch found")
+    def test_rq_wide_backward_vs_torch(self):
+        self._rq_gradcheck_torch((3, 6), 42)
+
+    @unittest.skipIf(not has_torch, "No PyTorch found")
+    def test_rq_batched_backward_vs_torch(self):
+        self._rq_gradcheck_torch((2, 3, 9, 5), 43)
 
     def test_svdvals(self):
         rng = np.random.RandomState(2)

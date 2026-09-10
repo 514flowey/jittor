@@ -13,6 +13,26 @@ namespace jittor {
 
 struct GetitemOp : Op {
     static constexpr jittor::NanoString::Flags _inplace = (jittor::NanoString::Flags)0;
+    // Cached copy of the primary input pointer, populated once at construction.
+    // getitem/setitem are unusual among ops in still dereferencing their input
+    // at jit_prepare/jit_run time via this pointer (most ops instead read a
+    // pre-baked shape/dtype and never touch the Var* again after infer_shape).
+    // Do NOT replace this with inputs().front(): the generic executor's
+    // per-op input-edge bookkeeping (_inputs) is allowed to be reset once an
+    // op is considered "finished", but this op can legitimately be revisited
+    // for jit_prepare afterwards (e.g. its output feeds a later, separate
+    // sync that shares this op with an earlier one) -- inputs().front() would
+    // then read an empty list and crash. See getitem_op.cc jit_prepare.
+    //
+    // `y` is unused by GetitemOp itself but MUST stay declared here, right
+    // after `x`: SetitemOp::infer_shape()/compile_optimize() reinterpret a
+    // SetitemOp* as a GetitemOp* to reuse infer_slices()/_compile_optimize()
+    // (see setitem_op.cc), which only works if both structs agree on the
+    // offset of every field that reinterpreted code touches (vs, i_to_vs,
+    // i_to_o, o_shape, first_oid_of_var, var_dim). Dropping this member (or
+    // reordering it after vs) desyncs the two layouts and makes that cast
+    // read vs/o_shape from the wrong offset -- garbage shapes, not a crash.
+    Var *x, *y;
     VarSlices vs;
     // map i to related var slice
     NanoVector i_to_vs;

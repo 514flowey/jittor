@@ -389,6 +389,23 @@ void Executor::run_sync(vector<Var*> vars, bool device_sync, bool weak_sync) {
                 for (Var* v : op->inputs()) {
                     if (v->tflag != tt) continue;
                     Op* opi = v->input();
+                    // opi may not be part of this run_sync's ops[]/father[]
+                    // arrays at all: since the Direction-A fix made
+                    // is_finished() reliable for every op type (including
+                    // formerly-fused-away ones), it's now possible for a
+                    // purely-internal fused var (never itself marked
+                    // finished, since it's never exposed via
+                    // op->outputs()/_outputs -- see FusedOp::update_ops())
+                    // to still be !is_finished() and get rediscovered here
+                    // while its producer, already is_finished() from an
+                    // earlier independent run_sync, is correctly excluded
+                    // from this round's BFS (see the `!is_finished()` guard
+                    // where ops[]/custom_data get assigned). Reading
+                    // opi->custom_data in that case is stale/undefined --
+                    // and there is nothing to actually wait for regardless,
+                    // since opi already finished, so just don't count it as
+                    // a dependency.
+                    if (opi->is_finished()) continue;
                     // if those two ops are not fused
                     if (father[opi->custom_data] != root) {
                         deps[root]++;
@@ -710,6 +727,34 @@ void Executor::run_sync(vector<Var*> vars, bool device_sync, bool weak_sync) {
             "/" >> queue.size() >> ") output:" << op->outputs();
         if (is_fused_op) {
             propergate_needed_flags(fused_op);
+            // [Direction A] release each fused constituent op's stake in
+            // its own inputs' live_consumers (node.h) now that it has
+            // genuinely run as part of this fused kernel -- WITHOUT calling
+            // finish_pending_liveness()/setting is_finished() on the op
+            // itself. Deliberately not reusing finish_pending_liveness()
+            // here: doing so was tried and found to corrupt the
+            // topological sort of a later, independent run_sync that still
+            // needs one of this fusion group's purely-internal (never
+            // separately finished, since it's never exposed via
+            // op->outputs()/_outputs) vars -- is_finished() would then
+            // incorrectly suggest that var's real producer op no longer
+            // needs a slot in that later call's ops[]/father[] arrays, so
+            // its custom_data field would be stale when read (see
+            // agent/workdocs/2026-09-05-p0-getitem-lazy-relay-fix.md §13.5
+            // for the full evidence chain, including the exact assertion
+            // failure and segfault this caused). live_consumers itself
+            // doesn't have that problem -- it's never consulted by the
+            // topological sort -- so releasing just that counter, without
+            // touching is_finished(), is safe. Each op's own
+            // live_consumers_released flag (see node.h) makes this
+            // idempotent, matching finish_pending_liveness()'s own
+            // idempotency, in case this op is ever visited here twice.
+            for (Op* fop : fused_op.ops)
+                if (!fop->live_consumers_released) {
+                    fop->live_consumers_released = true;
+                    for (auto* i : fop->inputs())
+                        i->live_consumers--;
+                }
             for (Var* var : op->outputs())
                 var->finish_pending_liveness();
             continue;

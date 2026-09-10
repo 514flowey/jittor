@@ -31,8 +31,7 @@ static inline void add_dependency(Node* a, Node* b) {
 }
 
 static void setitem_inplace(SetitemOp* op) {
-    // LOGir << "in setitem_inplace";
-    auto input = op->inputs().front();
+    auto input = op->x;
     if (!(input->outputs().size() == 1 && 
         input->forward_liveness<=1 &&
         (op->op == ns_void || op->op == ns_add || op->op == ns_subtract))) {
@@ -54,7 +53,7 @@ static void setitem_inplace(SetitemOp* op) {
     if (output->allocator) return;
     output->share_with(input);
     
-    auto data = op->input(1);
+    auto data = op->y;
     // if setitem requires type conversion, don't inplace
     if (data->dtype() != input->dtype())
         return;
@@ -119,9 +118,7 @@ static void setitem_inplace(SetitemOp* op) {
 }
 
 static void getitem_inplace(GetitemOp* op) {
-    // LOGir << "in getitem_inplace";
-
-    auto in = op->inputs().front();
+    auto in = op->x;
     auto ou = op->outputs().front();
 
     // return if out is all ready inplaced
@@ -196,7 +193,7 @@ static int64 slice_len(const VarSlice& s, int64 dim_size) {
 }
 
 static void getitem_contiguous_inplace(GetitemOp* op) {
-    auto in = op->inputs().front();
+    auto in = op->x;
     auto ou = op->outputs().front();
     if (ou->allocator)
         return;

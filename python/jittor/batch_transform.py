@@ -1,4 +1,4 @@
-# jittor-core-gaps.md section 3.1: a real batching transform (vmap), as opposed
+# jittor-core-gaps.md section 3.5: a real batching transform (vmap), as opposed
 # to the loop-based fallback in torch_compat.py's `vmap`/`torch.func.vmap`.
 #
 # Design: a BatchedVar wraps a real jt.Var whose physical axis 0 is a batch
@@ -25,11 +25,17 @@
 # nested inside it.
 #
 # Scope (see jittor-core-gaps.md section 3.5, "core set" agreed with the
-# user): elementwise unary/binary (incl. conj), real/imag, reduce, reshape/
+# user): elementwise unary/binary (incl. conj), real/imag, cast, reduce, reshape/
 # transpose/broadcast, matmul/einsum, getitem/setitem (basic + simple fancy
-# indexing), detach/start_grad/stop_grad/requires_grad, and random (both
-# randomness="different" and "same"). conv/pool and other nn layers, sparse
-# ops, linalg ops (qr/svd/eigh/solve/...), custom numpy_code ops, and
+# indexing), detach/start_grad/stop_grad/requires_grad, random (both
+# randomness="different" and "same"), and the single-input factorizations
+# qr/svd/svdvals/eigh/inv (2026-09-05-core-gaps.md §3.2: these are already
+# implemented as `(..., M, N)`-batched `numpy_code` ops with NO op-specific
+# batch-axis handling of their own, so vmap's extra leading physical axis is
+# just one more leading batch dim they already accept -- see
+# `_apply_linalg`). conv/pool and other nn layers, sparse ops, two-operand
+# linalg (`solve` -- batch-shape broadcasting between the two operands is a
+# separate, not-yet-implemented rule), custom numpy_code ops, and
 # fancy-index corner cases (batched index arrays, nested-depth mismatches in
 # setitem) are explicitly out of scope (jittor-core-gaps.md §3.1 acceptance
 # #7) and fail loud rather than silently looping or producing wrong results.
@@ -120,7 +126,7 @@ class BatchedVar:
         if name in _BINARY_NAMES:
             return lambda other: _apply_binary(name, self, other)
         if name in ("cast", "astype"):
-            return lambda dtype: _apply_cast(self, dtype)
+            return lambda *args, **kwargs: _apply_cast(self, *args, **kwargs)
         if name in ("reshape", "view"):
             return lambda *shape: _apply_reshape(self, _flatten_shape_args(shape))
         if name in ("transpose", "permute"):
@@ -247,10 +253,12 @@ def _apply_unary(name, a):
     return BatchedVar(_apply_unary(name, a.value), a.level)
 
 
-def _apply_cast(a, dtype):
+def _apply_cast(a, *args, **kwargs):
     if not isinstance(a, BatchedVar):
-        return _ORIG_CAST(a, dtype)
-    return BatchedVar(_apply_cast(a.value, dtype), a.level)
+        return _ORIG_CAST(a, *args, **kwargs)
+    # A cast changes dtype, not logical axes. Preserve every nesting level
+    # and delegate both numerical and gradient semantics to the native op.
+    return BatchedVar(_apply_cast(a.value, *args, **kwargs), a.level)
 
 
 def _apply_real(a):
@@ -335,6 +343,34 @@ def _apply_like(fn, a, *args, **kwargs):
     if not isinstance(a, BatchedVar):
         return fn(a, *args, **kwargs)
     return BatchedVar(_apply_like(fn, a.value, *args, **kwargs), a.level)
+
+
+def _apply_linalg(fn, a, *args, **kwargs):
+    # Batching rule for the single-input factorizations qr/svd/svdvals/eigh/
+    # inv (jittor-core-gaps.md §3.2). Unlike matmul/einsum, these need no
+    # axis bookkeeping at all: each is already implemented (linalg.py, via
+    # jt.numpy_code wrapping np.linalg.*) to treat every leading dim before
+    # the trailing matrix dims as an independent batch dim, with the
+    # batching done by NumPy/CuPy itself, not by any jittor-side "which axis
+    # is dim 0" logic. So vmap's physical batch axis (already at position 0,
+    # ahead of any of the function's own logical batch dims) is just one
+    # more such leading dim for free -- peel one BatchedVar level, recurse
+    # on the physical value, rewrap every output (qr/eigh return a 2-tuple,
+    # svd a 2- or 3-tuple depending on `compute_uv`, svdvals/inv a single
+    # Var) at the same level. Exactly the "elementwise family" peel-recurse-
+    # rewrap argument above, generalized from one output to a tuple of them.
+    if not isinstance(a, BatchedVar):
+        return fn(a, *args, **kwargs)
+    lvl = a.level
+    inner = _apply_linalg(fn, a.value, *args, **kwargs)
+    # (tuple, list): a jt.Function-based multi-output op (e.g. qr, since
+    # jittor-core-gaps.md §3.3) returns a plain `list` from a multi-output
+    # `execute()`, not a `tuple` -- checking only `tuple` here silently
+    # treated that whole list as ONE output instead of rewrapping each
+    # element, a real bug caught by test_vmap_qr_matches_per_sample.
+    if isinstance(inner, (tuple, list)):
+        return tuple(BatchedVar(r, lvl) for r in inner)
+    return BatchedVar(inner, lvl)
 
 
 def _align_logical_rank(av, bv):
@@ -720,6 +756,16 @@ def vmap(func, in_dims=0, out_dims=0, randomness="different"):
     underlying graph is made of ordinary Jittor ops.
 
     :param func: function to vectorize; may return a Var or a pytree of Vars.
+        Prefer `vmap(lambda x: jt.linalg.qr(x))` over the bare `vmap(jt.linalg.qr)`:
+        the batching patches below are installed lazily, the first time any
+        `vmap()` call runs in the process, and a bare op reference is
+        resolved by the caller *before* that installation happens, so on a
+        process's very first vmap call it can capture the pre-patch,
+        BatchedVar-oblivious op and fail with a confusing low-level error
+        instead of dispatching correctly. A lambda re-resolves the attribute
+        at call time (after patching), so it is not affected -- as is any
+        call after the first `vmap()` use in the process, since installation
+        is idempotent and permanent.
     :param in_dims: int, None, or a pytree matching `args` -- which axis of
         each argument to map over (None = broadcast that argument unchanged).
     :param out_dims: int or a pytree matching func's return value -- where to
@@ -737,7 +783,8 @@ def vmap(func, in_dims=0, out_dims=0, randomness="different"):
     reshape/transpose/permute/unsqueeze/broadcast, matmul/einsum, getitem/setitem
     (incl. simple fancy indexing), detach/start_grad/stop_grad (so
     gradfunctional's vjp/jvp compose: `vmap(lambda x, v: jvp(f, x, v))`),
-    and random. Anything else raises NotImplementedError.
+    qr/svd/svdvals/eigh/inv, and random. Anything else raises
+    NotImplementedError.
     '''
     if randomness not in ("different", "same"):
         raise ValueError(f"vmap: unknown randomness={randomness!r}")
@@ -964,8 +1011,11 @@ def install_batching_patches():
         _install(jt, name, make())
 
     _ORIG_CAST = jt.Var.cast
-    def _cast(a, dtype):
-        return _apply_cast(a, dtype)
+    def _cast(a, *args, **kwargs):
+        # Preserve the native op= keyword rather than imposing a different
+        # dtype= signature when batching patches are installed globally.
+        return _apply_cast(a, *args, **kwargs)
+
     _install(jt.Var, "cast", _cast)
     _install(jt.Var, "astype", _cast)
     _install(jt, "cast", _cast)
@@ -1006,6 +1056,16 @@ def install_batching_patches():
     _install(jt, "matmul", _matmul)
     _install(jt.Var, "matmul", _matmul)
     _install(jt.Var, "__matmul__", _matmul)
+
+    for name in ("qr", "svd", "svdvals", "eigh", "inv"):
+        orig = getattr(jt.linalg, name, None)
+        if orig is None:
+            continue
+        def make_linalg(orig=orig):
+            def f(a, *args, **kwargs):
+                return _apply_linalg(orig, a, *args, **kwargs)
+            return f
+        _install(jt.linalg, name, make_linalg())
 
     _ORIG_EINSUM = jt.linalg.einsum
     def _einsum(spec, *operands):

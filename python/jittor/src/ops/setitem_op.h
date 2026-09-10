@@ -11,6 +11,12 @@
 namespace jittor {
 
 struct SetitemOp : Op {
+    // See GetitemOp::x in getitem_op.h for why these are cached named
+    // members instead of inputs().front()/input(1): this op still
+    // dereferences its inputs at jit_prepare/jit_run time, which is unsafe
+    // once the generic executor considers the op "finished" and resets its
+    // _inputs edge list.
+    Var *x, *y;
     VarSlices vs;
     // map i to related var slice
     NanoVector i_to_vs;

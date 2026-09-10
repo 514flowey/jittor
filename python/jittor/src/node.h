@@ -134,6 +134,41 @@ struct Node {
     // p1: pending and f>0 and b>0 contrib pending_liveness
     // p2: output(p>0 and pending) contrib pending_liveness
     int pending_liveness = 0;
+    // Number of currently-live nodes (ops or vars) that have `this` as one
+    // of their _inputs and have neither finished executing nor been
+    // deleted yet. Unlike forward/backward/pending_liveness -- which are
+    // driven by Python-level VarHolder construction/destruction and, per
+    // instrumented reproduction against a real TensorCircuit
+    // MPSCircuit.sample() call, can drop to 0 well before a
+    // structurally-reachable consumer op actually executes (Jittor's lazy
+    // evaluation can leave an arbitrarily large gap between a local Python
+    // variable going out of scope and the op that reads it actually
+    // running) -- this counter is driven purely by graph edges
+    // (add_inputs()/set_inputs()) and execution/deletion outcomes
+    // (finish_pending_liveness()/Node::free()), so it can't be fooled by
+    // that gap. Declared here (rather than left implicit) so the field
+    // exists with the same layout in every build, including the default
+    // data.gz one, whose node.cc never touches it (harmlessly stays 0
+    // there). See __data__/src/node.cc for the bookkeeping and
+    // agent/workdocs/2026-09-05-p0-getitem-lazy-relay-fix.md §13 for the
+    // full evidence chain this fixes.
+    int live_consumers = 0;
+    // Has this node's stake in each of its OWN inputs' live_consumers
+    // already been released (exactly once, whether by finish_pending_liveness(),
+    // Node::free(), or -- for a fused-away constituent op, which is
+    // deliberately never marked is_finished(), see executor.cc's fused-op
+    // branch -- a direct release there)? Kept as its own flag rather than
+    // reusing is_finished(): a fused constituent op genuinely has run (so
+    // it's safe, and necessary to avoid leaking live_consumers on its
+    // inputs, to release its stake right away), but marking it
+    // is_finished() was tried and found to corrupt a *different*
+    // subsystem's bookkeeping -- the topological sort's per-run_sync
+    // custom_data/father[] indices for any purely-internal (never
+    // separately finished) var produced by the same fusion group and later
+    // rediscovered, independently, by a subsequent run_sync. See
+    // agent/workdocs/2026-09-05-p0-getitem-lazy-relay-fix.md §13 for the
+    // full evidence chain.
+    bool live_consumers_released = false;
     inline bool need_free()
     { return !pending_liveness && (!forward_liveness || !backward_liveness); }
     
