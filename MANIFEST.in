@@ -396,6 +396,9 @@ include src/bindings/pybind/core.cc
 include src/bindings/pybind/py_var_tracer.cc
 include src/bindings/pybind/py_var_tracer.h
 include src/bindings/pybind/py_var_tracer_interface.h
+include src/bindings/pyjt/dlpack.cc
+include src/bindings/pyjt/dlpack.h
+include src/bindings/pyjt/dlpack_api.h
 include src/bindings/pyjt/gil.h
 include src/bindings/pyjt/numpy.cc
 include src/bindings/pyjt/numpy.h

@@ -92,6 +92,7 @@ CYCLIC_SUBPACKAGES = frozenset(
         "jittor.pool",
         "jittor.sparse",
         "jittor.transform",
+        "jittor.vmap",
         "jittor_utils",
     }
 )
