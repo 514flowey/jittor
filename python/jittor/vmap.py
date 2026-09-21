@@ -938,7 +938,16 @@ def install_batching_patches():
     _PATCHED = True
 
     for name in _BINARY_NAMES:
-        orig = getattr(jt.Var, name, None)
+        # Prefer the free function (`jt.less`, not `jt.Var.less`): the free
+        # function is what public callers actually use for a scalar/scalar
+        # or scalar/ndarray call like `jt.less(1, 2)`, and it promotes
+        # non-Var arguments before dispatching. `jt.Var.less` is a bound
+        # method descriptor -- calling it directly with a non-Var first
+        # argument (exactly the non-batched fallback path below does when
+        # neither operand is a BatchedVar) fails with "descriptor 'less'
+        # for 'jittor_core.Var' objects doesn't apply to a 'int' object"
+        # instead of the correct promoted result.
+        orig = getattr(jt, name, None) or getattr(jt.Var, name, None)
         if orig is None:
             continue
         _ORIG_BINARY[name] = orig
