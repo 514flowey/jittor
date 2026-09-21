@@ -10,7 +10,8 @@
 # ***************************************************************
 """Real and native-complex matrix factorizations."""
 from ._helpers import (
-    _cn_to_native, _is_native_complex, _matmul, _native_to_cn, _transpose,
+    _cn_to_native, _is_native_complex, _matmul, _native_to_cn, _reconnect,
+    _transpose,
 )
 from .results import SVD
 
@@ -403,9 +404,10 @@ def cholesky(x):
 def qr(x):
     r"""
     do the qr factorization of x in the below formula:
-    x = QR where Q is orthogonal matrix and R is upper-triangle matrix.
-    :param x (...,M,M):
-    :return:q,r as the result of qr factorization.They are both in the shape of (...,M,M).
+    x = QR where Q has orthonormal columns and R is upper-triangular.
+    :param x (...,M,N): forward and backward both work for any M, N
+        (tall/square M>=N and wide M<N).
+    :return: q (...,M,K), r (...,K,N), K=min(M,N).
     """
     import jittor as jt
     from ..nn import ComplexNumber
@@ -423,48 +425,86 @@ def qr(x):
         np.copyto(q,Q)
         np.copyto(r,R)
 
-    def backward_code(np, data):
-        # Reduced-QR backward (m>=n). A=QR, Q:(...,m,k), R:(...,k,n), k=min(m,n).
-        # Standard form (mirrors torch): with M = R gR^T - gQ^T Q,
-        #   gA = (gQ + Q copyltu(M)) R^{-T},  copyltu(X)=tril(X)+tril(X,-1)^T.
-        # jittor calls this once per output, so out_index selects the gQ-only /
-        # gR-only contribution (the total is linear in (gQ,gR), summed by autodiff).
-        # The OLD code assumed square R (output shapes were both x.shape) and the
-        # Q term lived entirely in span(Q) — wrong/crash for tall m>n. R was even
-        # allocated (m,n) instead of (k,n).
-        T = _transpose
-        _dot = _matmul
-        dout = data["dout"]
-        out = data["outputs"][0]
-        q, r = data["f_outputs"]
-        out_index = data["out_index"]
-        m = q.shape[-2]; n = r.shape[-1]
-        if m < n:
-            raise NotImplementedError(
-                "qr backward is only implemented for tall/square inputs (m>=n); "
-                f"got m={m} < n={n}. Forward works for all shapes.")
-        def copyltu(X):
-            return np.tril(X) + T(np.tril(X, -1))
-        def rinvT(X):           # X @ R^{-T}
-            return T(np.linalg.solve(r, T(X)))
-        if out_index == 0:      # contribution from gQ (gR=0)
-            gQ = dout
-            M = -_dot(T(gQ), q)
-            np.copyto(out, rinvT(gQ + _dot(q, copyltu(M))))
-        else:                   # contribution from gR (gQ=0)
-            gR = dout
-            M = _dot(r, T(gR))
-            np.copyto(out, rinvT(_dot(q, copyltu(M))))
-
     m, n = x.shape[-2:]
     k = min(m, n)
     sq = list(x.shape[:-2]) + [m, k]
     sr = list(x.shape[:-2]) + [k, n]
-    q, r = jt.numpy_code(
-        [sq, sr],
-        [x.dtype, x.dtype],
-        [x],
-        forward_code,
-        [backward_code],
-    )
+
+    def _copyltu(X):
+        return jt.tril(X) + jt.tril(X, -1).transpose(-1, -2)
+
+    def _rinvT(X, r_):
+        # X @ r_^{-T}, expressed via solve so it stays differentiable (this
+        # is what makes the whole backward below a real, further-
+        # differentiable op graph instead of an opaque numpy_code callback --
+        # see `inv`/`_Inv` in solving.py for the general pattern this and
+        # det/solve/qr all share).
+        return jt.linalg.solve(r_, X.transpose(-1, -2)).transpose(-1, -2)
+
+    class _QR(jt.Function):
+        # Reduced-QR backward. A=QR, Q:(...,m,k), R:(...,k,n), k=min(m,n).
+        #
+        # Tall/square (m>=n, k=n, R square mxn->nxn): standard form (mirrors
+        # torch), with M = R gR^T - gQ^T Q:
+        #   gA = (gQ + Q copyltu(M)) R^{-T},  copyltu(X)=tril(X)+tril(X,-1)^T.
+        #
+        # Wide (m<n, k=m, Q is square mxm, R=[R1|R2] with R1 mxm upper
+        # triangular and R2 mx(n-m) the rest): A=[A1|A2], A1=Q@R1 is itself a
+        # square QR pair, A2=Q@R2. Deriving the adjoint from
+        # dR1 = Q^T dA1 - Q^T dQ R1, dR2 = Q^T dA2 - Q^T dQ R2 (and matching
+        # coefficients of dA1/dA2 in
+        #   dL = tr(gQ^T dQ) + tr(gR1^T dR1) + tr(gR2^T dR2)
+        #      = tr(gA1^T dA1) + tr(gA2^T dA2))
+        # gives gA2 = Q@gR2 directly, and gA1 = the SAME square-QR formula
+        # above applied to the pair (Q, R1) with an effective gQ of
+        #   G = gQ - Q @ gR2 @ R2^T
+        # (the gR1-only part of the coupling stays inside the square formula
+        # unchanged; only the R2/gR2 cross term needs folding into G). This
+        # reduces to the m>=n formula exactly when n==m (R2, gR2 are empty).
+        #
+        # Unlike the original numpy_code `backward_code` (which built a
+        # SEPARATE opaque, non-further-differentiable op per output,
+        # dispatched on `out_index`), a `jt.Function`'s `grad()` receives
+        # BOTH outputs' cotangents (gq, gr) at once, either of which may be
+        # None if that output wasn't used downstream -- so the two
+        # `out_index` branches collapse into ONE combined formula by
+        # linearity of the QR vjp (gQ-only and gR-only are just the special
+        # cases gr=0 / gq=0). Expressed with ordinary differentiable jittor
+        # ops (solve/matmul/transpose/tril) and a live recursive call to
+        # `qr(x)`, so `jt.grad(jt.grad(loss, x), x)` differentiates straight
+        # through it -- see `inv`/`_Inv` in solving.py for why the live
+        # recursive call (rather than the taped/stop-grad'd `self.q`/
+        # `self.r`) is what makes this work.
+        def execute(self, xt):
+            self.q, self.r = jt.numpy_code([sq, sr], [xt.dtype, xt.dtype], [xt], forward_code)
+            return self.q, self.r
+
+        def grad(self, gq, gr):
+            q_live, r_live = qr(x)
+            q = _reconnect(self.q, q_live)
+            r = _reconnect(self.r, r_live)
+            if gq is None:
+                gq = jt.zeros_like(q)
+            if gr is None:
+                gr = jt.zeros_like(r)
+            if m >= n:
+                M = jt.matmul(r, gr.transpose(-1, -2)) - jt.matmul(gq.transpose(-1, -2), q)
+                dA = _rinvT(gq + jt.matmul(q, _copyltu(M)), r)
+            else:
+                r1 = r[..., :, :m]
+                r2 = r[..., :, m:]
+                gr1 = gr[..., :, :m]
+                gr2 = gr[..., :, m:]
+                G = gq - jt.matmul(jt.matmul(q, gr2), r2.transpose(-1, -2))
+                M = jt.matmul(r1, gr1.transpose(-1, -2)) - jt.matmul(G.transpose(-1, -2), q)
+                a1 = _rinvT(G + jt.matmul(q, _copyltu(M)), r1)
+                a2 = jt.matmul(q, gr2)
+                dA = jt.concat([a1, a2], dim=-1)
+            return dA.reshape(x.shape)
+
+    # jt.Function returns a plain list (not a tuple) for a multi-output
+    # execute(); convert back to a tuple to preserve qr()'s established
+    # (q, r) return contract (e.g. `isinstance(..., tuple)` checks and
+    # code doing `q, r = qr(x)` both keep working identically).
+    q, r = _QR()(x)
     return q, r
