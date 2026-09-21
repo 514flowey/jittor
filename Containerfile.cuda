@@ -26,20 +26,31 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 RUN python3 -m pip install --no-cache-dir --upgrade pip && \
-    python3 -m pip install --no-cache-dir numpy tqdm pillow astunparse \
-        pytest==7.4.4 pytest-timeout==2.3.1 pytest-xdist==3.6.1 PyYAML==6.0.2 scipy==1.13.1
+    python3 -m pip install --no-cache-dir "setuptools==83.0.0" "wheel==0.45.1" \
+        numpy tqdm pillow astunparse \
+        pytest==7.4.4 pytest-timeout==2.3.1 pytest-xdist==3.6.1 PyYAML==6.0.2
+# scipy is deliberately not preinstalled: only two test files import it and
+# neither is on the core/smoke path this image exists to run; add it with a
+# plain `pip install scipy` inside the container if a scipy-dependent test
+# needs to run.
 
 WORKDIR /usr/src/jittor
 COPY . .
 
-# Core: editable install so `tests/` (which import against the checkout) and
-# tools/run_test_suite.py see the same tree that's mounted/copied in.
-RUN python3 -m pip install --no-cache-dir --no-build-isolation -e .
+# Core + compat share the `jittor` import package (compat installs into
+# `jittor.compat` without owning `jittor`; see agent/manuals/environment.md
+# "Editable installs of core and compat"). Editable-installing core in
+# setuptools' *default* mode registers a sys.meta_path finder that a plain
+# `import jittor` never reaches, because compat's PathFinder-registered
+# namespace placeholder wins the race first -- `editable_mode=compat` makes
+# core's install a plain .pth path entry instead, which PathFinder resolves
+# before it ever gets to compat's placeholder.
+RUN python3 -m pip install --no-cache-dir --no-build-isolation \
+        --config-settings editable_mode=compat -e .
 
-# Compat ("jittor-torch"): independent distribution sharing the jittor.compat
-# namespace. --no-deps because it declares jittor==1.3.11.0 as a dependency and
-# we already installed core from source; --no-build-isolation so it reuses the
-# already-installed setuptools/wheel instead of fetching build deps offline.
+# --no-deps: compat declares jittor==1.3.11.0, and we already installed core
+# from source above. --no-build-isolation: reuse the setuptools/wheel already
+# installed instead of fetching build deps offline.
 RUN python3 -m pip install --no-cache-dir --no-deps --no-build-isolation -e compat
 
 CMD ["bash"]
