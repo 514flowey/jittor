@@ -31,12 +31,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 RUN python3 -m pip install --no-cache-dir --upgrade pip && \
     python3 -m pip install --no-cache-dir "setuptools==83.0.0" "wheel==0.45.1" \
-        numpy tqdm pillow astunparse \
+        numpy tqdm pillow astunparse scipy \
         pytest==7.4.4 pytest-timeout==2.3.1 pytest-xdist==3.6.1 PyYAML==6.0.2
-# scipy is deliberately not preinstalled: only two test files import it and
-# neither is on the core/smoke path this image exists to run; add it with a
-# plain `pip install scipy` inside the container if a scipy-dependent test
-# needs to run.
+# scipy: only a couple of test files actually exercise it at runtime, but
+# tests/structure/test_opinfo_dtype_declaration.py imports it at COLLECTION
+# time -- pytest's own strict-config collection of the whole tests/structure/
+# tree (the repo's own pre-commit gate, see AGENTS.md) fails outright without
+# it, not just that one file's cases.
 
 WORKDIR /usr/src/jittor
 COPY . .

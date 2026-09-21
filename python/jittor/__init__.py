@@ -202,6 +202,14 @@ from . import dataset
 from . import init
 from . import autograd
 
+# Native batching transform: builds one real batched op graph instead of
+# looping over the batch in Python (jt.grad/vjp/jvp differentiate through it
+# with no extra code, since the underlying graph is ordinary Jittor ops).
+# Independent of compat/torch's own approximate `torch.vmap` shim -- that one
+# lives in the separate jittor.compat.torch namespace, so there is no name
+# collision to order against here, unlike a same-process monkeypatch layer.
+from .vmap import vmap
+
 # The legacy ``jittor.gradfunctional`` spelling is published as a same-object
 # alias after compatibility composition. Keep the root attribute available
 # during composition as well.
@@ -364,7 +372,7 @@ _ROOT_EXPORTS = (
     "dtype", "einsum", "fft", "gradfunctional", "has_cuda", "in_mpi",
     "init", "jittor_core", "kron", "linalg", "logsumexp", "lr_scheduler",
     "math_util", "matmul", "misc", "mkl_ops", "mpi", "mpi_ops", "nn",
-    "numpy2cupy", "optim", "ops", "rank", "sparse", "tensordot",
+    "numpy2cupy", "optim", "ops", "rank", "sparse", "tensordot", "vmap",
     "amp",
     "world_size", "config", "capability", "introspection", "graph_replay",
 )
