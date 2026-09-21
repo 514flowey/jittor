@@ -68,9 +68,14 @@ void display_memory_info(const char* fileline, bool dump_var, bool red_color) {
         FloatOutput{(double)mem_info.total_cpu_ram, " KMG", 1024, "B"};
     log << "total_device_ram:" << 
         FloatOutput{(double)mem_info.total_cuda_ram, " KMG", 1024, "B"} >> "\n";
+    // .load(): streaming a std::atomic<int64> directly is ambiguous under
+    // libstdc++ 11 -- atomic<T>'s implicit conversion to T (here, long long)
+    // ties between ostream's built-in operator<<(long) and operator<<(unsigned
+    // long) overloads (same width, neither a better match), so this needs the
+    // conversion to int64 spelled out rather than left to happen implicitly.
     log << "hold_vars:" << runtime_holder_state().holders().size()
-        << "lived_vars:" << Var::number_of_lived_vars
-        << "lived_ops:" << Op::number_of_lived_ops >> '\n';
+        << "lived_vars:" << Var::number_of_lived_vars.load()
+        << "lived_ops:" << Op::number_of_lived_ops.load() >> '\n';
     if (_grad_backup_ptr)
         log << "autograd_backup_vars:" << _grad_backup_ptr->size() >> '\n';
 
