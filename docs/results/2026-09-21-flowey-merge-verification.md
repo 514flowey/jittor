@@ -51,6 +51,51 @@ the docstring/comment that motivated the original concern:
 - **Scalar tensor indexing / `newaxis` getitem** — already correct.
 - **Real (non-complex) wide QR forward** — already correct (only backward and
   higher-order AD needed the port below).
+- **getitem/setitem use-after-free under lazy execution** (flowey's own fork
+  found and fixed a real P0 bug here — a67c6be2's `Node::live_consumers`
+  counter — because their `forward_liveness`/`backward_liveness`/
+  `pending_liveness` were driven by Python-level `VarHolder`
+  construction/destruction, which could drop to 0 well before a
+  structurally-reachable, already-constructed consumer op actually ran under
+  lazy execution). Master's own executor is a from-scratch rewrite and does
+  **not** have this gap, for a concrete, documented architectural reason:
+  `Node::own_pending_liveness()`/`release_pending_liveness()` propagate
+  along the graph's own `_inputs` edges (via `add_inputs()`/`set_inputs()`,
+  which `GetitemOp`/`SetitemOp`'s constructors go through like every other
+  op) rather than from Python `VarHolder` refcounts — so a var referenced
+  only by a not-yet-executed consumer op stays `pending`-live regardless of
+  whether its own Python name still exists, and `Node::free()` checks
+  `liveness.pending.active()` (not `is_finished()`, which a var internal to
+  a `FusedOp` never becomes) before releasing anything. This is exactly the
+  invariant flowey's `live_consumers` counter was invented to add on top of
+  a different, more primitive liveness scheme. It is independently
+  documented as a *fixed* bug in this exact area: **KI-EXEC-006** in
+  `agent/manuals/known-issues.md` ("a second backward over a retained graph
+  found an input gone", fixed 2026-09-18 — after flowey's fork diverged —
+  in `Node::free()`, using the identical `!is_finished() && pending.active()`
+  guard, with measured before/after leaked-op counts: 0 lived ops/vars after
+  30 repetitions of the reproduction, versus 652 ops / 938 vars growing
+  without bound under an earlier attempted fix). Master's `GetitemOp`/
+  `SetitemOp` also hold no cached raw `Var*` members (`src/ops/composite/
+  getitem_op.h`/`setitem_op.h` — `x`/`y` are constructor parameters only,
+  consumed through the standard `inputs()` graph-edge accessor thereafter),
+  so flowey's other fix in this area (03205975's `GetitemOp::x`/
+  `SetitemOp::x/y` members, added to work around a *different* executor's
+  `_inputs()`/`input(N)` going stale under a revisited op) has no analogous
+  gap to port either — master's `Node::batch_index_at()` converts exactly
+  that "stale per-run_sync bookkeeping" failure mode into a loud assertion
+  (`batch_index_mismatch`) instead of a silent stale read, replacing what
+  flowey's own fix comment describes as an unowned `custom_data` field.
+  New regression test (`tests/core/test_getitem_setitem_liveness.py`, 8
+  cases: dropped-source getitem, dropped-operand setitem, a shared getitem
+  result fed to two branches with only one synced before the other's source
+  vars are dropped and GC'd, and a 250-iteration construct/drop/sync stress
+  loop shaped like the TensorCircuit workload that originally surfaced
+  flowey's bug) attempts to reproduce the failure mode directly against
+  master's executor with real GC pressure and intervening large allocations
+  (to make any premature free surface as a wrong value, not just rarely as a
+  crash) — passes cleanly on both CPU and CUDA, 0 anomalies. No fix needed;
+  nothing was blindly transplanted.
 
 ## Genuine gaps found and ported
 
@@ -209,18 +254,6 @@ extension fails to compile as one unit) — unrelated to the merge, fixed with
   `cusparse_spmmcsr_op.cc` kernel exists but nothing in Python wires it up).
   See item 7 below for what was actually ported and why it does **not**
   reuse flowey's `scipy.sparse`/`cupyx.scipy.sparse`-backed implementation.
-- **getitem/setitem `use-after-free` liveness (flowey's `live_consumers`
-  counter) and member-caching (`GetitemOp::x`/`SetitemOp::x/y`)**: master's
-  `GetitemOp`/`SetitemOp` still read their primary inputs via
-  `inputs().front()`/`input(1)` (the live graph-edge accessor) rather than a
-  cached member — the same pattern flowey's fix replaced. Master does have a
-  more elaborate native liveness system (`Node::liveness.{forward,backward,
-  pending}`, plus a documented, already-fixed ASAN use-after-free via
-  `VarRelayGroup` in `src/codegen/opt/var_relay.h`) that may or may not
-  already close the specific gap flowey's `live_consumers` counter addressed.
-  **Not verified either way** — this needs a real repro against master's
-  actual executor (per this repo's own verify-then-fix rule) before deciding
-  whether a fix is needed, and that wasn't done this session.
 
 ## Test migration
 
@@ -361,19 +394,16 @@ is too many for a full one-by-one write-up):
 1. Get a real independent PyTorch (or an environment without `compat`
    installed) to re-run `--tier smoke` and get a clean signal on the
    ~70 torch-shadow-affected files above.
-2. Reproduce (or rule out) the getitem/setitem use-after-free and
-   member-caching concerns against master's actual `NodeLiveness`/exec_plan
-   machinery before deciding whether a fix is needed.
-3. Verify whether the native `cusparse_spmmcsr_op.cc` custom op composes
+2. Verify whether the native `cusparse_spmmcsr_op.cc` custom op composes
    safely inside an ordinary lazy graph (no immediate `.fetch_sync()`) and,
    if so, wire it in as a CUDA fast path for `SparseCSR.spmm`'s forward pass
    (dtype ∈ {float16, float32, float64}), with backward still expressed via
    ordinary native ops (gather-based `dValues`, and `dY` via the same op
    called again with `trans_A=True`) rather than a second host round-trip.
-4. Install `cupy` in the image and re-verify the CUDA path for every
+3. Install `cupy` in the image and re-verify the CUDA path for every
    `numpy_code`-based port in this report (complex QR, inv/det/solve, vmap's
    linalg batching rule).
-5. Set up MPI/NCCL/Triton in-container if those backend gates matter for
+4. Set up MPI/NCCL/Triton in-container if those backend gates matter for
    this merge's acceptance bar.
-6. Run the `full` tier once everything above lands, per the user's stated
+5. Run the `full` tier once everything above lands, per the user's stated
    preference (core/smoke first, full as the final check).
