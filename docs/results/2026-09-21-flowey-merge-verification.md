@@ -144,6 +144,50 @@ the docstring/comment that motivated the original concern:
    draw can read stale state — callers doing a real save/restore around a
    draw must `.sync()` it first (documented in the new test file and in
    `Var.random`'s docstring).
+7. **CSR sparse layer** (`python/jittor/sparse/csr.py`, new; `coo.py`'s
+   `SparseVar` gained `coalesce()`/`to_csr()`, `spmm()` now accepts a
+   `SparseCSR`) — master's COO layer (`coo.py`) already existed but had no
+   CSR support at all. **Deliberately did not port flowey's `sparse.py`
+   implementation** (`scipy.sparse`/`cupyx.scipy.sparse`-backed via
+   `jt.numpy_code`): master's own COO layer already solves the same problems
+   natively — `to_dense()`/`spmm()` are built from ordinary differentiable
+   `reindex`/`reindex_reduce` calls, no host round-trip, no scipy/cupy
+   dependency — and master separately has real native ops
+   (`jt.argsort`/`jt.searchsorted`/`jt.unique`) that flowey's own fork
+   doesn't, which turn out to make a *fully native* CSR layer possible:
+   - **COO↔CSR conversion is a pure row-sort permutation** (nnz preserved,
+     duplicates kept) — expressed with `jt.argsort` (sort by row) plus a
+     `jt.searchsorted` trick for the row pointer (`crow[i]` = count of
+     sorted rows `< i`) and for expanding a CSR row pointer back into a
+     per-nonzero row index (`row[e]` = count of row-pointer boundaries
+     `<= e`, which also handles empty rows for free). Both directions stay
+     fully lazy/symbolic and differentiable — no new C++ binding, no host
+     sync, matching this codebase's own preference for native ops over
+     `numpy_code` wherever the shape is static.
+   - **`coalesce()`** (nnz can shrink — a genuinely data-dependent output
+     shape) is the one operation that must leave the lazy graph, exactly
+     like flowey's own version reasoned; ported via `jt.Function` + numpy
+     (`np.unique`/`np.add.at`), simplified from flowey's `scipy.sparse`
+     scatter-add trick since `np.add.at` handles it directly with no new
+     dependency.
+   - **`spmm()` on a `SparseCSR`** converts to COO first (the cheap, lazy
+     permutation above) and reuses the existing, already-tested COO `spmm`.
+     **Deliberately does not** call the native `cusparse_spmmcsr_op.cc`
+     custom op directly: that op writes into a caller-supplied output Var
+     as a side effect (`OpFlags::_manual_set_vnbb`), has no autograd of its
+     own, and every existing use (`tests/backends/cuda/test_cusparse_op.py`)
+     calls `.fetch_sync()` immediately afterward — there is no precedent
+     anywhere in this tree for composing it lazily inside a larger graph or
+     threading a custom backward through it, and verifying that pattern is
+     safe was out of scope for this port. Documented as a real, worthwhile
+     future optimization (see Follow-ups), not silently skipped.
+   - Verified: `tests/nn/test_sparse.py` (18 new CSR cases: roundtrip vs.
+     scipy's own CSR — coalescing first, since scipy's `tocsr()` coalesces
+     duplicates by default and `to_csr()` deliberately doesn't; empty rows;
+     an entirely empty matrix; transpose; coalesce; `spmm` forward+backward
+     compared directly against the existing COO `spmm` path) — all pass on
+     both CPU and CUDA (45/45 total in the file, including the pre-existing
+     COO cases, no regressions).
 
 ## A real, unrelated compiler bug fixed along the way
 
@@ -160,13 +204,11 @@ extension fails to compile as one unit) — unrelated to the merge, fixed with
 ## Scope corrections vs. the original plan
 
 - **CUDA sparse CSR**: turned out to be a bigger gap than "port a row-index
-  bug fix" — master's Python `sparse` module has no CSR support *at all* (no
+  bug fix" — master's Python `sparse` module had no CSR support *at all* (no
   `to_csr`/`to_coo`, only a `SparseVar` COO class; the native
   `cusparse_spmmcsr_op.cc` kernel exists but nothing in Python wires it up).
-  **Not yet ported** — flowey's `sparse.py` has a complete, working CSR layer
-  (`scipy.sparse`/`cupyx.scipy.sparse`-backed) that could be adapted, but this
-  is a larger lift than originally scoped and was deprioritized behind the
-  four items above.
+  See item 7 below for what was actually ported and why it does **not**
+  reuse flowey's `scipy.sparse`/`cupyx.scipy.sparse`-backed implementation.
 - **getitem/setitem `use-after-free` liveness (flowey's `live_consumers`
   counter) and member-caching (`GetitemOp::x`/`SetitemOp::x/y`)**: master's
   `GetitemOp`/`SetitemOp` still read their primary inputs via
@@ -322,8 +364,12 @@ is too many for a full one-by-one write-up):
 2. Reproduce (or rule out) the getitem/setitem use-after-free and
    member-caching concerns against master's actual `NodeLiveness`/exec_plan
    machinery before deciding whether a fix is needed.
-3. Port a CSR layer into `python/jittor/sparse/` wired to the existing
-   `cusparse_spmmcsr_op.cc` kernel.
+3. Verify whether the native `cusparse_spmmcsr_op.cc` custom op composes
+   safely inside an ordinary lazy graph (no immediate `.fetch_sync()`) and,
+   if so, wire it in as a CUDA fast path for `SparseCSR.spmm`'s forward pass
+   (dtype ∈ {float16, float32, float64}), with backward still expressed via
+   ordinary native ops (gather-based `dValues`, and `dY` via the same op
+   called again with `trans_A=True`) rather than a second host round-trip.
 4. Install `cupy` in the image and re-verify the CUDA path for every
    `numpy_code`-based port in this report (complex QR, inv/det/solve, vmap's
    linalg batching rule).
