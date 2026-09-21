@@ -105,7 +105,9 @@ def complex_eigh(x:ComplexNumber):
     (``UPLO='L'``), matching the real ``eigh``. Returns ``(w, v)`` as
     ``ComplexNumber``\ s for type-consistency with :func:`complex_eig`; the
     eigenvalues ``w`` are mathematically real (carried with a zero imaginary
-    part). Forward-only (numpy), like ``complex_eig``/``complex_svd``.
+    part). First-order backward supports distinct eigenvalues and losses
+    invariant to the per-eigenvector complex phase. Higher-order derivatives
+    through the numpy-code callback are not supported.
 
     :param x (...,M,M):
     :return: w (...,M) eigenvalues, v (...,M,M) eigenvectors.
@@ -128,7 +130,32 @@ def complex_eigh(x:ComplexNumber):
         np.copyto(v, _complex_to_stack(tv))
 
     def backward_code(np, data):
-        raise NotImplementedError
+        # Port of 32001665's first-order adjoint. UPLO='L' reads only the
+        # lower triangle: each strict-lower entry also contributes through
+        # its conjugate mirror, the real diagonal once, and the upper never.
+        H = _conj_transpose
+        dout = _stack_to_complex(data["dout"])
+        out = data["outputs"][0]
+        w, v = data["f_outputs"]
+        w = np.real(_stack_to_complex(w))
+        v = _stack_to_complex(v)
+        k = v.shape[-1]
+        if data["out_index"] == 0:
+            # Eigenvalues have an identically zero imaginary component.
+            t = _matmul(v * np.real(dout)[..., np.newaxis, :], H(v))
+        else:
+            if not np.any(dout):
+                np.copyto(out, np.zeros_like(out))
+                return
+            eye = np.eye(k, dtype=w.dtype)
+            differences = w[..., np.newaxis, :] - w[..., :, np.newaxis]
+            # The diagonal of V^H dV is a free phase, not an input gradient.
+            factors = (1 - eye) / (differences + eye)
+            t = _matmul(_matmul(v, factors * _matmul(H(v), dout)), H(v))
+        folded = np.tril(t + H(t), -1)
+        indices = np.arange(k)
+        folded[..., indices, indices] = np.real(np.einsum('...ii->...i', t))
+        np.copyto(out, _complex_to_stack(folded))
 
     sw = x.shape[:-2] + x.shape[-1:] + (2,)
     sv = x.value.shape
@@ -261,6 +288,9 @@ def complex_svd(x:ComplexNumber):
     s's shape (...,K)
     v's shape (...,K,N)
     where K is min(M,N).
+    First-order backward supports distinct, nonzero singular values and
+    separately phase-invariant singular-vector losses. Joint U/V phase
+    coupling and higher-order callback derivatives are not supported yet.
     :param x:
     :return:u,s,v.
     '''
@@ -275,7 +305,44 @@ def complex_svd(x:ComplexNumber):
         np.copyto(v, _complex_to_stack(tv))
 
     def backward_code(np, data):
-        raise NotImplementedError
+        # Port of 32001665's reduced complex SVD adjoint, retaining the
+        # per-output numpy-code contract. This formula drops diagonal phase
+        # terms and therefore only covers separately phase-invariant U/V
+        # losses, not general jointly phase-invariant reconstruction losses.
+        H = _conj_transpose
+        dout = _stack_to_complex(data["dout"])
+        out = data["outputs"][0]
+        u, s, vh = data["f_outputs"]
+        u = _stack_to_complex(u)
+        s = np.real(_stack_to_complex(s))
+        vh = _stack_to_complex(vh)
+        v = H(vh)
+        m, k = u.shape[-2:]
+        n = vh.shape[-1]
+        eye = np.eye(k, dtype=s.dtype)
+        out_index = data["out_index"]
+        if out_index == 1:
+            # The imaginary singular-value output is constant zero.
+            t = _matmul(u * np.real(dout)[..., np.newaxis, :], vh)
+        else:
+            factors = 1 / (
+                s[..., np.newaxis, :] ** 2 - s[..., :, np.newaxis] ** 2 + eye
+            )
+            if out_index == 0:
+                projected = _matmul(H(u), dout) * (1 - eye)
+                middle = factors * (projected - H(projected))
+                t = _matmul(_matmul(u, middle * s[..., np.newaxis, :]), vh)
+                if m > n:
+                    complement = np.eye(m, dtype=s.dtype) - _matmul(u, H(u))
+                    t += _matmul(_matmul(complement, dout / s[..., np.newaxis, :]), vh)
+            else:
+                projected = _matmul(vh, H(dout)) * (1 - eye)
+                middle = factors * (projected - H(projected))
+                t = _matmul(_matmul(u, s[..., :, np.newaxis] * middle), vh)
+                if m < n:
+                    complement = np.eye(n, dtype=s.dtype) - _matmul(v, vh)
+                    t += _matmul(_matmul(u / s[..., np.newaxis, :], dout), complement)
+        np.copyto(out, _complex_to_stack(t))
 
     m, n = x.shape[-2:]
     k = min(m, n)
