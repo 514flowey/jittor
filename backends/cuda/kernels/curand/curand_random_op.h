@@ -9,14 +9,20 @@
 // ***************************************************************
 #pragma once
 #include "core/op.h"
+#include "runtime/random_generator.h"
 
 namespace jittor {
 
 struct CurandRandomOp : Op {
     Var* output;
     NanoString type;
-    CurandRandomOp(NanoVector shape, NanoString dtype=ns_float32, NanoString type=ns_uniform);
-    
+    // See RandomOp::gen (ops/composite/random_op.h) -- same contract, CUDA
+    // side. Named rand_gen (not gen) to avoid colliding with the
+    // file-scope global `curandGenerator_t gen` declared in
+    // curand_wrapper.h and used for the no-generator-passed default path.
+    shared_ptr<RandomGeneratorState> rand_gen;
+    CurandRandomOp(NanoVector shape, NanoString dtype=ns_float32, NanoString type=ns_uniform, RandomGenerator* generator=nullptr);
+
     const char* name() const override { return "curand_random"; }
     DECLARE_jit_run;
 };

@@ -36,7 +36,7 @@ from ._runtime.composition import publish as _publish
 
 
 _NATIVE_CORE_EXPORTS = (
-    "DumpGraphs", "Flags", "MemInfo", "NanoString", "NanoVector",
+    "DumpGraphs", "Flags", "Generator", "MemInfo", "NanoString", "NanoVector",
     "RingBuffer", "Var", "ZipFile", "binary_dtype_infer", "clean_graph",
     "cleanup", "clear_trace_data", "current_device", "display_max_memory_info",
     "display_memory_info", "dump_all_graphs", "dump_trace_data", "fetch_sync",

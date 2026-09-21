@@ -138,7 +138,7 @@ def _amp_array_preference(ret):
         return ret if _jittor_dtype_name(ret.dtype) == "float16" else ret.float16()
     return ret
 
-def random(shape, dtype="float32", type="uniform"):
+def random(shape, dtype="float32", type="uniform", generator=None):
     ''' Constructs a random jittor Var.
 
     :param shape: The shape of the random Var.
@@ -147,6 +147,12 @@ def random(shape, dtype="float32", type="uniform"):
     :type dtype: str, jittor type-cast function, or None.
     :param type: The random distribution, can be 'uniform' or 'normal'.
     :type type: str
+    :param generator: an optional jt.Generator: when given, draws consume
+        (and advance) that generator's own independent, device-native RNG
+        state instead of the global one -- two generators seeded identically
+        produce identical sequences, and interleaved draws from different
+        generators never share state.
+    :type generator: jt.Generator, optional
 
     ----------------
 
@@ -163,9 +169,9 @@ def random(shape, dtype="float32", type="uniform"):
     if _jittor_dtype_name(dtype) in ("float16", "bfloat16"):
         # The CPU and accelerator random engines generate standard floating
         # types; low-precision outputs use their regular cast kernels.
-        ret = ops.random(shape, "float32", type).cast(dtype)
+        ret = ops.random(shape, "float32", type, generator).cast(dtype)
     else:
-        ret = ops.random(shape, dtype, type)
+        ret = ops.random(shape, dtype, type, generator)
     return _amp_array_preference(ret)
 
 _core_to_device = Var.to_device

@@ -12,6 +12,7 @@
 #include "runtime/init.h"
 #include "runtime/device.h"
 #include "runtime/cuda_streams.h"
+#include "runtime/random_generator.h"
 
 namespace jittor {
 
@@ -94,5 +95,42 @@ inline ~curand_initer() {
 }
 
 } init_;
+
+// Hooks that let core code (runtime/random_generator.cc, which cannot depend
+// on <curand.h>/-lcurand) create/reseed/destroy an INDEPENDENT
+// curandGenerator_t per jt.Generator(device="cuda") instance -- distinct
+// from (and never touching) the per-device global `gens`/`gen` above, which
+// stay exactly as they were for every draw that doesn't pass an explicit
+// generator. Registered unconditionally (device_count==0 just means these
+// are never invoked, since RandomGeneratorState only calls them for a
+// generator explicitly constructed with device="cuda").
+static void* curand_gen_create(int64 seed, int64 offset, int device_id) {
+    if (device_id >= 0)
+        checkCudaErrors( cudaSetDevice(device_id) );
+    curandGenerator_t g;
+    checkCudaErrors( curandCreateGenerator(&g, CURAND_RNG_PSEUDO_DEFAULT) );
+    checkCudaErrors( curandSetPseudoRandomGeneratorSeed(g, (unsigned long long)seed) );
+    if (offset)
+        checkCudaErrors( curandSetGeneratorOffset(g, (unsigned long long)offset) );
+    return (void*)g;
+}
+
+static void curand_gen_destroy(void* g) {
+    checkCudaErrors( curandDestroyGenerator((curandGenerator_t)g) );
+}
+
+static void curand_gen_set_seed_offset(void* g, int64 seed, int64 offset) {
+    curandGenerator_t cg = (curandGenerator_t)g;
+    checkCudaErrors( curandSetPseudoRandomGeneratorSeed(cg, (unsigned long long)seed) );
+    checkCudaErrors( curandSetGeneratorOffset(cg, (unsigned long long)offset) );
+}
+
+struct curand_generator_hook_initer {
+inline curand_generator_hook_initer() {
+    cuda_gen_create_hook = curand_gen_create;
+    cuda_gen_destroy_hook = curand_gen_destroy;
+    cuda_gen_set_seed_offset_hook = curand_gen_set_seed_offset;
+}
+} generator_hook_init_;
 
 } // jittor

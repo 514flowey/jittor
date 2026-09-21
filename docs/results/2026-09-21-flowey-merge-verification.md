@@ -108,6 +108,42 @@ the docstring/comment that motivated the original concern:
    added — reproducing the exact fuser disagreement needed to trigger this is
    expensive to construct; the existing core/smoke suite exercises this file
    continuously as a regression backstop.
+6. **Native `jt.Generator` RNG** (`src/runtime/random_generator.{h,cc}`,
+   `src/ops/composite/random_op.{cc,h}`,
+   `backends/cuda/kernels/curand/curand_{random_op,capabilities}.{cc,h}`,
+   `backends/cuda/libraries/curand/src/curand_wrapper.cc`) — master's only
+   `Generator` was a compat-only numpy shim for `torch.Generator`, unconnected
+   to native RNG; `jt.random(...)` always drew from the single global stream.
+   Confirmed master's curand backend had *already*, independently, fixed the
+   two curand bugs flowey's own commit fixed (`curandSetGeneratorOffset`'s
+   unit-of-2-for-normal-draws accounting, and reseed-doesn't-reset-offset), so
+   only the actual gap — an independent, per-instance `jt.Generator` object —
+   needed porting. Threaded a new `RandomGenerator*` parameter through
+   master's `find_op_capability`/`OpCapability::Random` backend-dispatch
+   abstraction (a different, more general mechanism than flowey's direct
+   CUDA-only lookup; CUDA is the only backend that registers
+   `OpCapability::Random`, so this was a safe, isolated signature change). CPU
+   path holds its own `std::default_random_engine`; CUDA path lazily creates
+   an independent `curandGenerator_t` via function-pointer hooks
+   (`cuda_gen_create_hook` etc.) registered from `curand_wrapper.cc`, so core
+   code (`src/runtime/`) never hard-links `-lcurand`. `get_state()`/
+   `set_state()` round-trip both the CPU engine and the CUDA offset/seed.
+   Exposed as `jt.Generator(device="cpu"|"cuda"[:N])` with
+   `manual_seed`/`seed`/`initial_seed`/`get_state`/`set_state`/`.device`, and
+   `generator=` accepted by `jt.random`.
+   **Notable pitfall hit while porting**: jittor's own `@if(...)`/`@for(...)`
+   JIT-templating macro splitter does naive top-level comma counting that does
+   not skip `//` comments — an explanatory comment with a comma placed inside
+   an `@if(...)` block in `curand_random_op.cc` was misparsed as an extra
+   macro argument, failing at JIT-compile time with `"Jit error: if wrong
+   arguments"` (not a normal C++ diagnostic). Fixed by moving all prose
+   comments for that block outside the macro; left a warning comment in place
+   for future maintainers of this file. Also: since jittor is lazy and there
+   is no dataflow edge for a generator's side-effecting state mutation between
+   independent draws, `get_state()` right after an unsynced `generator=`
+   draw can read stale state — callers doing a real save/restore around a
+   draw must `.sync()` it first (documented in the new test file and in
+   `Var.random`'s docstring).
 
 ## A real, unrelated compiler bug fixed along the way
 
@@ -131,17 +167,6 @@ extension fails to compile as one unit) — unrelated to the merge, fixed with
   (`scipy.sparse`/`cupyx.scipy.sparse`-backed) that could be adapted, but this
   is a larger lift than originally scoped and was deprioritized behind the
   four items above.
-- **Native `jt.Generator` RNG**: genuine gap confirmed (master's only
-  `Generator` is a compat-only numpy shim for `torch.Generator`, unconnected
-  to native RNG), and master's curand backend has *already* independently
-  fixed the same two curand bugs flowey's commit fixed (the
-  `curandSetGeneratorOffset` unit-of-2-for-normal-draws bug, and the
-  reseed-doesn't-reset-offset bug) — the remaining gap is specifically an
-  independent-per-instance `jt.Generator` object, which requires threading a
-  new parameter through master's `find_op_capability`/`OpCapability::Random`
-  backend-dispatch abstraction (a different, more general mechanism than
-  flowey's direct CUDA-only lookup). **Not yet ported** — deprioritized
-  behind DLPack/vmap given session time.
 - **getitem/setitem `use-after-free` liveness (flowey's `live_consumers`
   counter) and member-caching (`GetitemOp::x`/`SetitemOp::x/y`)**: master's
   `GetitemOp`/`SetitemOp` still read their primary inputs via
@@ -169,6 +194,9 @@ each port:
   `tests/ops/test_linalg.py::test_qr` is permanently skipped here)
 - `tests/bindings/test_dlpack.py` (new file, 12 cases)
 - `tests/core/test_vmap.py` (new file, 10 cases)
+- `tests/ops/test_random_generator.py` (new file, 13 cases: CPU + CUDA,
+  reproducibility, independence between generators, global-stream isolation,
+  state save/restore for uniform and normal odd/even-length draws)
 
 All pass on the CPU backend in-container. CUDA-path testing for the
 `numpy_code`-based linalg ops (complex QR, inv/det/solve, vmap's linalg
@@ -294,14 +322,12 @@ is too many for a full one-by-one write-up):
 2. Reproduce (or rule out) the getitem/setitem use-after-free and
    member-caching concerns against master's actual `NodeLiveness`/exec_plan
    machinery before deciding whether a fix is needed.
-3. Port native `jt.Generator` RNG, threaded through
-   `find_op_capability`/`OpCapability::Random`.
-4. Port a CSR layer into `python/jittor/sparse/` wired to the existing
+3. Port a CSR layer into `python/jittor/sparse/` wired to the existing
    `cusparse_spmmcsr_op.cc` kernel.
-5. Install `cupy` in the image and re-verify the CUDA path for every
+4. Install `cupy` in the image and re-verify the CUDA path for every
    `numpy_code`-based port in this report (complex QR, inv/det/solve, vmap's
    linalg batching rule).
-6. Set up MPI/NCCL/Triton in-container if those backend gates matter for
+5. Set up MPI/NCCL/Triton in-container if those backend gates matter for
    this merge's acceptance bar.
-7. Run the `full` tier once everything above lands, per the user's stated
+6. Run the `full` tier once everything above lands, per the user's stated
    preference (core/smoke first, full as the final check).
