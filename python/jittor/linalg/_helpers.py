@@ -13,6 +13,30 @@ from jittor._core.dtypes import dtype_name as _jittor_dtype_name
 import numpy as np
 
 
+def _reconnect(cached, live):
+    """Give a stop-grad'd numpy_code result a real, higher-order-differentiable
+    gradient path, without changing its value.
+
+    ``cached`` is a value already computed once inside a ``jt.Function``'s
+    ``execute()`` -- ``jt.Function`` tapes and stop-grads its own execute()
+    inputs/outputs, so a value cached there (e.g. ``self.mx = inv_via_numpy(x)``)
+    is permanently detached from ``x``'s autograd graph. ``live`` is the SAME
+    mathematical quantity recomputed via a live, autograd-connected recursive
+    call (e.g. calling the public ``inv(x)`` again from inside ``inv``'s own
+    ``grad()``, closing over the still-live outer ``x``).
+
+    Returns a Var whose VALUE is exactly ``cached`` (bit-identical --
+    ``live - live.detach()`` is a subtraction of a tensor from its own detached
+    copy, so it is exactly zero regardless of ``live``'s own numerical
+    precision) but whose GRADIENT w.r.t. ``live``'s inputs matches ``live``'s.
+    This keeps first-order precision identical to a plain numpy_code op (no
+    duplicated rounding from an independent recompute) while still making
+    second/third-order derivatives available through the ``live`` path -- the
+    standard "stop-gradient trick".
+    """
+    return cached + (live - live.detach())
+
+
 def _transpose(x):
     """Batched transpose: swap the last two axes."""
     return np.swapaxes(x, -1, -2)

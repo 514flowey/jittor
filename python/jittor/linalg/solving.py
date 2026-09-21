@@ -10,7 +10,8 @@
 # ***************************************************************
 """Linear solves, inverses, determinants and matrix powers."""
 from ._helpers import (
-    _cn_to_native, _is_native_complex, _matmul, _native_to_cn, _transpose,
+    _cn_to_native, _is_native_complex, _matmul, _native_to_cn, _reconnect,
+    _transpose,
 )
 from .results import INVEX
 
@@ -35,25 +36,33 @@ def inv(x):
         t_a = np.linalg.inv(a)
         np.copyto(m_a, t_a)
 
-    def backward_code(np, data):
-        T = _transpose
-        _dot = _matmul
-        dout = data["dout"]
-        out = data["outputs"][0]
-        lmx = data["f_outputs"]
-        mx = lmx[0]
-        t = -_dot(_dot(T(mx), dout), T(mx))
-        np.copyto(out, t)
+    class _Inv(jt.Function):
+        # A plain numpy_code op's analytic backward is built as a SECOND,
+        # opaque numpy_code call with no backward of its own -- so a second
+        # derivative through `inv` raised instead of computing a real answer.
+        # Real higher-order AD instead: express the backward *formula* with
+        # ordinary differentiable jittor ops (matmul/transpose) and recompute
+        # `inv(x)` via a live, non-taped recursive call to this same function.
+        # `jt.Function` tapes and stop-grads its own `execute()` inputs/
+        # outputs (so a value cached as `self.mx` is permanently detached
+        # from x's autograd graph) -- but a value computed by calling
+        # `inv(x)` again, closing over the *outer*, still-live `x`, is not,
+        # so `_reconnect` reconnects the backward expression to x's real
+        # graph. `jt.grad(jt.grad(loss, x), x)` then differentiates straight
+        # through it like any composed op. The one-time cost is recomputing
+        # the inversion during backward (the cached forward value can't be
+        # reused for this) -- the standard trade-off for a recompute-based
+        # higher-order-differentiable op.
+        def execute(self, xt):
+            self.mx = jt.numpy_code([xt.shape], [xt.dtype], [xt], forward_code)[0]
+            return self.mx
 
-    lmx = jt.numpy_code(
-        [x.shape],
-        [x.dtype],
-        [x],
-        forward_code,
-        [backward_code],
-    )
-    mx = lmx[0]
-    return mx
+        def grad(self, dout):
+            mx = _reconnect(self.mx, inv(x))
+            mxT = mx.transpose(-1, -2)
+            return -jt.matmul(jt.matmul(mxT, dout), mxT)
+
+    return _Inv()(x)
 
 
 def inv_ex(x, *, check_errors=False, out=None):
@@ -202,31 +211,33 @@ def det(x):
         tL = np.linalg.det(a)
         np.copyto(L, tL)
 
-    def backward_code(np, data):
-        T = _transpose
-        _dot = _matmul
-        dout = data["dout"]
-        out = data["outputs"][0]
-        f_out = data["f_outputs"][0]
-        inp = data["inputs"][0]
-        n_d = np.reshape(dout, np.shape(dout) + (1, 1))
-        n_o = np.reshape(f_out, np.shape(f_out) + (1, 1))
-        s = n_d * n_o * T(np.linalg.inv(inp))
-        np.copyto(out, s)
-
     s = x.shape
     x_s = s[:-2]
     if len(s) == 2:
         x_s.append(1)
-    l_det = jt.numpy_code(
-        [x_s],
-        [x.dtype],
-        [x],
-        forward_code,
-        [backward_code],
-    )
-    det = l_det[0]
-    return det
+
+    class _Det(jt.Function):
+        # See `inv`/`_Inv` above for the general real-higher-order-AD
+        # pattern (live recursive call instead of an opaque numpy_code
+        # backward-of-backward). `d(det)/dx = dout * det(x) * inv(x)^T`;
+        # both `det(x)` and `inv(x)` recurse into their own (now
+        # higher-order-differentiable) public functions, closing over the
+        # live `x`, so this composes to any order.
+        def execute(self, xt):
+            self.d = jt.numpy_code([x_s], [xt.dtype], [xt], forward_code)[0]
+            return self.d
+
+        def grad(self, dout):
+            d = _reconnect(self.d, det(x))
+            n_d = dout.reshape(list(dout.shape) + [1, 1])
+            n_o = d.reshape(list(d.shape) + [1, 1])
+            # inv(x) was never cached during forward (det's forward never
+            # computes it) -- this recompute is not new, the original numpy
+            # backward_code called np.linalg.inv(inp) fresh every time too.
+            xinvT = inv(x).transpose(-1, -2)
+            return (n_d * n_o * xinvT).reshape(x.shape)
+
+    return _Det()(x)
 
 
 def slogdet(x):
@@ -287,33 +298,36 @@ def solve(a,b):
         ans = np.linalg.solve(a, b)
         np.copyto(L, ans)
 
-    def backward_code1(np, data):
-        T = _transpose
-        _dot = _matmul
-        dout = data["dout"]
-        out = data["outputs"][0]
-        f_out = data["f_outputs"][0]
-        inp = data["inputs"][0]
-        updim = lambda x: x if x.ndim == a.ndim else x[..., None]
-        t = -_dot(updim(np.linalg.solve(T(inp), dout)), T(updim(f_out)))
-        np.copyto(out, t)
+    def _T(v):
+        # conjugate (Hermitian) transpose; .conj() is a no-op for real
+        # dtypes, so this also covers the real case unchanged, matching the
+        # Wirtinger-conjugate convention used throughout this module.
+        return v.transpose(-1, -2).conj()
 
-    def backward_code2(np, data):
-        # gradient wrt b: solve(A,b)=A^-1 b  =>  dL/db = A^-T @ dout.
-        # (was a stub writing 0 -> silently zero grad through the RHS, breaking
-        #  any training that backprops into b, e.g. differentiable solves / GP.)
-        T = _transpose
-        dout = data["dout"]
-        out = data["outputs"][0]
-        a = data["inputs"][0]
-        np.copyto(out, np.linalg.solve(T(a), dout))
+    class _Solve(jt.Function):
+        # See `inv`/`_Inv` above for the general real-higher-order-AD
+        # pattern. dL/db = A^-H @ dout = solve(A^H, dout); dL/dA = -db @ x^H
+        # (x = solve(A,b)), with a vector rhs promoted to a column vector for
+        # the outer product and squeezed back for the return shape, matching
+        # the original numpy backward's `updim` handling. Both `solve(...)`
+        # recursive calls close over the live `a`/`b`, so this composes to
+        # any order.
+        def execute(self, at, bt):
+            self.x = jt.numpy_code([bt.shape], [bt.dtype], [at, bt], forward_code)[0]
+            return self.x
 
-    l_ans = jt.numpy_code(
-        [b.shape],
-        [b.dtype],
-        [a, b],
-        forward_code,
-        [backward_code1, backward_code2],
-    )
-    ans = l_ans[0]
-    return ans
+        def grad(self, dout):
+            aH = _T(a)
+            # db has no cached forward value to reuse (it depends on dout,
+            # only known at backward time) -- this is not a new recompute,
+            # the original numpy backward already called np.linalg.solve
+            # independently for the a- and b-gradients.
+            db = solve(aH, dout)
+            x = _reconnect(self.x, solve(a, b))
+            need_squeeze = db.ndim == a.ndim - 1
+            db_col = db.unsqueeze(-1) if need_squeeze else db
+            x_col = x.unsqueeze(-1) if need_squeeze else x
+            dA = -jt.matmul(db_col, _T(x_col))
+            return dA.reshape(a.shape), db.reshape(b.shape)
+
+    return _Solve()(a, b)
