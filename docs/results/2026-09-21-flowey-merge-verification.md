@@ -1,6 +1,9 @@
 # Merging jittor-flowey's features onto jittor-master (2.0-refactor): what was ported, what was already there, and what's left
 
-- Status: In progress — core/smoke-tier verification underway; `full` tier not yet run
+- Status: `tests/structure` and `--tier core` (native+torch) green; `--tier smoke`
+  run and triaged — one real regression found and fixed (see below), remaining
+  failures are pre-existing environment gaps in this container, not this
+  session's code. `full` tier not yet run.
 - Date: 2026-09-21
 - Owner: this session (branch `merge/master-base` in the `jittor-flowey` repo)
 - Review when: `tests/_helpers/tiers.py`, `python/jittor/vmap.py`,
@@ -208,12 +211,86 @@ CPU path is the one this report's pass/fail claims cover.
   confirmed against an unmodified `2.0-refactor` checkout in the same
   container this session.
 
+## `--tier smoke` run and triage
+
+`python tools/run_test_suite.py --tier smoke --backend cpu`: native session
+49 failed / 244 errors / 2113 passed; torch session 22 failed / 2782 passed
+(`combined exit=1`). Triaged by category rather than file-by-file (315 items
+is too many for a full one-by-one write-up):
+
+- **One real regression, found and fixed**: `_apply_binary`'s non-batched
+  fallback (`python/jittor/vmap.py`) captured `jt.Var.less` (a bound-method
+  descriptor requiring a real `Var` `self`) as "the original `less`", instead
+  of the free function `jt.less` (which promotes scalar/ndarray args before
+  dispatching). Any call like `jt.less(1, 2)` after `jt.vmap()` had installed
+  its patches anywhere in the process — even with neither operand batched —
+  crashed with `TypeError: descriptor 'less' for 'jittor_core.Var' objects
+  doesn't apply to a 'int' object` instead of returning `True`. Caught by
+  `tests/ops/test_binary_op.py::test_binary_op`/`test_binary_op_bool`. Fixed
+  by capturing `getattr(jt, name, None)` (the free function) first, falling
+  back to the `Var` method only if no free function exists — matches the
+  existing precedent this file already uses for unary/reduce ops, just with
+  the two names' priority order corrected for the binary case specifically.
+  Reverified: `tests/ops/test_binary_op.py` + `tests/core/test_vmap.py`
+  together — 0 vmap-related failures (63 passed).
+- **`tests/ops/test_matmul.py`'s 4 failures are pre-existing, not caused by
+  this session**: `assert len(logs)==1` where `len(logs)==0`, checking that
+  exactly one `"Jit op key ... found: mkl_matmul..."` message was logged.
+  Reproduces identically (same 4 tests, same assertion) run completely
+  alone, with a from-scratch `$HOME` and a freshly re-downloaded oneDNN
+  source build — ruling out any state this session's heavy container reuse
+  might have left behind. The captured log shows the real first-compile
+  message at verbosity `v10` and the cache-hit messages at `v100`; nothing
+  in this session's 3 C++ changes (`array_op.cc`'s jit_key gate,
+  `mem_info.cc`'s atomic fix, `foreign_allocator.{h,cc}`'s per-device
+  pooling) touches matmul dispatch, MKL/oneDNN kernel selection, or `op.cc`'s
+  logging at all — left as a pre-existing test/logging-verbosity fragility
+  in master itself, not investigated further given session time.
+- **The remaining ~49 failed / 244 errors / 22 failed cluster almost
+  entirely into two known, pre-existing environment gaps in this specific
+  container**, not this session's code:
+  - **Shadowed `torch`**: installing `compat` (needed for `tests/structure`
+    and the `torch` test session to work at all) makes `import torch`
+    resolve to `compat/pyproject.toml`'s `"torch" = "shim/resources/torch"`
+    package-dir mapping — a real, importable, but deliberately partial
+    package (missing `torch.nn`, `torch.autograd`, `torch.linalg`,
+    `torch.matmul`, ...). Test files that gate on
+    `_skip_torch_test = not modules_available("torch")` (an import-succeeds
+    check, not an "is this really independent PyTorch" check) see this shim
+    as present and run instead of skipping, then fail on the first missing
+    attribute. This is exactly the failure mode
+    `agent/manuals/environment.md`'s "Independent Torch oracle" section
+    already documents and warns about. Affects `tests/nn/test_rnn.py` (36),
+    `tests/distributions/test_distributions.py` (33),
+    `tests/type/test_complex.py` (23+5), `tests/ops/test_arg_pool_op.py`
+    (19), `tests/ops/test_linalg.py` (18), `tests/ops/test_fft_op.py` (16),
+    `tests/nn/test_loss.py` (14), `tests/ops/test_misc_issue.py` (14),
+    `tests/ops/test_random_op.py` (12), and roughly a dozen smaller files —
+    confirmed by spot-checking several (`test_rnn.py`'s 36 errors are all
+    `ModuleNotFoundError: No module named 'torch.nn'`;
+    `test_complex.py`'s failures are all `AttributeError: module 'torch' has
+    no attribute {linalg,matmul,tensordot}`). Would need either a real
+    independent PyTorch installed alongside, or running the native session
+    in an environment without `compat` installed, to get a clean signal from
+    these files.
+  - **Missing test-only dependencies / unavailable hardware**: MPI
+    (`tests/backends/comm/mpi/*`, 8 files), NCCL (`tests/backends/comm/nccl/*`,
+    3 files — this container's 3 GPUs are visible but NCCL rank coordination
+    wasn't set up this session), ACL/Ascend NPU (not present hardware),
+    Triton (`compat/tests/triton/test_triton_backend.py`, not installed),
+    IPython (`tests/build/test_import_does_not_pull_ipython.py`), and a
+    handful of `tests/codegen`/`tests/runtime`/`tests/distributed` files not
+    individually triaged.
+  - Not independently confirmed against an unmodified `2.0-refactor`
+    checkout in the same container this session — the categorization above
+    is inferred from each failure's own traceback/message, not from a
+    differential run.
+
 ## Follow-ups
 
-1. Finish the in-progress full `tests/structure` run and re-run
-   `--tier core`/`--tier smoke` on both `native` and `torch` sessions,
-   `--backend cpu` and `--backend cuda`, now that vmap/DLPack/linalg changes
-   are all in.
+1. Get a real independent PyTorch (or an environment without `compat`
+   installed) to re-run `--tier smoke` and get a clean signal on the
+   ~70 torch-shadow-affected files above.
 2. Reproduce (or rule out) the getitem/setitem use-after-free and
    member-caching concerns against master's actual `NodeLiveness`/exec_plan
    machinery before deciding whether a fix is needed.
@@ -224,5 +301,7 @@ CPU path is the one this report's pass/fail claims cover.
 5. Install `cupy` in the image and re-verify the CUDA path for every
    `numpy_code`-based port in this report (complex QR, inv/det/solve, vmap's
    linalg batching rule).
-6. Run the `full` tier once everything above lands, per the user's stated
+6. Set up MPI/NCCL/Triton in-container if those backend gates matter for
+   this merge's acceptance bar.
+7. Run the `full` tier once everything above lands, per the user's stated
    preference (core/smoke first, full as the final check).
