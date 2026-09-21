@@ -145,68 +145,109 @@ def complex_eigh(x:ComplexNumber):
 def complex_qr(x):
     r"""
     do the qr factorization of x in the below formula:
-    x = QR where Q is orthogonal matrix and R is upper-triangle matrix.
-    :param x (...,M,M):
-    :return:q,r as the result of qr factorization.They are both in the shape of (...,M,M).
+    x = QR where Q has orthonormal columns and R is upper-triangular.
+    :param x (...,M,N): forward and backward both work for any M, N
+        (tall/square M>=N and wide M<N).
+    :return: q (...,M,K), r (...,K,N), K=min(M,N).
     """
     import jittor as jt
     if not isinstance(x, ComplexNumber):
         raise TypeError("linalg_qr is implemented for nn.ComplexNumber")
     if not (_jittor_dtype_name(x.real.dtype) == "float32" and _jittor_dtype_name(x.imag.dtype) == "float32"):
         raise TypeError("real and imag in ComplexNumber should be jt.float32")
-    if x.shape[-2] != x.shape[-1]:
-        raise ValueError("only square matrix is supported for linalg_qr")
+    m, n = x.shape[-2:]
+    k = min(m, n)
     def forward_code(np, data):
         a = _stack_to_complex(data["inputs"][0])
-        qr = data["outputs"][0]
+        q_out, r_out = data["outputs"]
         Q, R = np.linalg.qr(a)
-        QR = np.stack([Q, R], axis=0)
-        np.copyto(qr, _complex_to_stack(QR))
+        np.copyto(q_out, _complex_to_stack(Q))
+        np.copyto(r_out, _complex_to_stack(R))
 
     def backward_code(np, data):
         # reference: https://github.com/tencent-quantum-lab/tensorcircuit/blob/master/tensorcircuit/backends/pytorch_ops.py
+        # Linear in (dq, dr) jointly (no dq*dr cross terms), so a multi-output
+        # numpy_code -- one out_index per Q/R, each called with the OTHER
+        # cotangent zeroed -- sums to the same total gradient as the original
+        # single combined-output call. Verified for M>N (tall) and M==N
+        # (square), batched and unbatched, against a numpy finite-difference
+        # oracle.
+        #
+        # Wide (m<n): Q is square (...,m,m), R=[R1|R2] with R1 (...,m,m) upper
+        # triangular and R2 (...,m,n-m) the rest. A=[A1|A2], A1=Q@R1 is itself
+        # a square QR pair, A2=Q@R2. Matching coefficients of dA1/dA2 in the
+        # total differential (same derivation as the tall/square formula
+        # below) gives gA2 = Q@gR2 directly, and gA1 = the SAME square-QR
+        # formula (`square_grad` below) applied to (Q, R1) with an effective
+        # gQ of G = gQ - Q @ gR2 @ H(R2) (the gR1 part of the coupling stays
+        # inside the square formula unchanged). Reduces to the m>=n formula
+        # exactly when n==m. Verified against a numpy finite-difference
+        # oracle for complex64/complex128, batched/unbatched, several (m,n)
+        # shapes with m<n.
         H = _conj_transpose
         def _TriangularSolve(x, r):
             return H(np.linalg.solve(r, H(x)))
         _dot = _matmul
         _diag = partial(np.einsum, '...ii->...i')
 
-        dout = data["dout"]
+        dout = _stack_to_complex(data["dout"])
         out = data["outputs"][0]
-        qr = data["f_outputs"][0]
-        dout = _stack_to_complex(dout)
-        dq, dr = dout[0], dout[1]
-        qr = _stack_to_complex(qr)
-        q, r = qr[0], qr[1]
+        out_index = data["out_index"]
+        q, r = data["f_outputs"]
+        q = _stack_to_complex(q)
+        r = _stack_to_complex(r)
+        m_dim = q.shape[-2]; n_dim = r.shape[-1]
 
+        def square_grad(rr, dq, dr):
+            # Combined square-QR (A=Q@rr, rr square & invertible) adjoint
+            # from (dq, dr); the tall/square-case formula, reused unchanged
+            # here for both the tall/square path and, applied to R1, the
+            # wide path below.
+            qdq = _dot(H(q), dq)
+            qdq_ = qdq - H(qdq)
+            rdr = _dot(rr, H(dr))
+            rdr_ = rdr - H(rdr)
+            tril = np.tril(qdq_ + rdr_)
+            grad_a = _dot(q, dr + _TriangularSolve(tril, rr))
+            grad_b = _TriangularSolve(dq - _dot(q, qdq), rr)
+            ret = grad_a + grad_b
+            m_ = rdr - H(qdq)
+            eyem = np.zeros_like(m_)
+            _diag(eyem)[:] = _diag(m_)
+            correction = eyem - np.real(eyem)
+            ret = ret + _TriangularSolve(_dot(q, H(correction)), rr)
+            return ret
 
-        qdq = _dot(H(q), dq)
-        qdq_ = qdq - H(qdq)
-        rdr = _dot(r, H(dr))
-        rdr_ = rdr - H(rdr)
-        tril = np.tril(qdq_ + rdr_)
+        if m_dim >= n_dim:
+            dq = dout if out_index == 0 else np.zeros_like(q)
+            dr = dout if out_index == 1 else np.zeros_like(r)
+            ret = square_grad(r, dq, dr)
+        else:
+            r1 = r[..., :, :m_dim]
+            r2 = r[..., :, m_dim:]
+            if out_index == 0:
+                G = dout
+                gR1 = np.zeros_like(r1)
+                a2 = np.zeros_like(r2)
+            else:
+                gR1 = dout[..., :, :m_dim]
+                gR2 = dout[..., :, m_dim:]
+                G = -_dot(_dot(q, gR2), H(r2))
+                a2 = _dot(q, gR2)
+            a1 = square_grad(r1, G, gR1)
+            ret = np.concatenate([a1, a2], axis=-1)
 
-        grad_a = _dot(q, dr + _TriangularSolve(tril, r))
-        grad_b = _TriangularSolve(dq - _dot(q, qdq), r)
-        ret = grad_a + grad_b
+        np.copyto(out, _complex_to_stack(ret))
 
-        m = rdr - H(qdq)
-        eyem = np.zeros_like(m)
-        _diag(eyem)[:] = _diag(m)
-        correction = eyem - np.real(eyem)
-        ret = ret + _TriangularSolve(_dot(q, H(correction)), r)
-
-        ret = _complex_to_stack(ret)
-        np.copyto(out,ret)
-
-    qr = jt.numpy_code(
-        (2,) + x.value.shape,
-        x.value.dtype,
+    sq = list(x.shape[:-2]) + [m, k, 2]
+    sr = list(x.shape[:-2]) + [k, n, 2]
+    q, r = jt.numpy_code(
+        [sq, sr],
+        [x.value.dtype, x.value.dtype],
         [x.value],
         forward_code,
         [backward_code],
     )
-    q, r = qr[0], qr[1]
     return ComplexNumber(q, is_concat_value=True), ComplexNumber(r, is_concat_value=True)
 
 
