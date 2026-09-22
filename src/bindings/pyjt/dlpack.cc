@@ -400,9 +400,11 @@ static bool dl_tensor_is_contiguous(const DLTensor& t) {
 // resolves version, and returns the DLTensor* plus the two possible managed
 // pointers (exactly one of which is non-null) -- used by both the read-only
 // peek and the real (consuming) import below, so the "which flavor, which
-// version" logic exists in exactly one place.
+// version" logic exists in exactly one place. Inspection never consumes an
+// unsupported version; a direct import consumes it and calls its deleter.
 static DLTensor* unwrap_capsule(PyObject* capsule, bool& versioned,
-        DLManagedTensor*& managed, DLManagedTensorVersioned*& managed_v) {
+        DLManagedTensor*& managed, DLManagedTensorVersioned*& managed_v,
+        bool consume_unsupported) {
     versioned = PyCapsule_IsValid(capsule, "dltensor_versioned");
     if (!versioned && !PyCapsule_IsValid(capsule, "dltensor"))
         LOGf << "dlpack: expected a live \"dltensor\" or \"dltensor_versioned\" "
@@ -412,6 +414,19 @@ static DLTensor* unwrap_capsule(PyObject* capsule, bool& versioned,
     managed_v = nullptr;
     if (versioned) {
         managed_v = (DLManagedTensorVersioned*)PyCapsule_GetPointer(capsule, "dltensor_versioned");
+        const uint32_t major = managed_v->version.major;
+        if (major != DLPACK_MAJOR_VERSION) {
+            // Only the version/deleter prefix has a compatible ABI. Do not
+            // inspect dl_tensor, even for a read-only peek. Save the version
+            // before a producer deleter can destroy the managed header.
+            if (consume_unsupported) {
+                if (PyCapsule_SetName(capsule, "used_dltensor_versioned") < 0)
+                    LOGf << "dlpack: failed to consume an unsupported-version capsule";
+                if (managed_v->deleter) managed_v->deleter(managed_v);
+            }
+            LOGf << "dlpack: unsupported DLPack major version " << major
+                 << " (this build understands major version " << DLPACK_MAJOR_VERSION << ")";
+        }
         return &managed_v->dl_tensor;
     }
     managed = (DLManagedTensor*)PyCapsule_GetPointer(capsule, "dltensor");
@@ -426,7 +441,7 @@ static DLTensor* unwrap_capsule(PyObject* capsule, bool& versioned,
 // touch the deleter -- a capsule can still be imported normally afterwards.
 PyObject* dlpack_peek(PyObject* capsule) {
     bool versioned; DLManagedTensor* managed; DLManagedTensorVersioned* managed_v;
-    DLTensor& t = *unwrap_capsule(capsule, versioned, managed, managed_v);
+    DLTensor& t = *unwrap_capsule(capsule, versioned, managed, managed_v, false);
     PyObject* shape_tuple = PyTuple_New(t.ndim);
     for (int32_t i = 0; i < t.ndim; i++)
         PyTuple_SET_ITEM(shape_tuple, i, PyLong_FromLongLong((long long)t.shape[i]));
@@ -454,18 +469,7 @@ VarHolder* from_dlpack_capsule(PyObject* capsule, PyObject* flat_len, int64 elem
     // side of the same pair. Only one of these two names can ever be valid
     // on a given capsule.
     bool versioned; DLManagedTensor* managed; DLManagedTensorVersioned* managed_v;
-    DLTensor& t = *unwrap_capsule(capsule, versioned, managed, managed_v);
-    if (versioned && managed_v->version.major != DLPACK_MAJOR_VERSION) {
-        // Per the DLPack spec: on a major-version mismatch it is only
-        // safe to call the deleter, not to read any other field (the
-        // ABI layout itself may have changed) -- consume the capsule
-        // and fail loud rather than misreading a struct we don't
-        // understand.
-        PyCapsule_SetName(capsule, "used_dltensor_versioned");
-        if (managed_v->deleter) managed_v->deleter(managed_v);
-        LOGf << "dlpack: unsupported DLPack major version " << managed_v->version.major
-             << " (this build understands major version " << DLPACK_MAJOR_VERSION << ")";
-    }
+    DLTensor& t = *unwrap_capsule(capsule, versioned, managed, managed_v, true);
 
     // `flat_len` (a Python int) is set only by from_dlpack()'s own strided-
     // import fallback, which has already decided (via dlpack_peek()) that
@@ -513,9 +517,15 @@ VarHolder* from_dlpack_capsule(PyObject* capsule, PyObject* flat_len, int64 elem
     // leaking it (real accelerator memory, for a CUDA producer).
     PyCapsule_SetName(capsule, versioned ? "used_dltensor_versioned" : "used_dltensor");
 
+    // A producer may supply a null deleter. Keep a callable no-op in that
+    // case: ForeignAllocator still invokes its release callback exactly once.
     std::function<void()> fire_deleter = versioned
-        ? std::function<void()>([managed_v]() { managed_v->deleter(managed_v); })
-        : std::function<void()>([managed]() { managed->deleter(managed); });
+        ? std::function<void()>([managed_v, deleter=managed_v->deleter]() {
+            if (deleter) deleter(managed_v);
+        })
+        : std::function<void()>([managed, deleter=managed->deleter]() {
+            if (deleter) deleter(managed);
+        });
 
     VarPtr vp(shape, dtype);
     vp->finish_pending_liveness();
