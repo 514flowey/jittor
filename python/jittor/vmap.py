@@ -64,6 +64,7 @@
 # `.stop_grad()` are called at all in preprocessing, not what they do.
 import jittor as jt
 from collections.abc import Sequence as _Sequence
+from operator import index as _index
 
 __all__ = ["vmap", "BatchedVar"]
 
@@ -128,12 +129,16 @@ class BatchedVar:
             return lambda dim=None, keepdims=False: _apply_maxmin(name, self, dim, keepdims)
         if name in _BINARY_NAMES:
             return lambda other: _apply_binary(name, self, other)
+        if name in ("cast", "astype"):
+            return lambda *args, **kwargs: _apply_cast(self, *args, **kwargs)
         if name in ("reshape", "view"):
             return lambda *shape: _apply_reshape(self, _flatten_shape_args(shape))
         if name in ("transpose", "permute"):
             return lambda *dims: _apply_transpose(self, _flatten_shape_args(dims) or None)
         if name == "unsqueeze":
             return lambda dim: _apply_unsqueeze(self, dim)
+        if name in ("broadcast", "broadcast_var"):
+            return lambda shape, dims=None: _apply_broadcast(self, shape, dims)
         if name in ("argmax", "argmin"):
             return lambda dim, keepdims=False: _apply_argreduce(name, self, dim, keepdims)
         # jittor-core-gaps.md §3.1: gradfunctional's jvp/vjp (via
@@ -159,7 +164,7 @@ class BatchedVar:
         raise NotImplementedError(
             f"vmap: no batching rule for `.{name}` -- supported ops are limited to "
             "elementwise unary/binary, reduce (sum/mean/max/min/prod/argmax/argmin), "
-            "reshape/transpose/permute/unsqueeze, matmul/einsum, getitem/setitem, "
+            "cast/astype, reshape/transpose/permute/unsqueeze/broadcast, matmul/einsum, getitem/setitem, "
             "detach/start_grad/stop_grad, and random. Avoid calling this op inside a "
             "vmapped function, or restructure so it runs outside vmap.")
 
@@ -251,6 +256,14 @@ def _apply_unary(name, a):
     if not isinstance(a, BatchedVar):
         return _ORIG_UNARY[name](a)
     return BatchedVar(_apply_unary(name, a.value), a.level)
+
+
+def _apply_cast(a, *args, **kwargs):
+    if not isinstance(a, BatchedVar):
+        return _ORIG_CAST(a, *args, **kwargs)
+    # Dtype conversion preserves every batch level and delegates its gradient
+    # semantics to the native op, including native unsupported conversions.
+    return BatchedVar(_apply_cast(a.value, *args, **kwargs), a.level)
 
 
 def _apply_real(a):
@@ -536,9 +549,16 @@ def _shift_dim_by(dim, nd, depth, required=False):
         # Full reduction (no dim given) must still spare the `depth` leading
         # batch axes -- reduce over exactly the logical (unbatched) axes.
         return list(range(depth, depth + nd))
-    if isinstance(dim, (list, tuple)):
-        return [depth + (d if d >= 0 else d + nd) for d in dim]
-    return depth + (dim if dim >= 0 else dim + nd)
+    def shifted(d):
+        d = _index(d)
+        if not -nd <= d < nd:
+            raise ValueError(f"vmap: dim {d} out of range for a {nd}-D logical tensor")
+        return depth + (d if d >= 0 else d + nd)
+
+    if isinstance(dim, (list, tuple, jt.NanoVector)):
+        # Native empty dims mean full reduction, but only over logical axes.
+        return [shifted(d) for d in dim] if len(dim) else list(range(depth, depth + nd))
+    return shifted(dim)
 
 
 def _apply_reduce(name, a, dim, keepdims):
@@ -547,28 +567,32 @@ def _apply_reduce(name, a, dim, keepdims):
     depth = a._nesting_depth()
     shifted = _shift_dim_by(dim, a.ndim, depth)
     real = a._physical()
-    result = _ORIG_REDUCE[name](real, shifted, keepdims)
+    if a.ndim == 0:
+        # Empty native dims would reduce the physical batch axes. A single
+        # logical element preserves the native reducer's dtype promotion
+        # and gradient, unlike returning the input directly (e.g. bool sum).
+        result = _ORIG_REDUCE[name](_ORIG_UNSQUEEZE(real, depth), depth, False)
+    else:
+        result = _ORIG_REDUCE[name](real, shifted, keepdims)
     return _rewrap_like(a, result)
 
 
 def _apply_maxmin(name, a, dim=None, keepdims=False):
-    # jt.Var.max/min (torch_compat-patched) return a plain Var for a full
-    # reduction (dim=None) but a (values, indices) pair when dim is given --
-    # unlike sum/mean/prod, which are always single-output. Route the
-    # single-output case through the ordinary reduce rule and handle the
-    # paired case like argmax/argmin. Returns a plain tuple rather than
-    # torch_compat's named `torch_return_types` (still supports `[0]`/`[1]`
-    # indexing and unpacking, just not `.values`/`.indices` attribute access).
-    if dim is None:
+    # Native max/min return values only, including when dim is explicit.
+    # The optional legacy Torch frontend can instead return (values, indices).
+    # Preserve that result structure; indexing a native Var as if it were a
+    # pair would discard physical batch rows and silently change the shape.
+    if dim is None or isinstance(dim, (list, tuple, jt.NanoVector)) and not len(dim):
         return _apply_reduce(name, a, dim, keepdims)
     if not isinstance(a, BatchedVar):
-        result = _ORIG_REDUCE[name](a, dim, keepdims)
-        return result[0], result[1]
+        return _ORIG_REDUCE[name](a, dim, keepdims)
     depth = a._nesting_depth()
     shifted = _shift_dim_by(dim, a.ndim, depth, required=True)
     real = a._physical()
     result = _ORIG_REDUCE[name](real, shifted, keepdims)
-    return _rewrap_like(a, result[0]), _rewrap_like(a, result[1])
+    if isinstance(result, (tuple, list)):
+        return tuple(_rewrap_like(a, value) for value in result)
+    return _rewrap_like(a, result)
 
 
 def _apply_argreduce(name, a, dim, keepdims):
@@ -617,14 +641,29 @@ def _apply_unsqueeze(a, dim):
 
 
 def _apply_broadcast(a, shape, dims=None):
+    if isinstance(shape, BatchedVar):
+        shape = shape.shape
     if not isinstance(a, BatchedVar):
         return _ORIG_BROADCAST(a, shape, dims) if dims is not None else _ORIG_BROADCAST(a, shape)
+    shape = list(shape.shape if isinstance(shape, jt.Var) else shape)
+    dims = [] if dims is None else list(dims)
+    if len(dims) > len(shape):
+        raise ValueError("vmap: broadcast has more inserted dims than target axes")
+    # Native broadcast right-aligns both operands and permits the target to
+    # have fewer axes than the result. Do that alignment in logical space,
+    # never against the leading physical batch axes.
+    rank = max(a.ndim, len(shape) - len(dims)) + len(dims)
+    inserted = _shift_dim_by(dims, rank, 0) if dims else []
+    if len(set(inserted)) != len(inserted):
+        raise ValueError("vmap: duplicate broadcast insertion dim")
+    missing = rank - a.ndim - len(inserted)
+    inserted += [d for d in range(rank) if d not in inserted][:missing]
     depth = a._nesting_depth()
     real = a._physical()
     batch_dims = list(real.shape[:depth])
-    new_shape = batch_dims + list(shape)
-    new_dims = [i for i in range(depth)] if dims is None else \
-        list(range(depth)) + [depth + (d if d >= 0 else d + len(shape)) for d in dims]
+    new_shape = batch_dims + [1] * (rank - len(shape)) + shape
+    # dims denotes newly inserted axes, not existing axes to preserve.
+    new_dims = [depth + d for d in sorted(inserted)]
     result = _ORIG_BROADCAST(real, new_shape, new_dims)
     return _rewrap_like(a, result)
 
@@ -771,7 +810,7 @@ def vmap(func, in_dims=0, out_dims=0, randomness="different"):
         closure-captured value).
 
     Supported ops inside `func`: elementwise unary/binary (incl. conj),
-    real/imag, reduce (sum/mean/max/min/prod/argmax/argmin), reshape/
+    real/imag, cast/astype, reduce (sum/mean/max/min/prod/argmax/argmin), reshape/
     transpose/permute/unsqueeze/broadcast, matmul/einsum, getitem/setitem
     (incl. simple fancy indexing), detach/start_grad/stop_grad (so
     gradfunctional's vjp/jvp compose: `vmap(lambda x, v: jvp(f, x, v))`),
@@ -804,8 +843,16 @@ def vmap(func, in_dims=0, out_dims=0, randomness="different"):
         for o, d in zip(flat_out, flat_out_dims):
             if isinstance(o, BatchedVar) and o.level == level:
                 inner = o.value
+            elif isinstance(o, BatchedVar):
+                # This output is shared at the current level, not at its
+                # enclosing levels. Insert just this batch axis and preserve
+                # every existing wrapper before moving the logical out_dim.
+                depth = o._nesting_depth()
+                real = o._physical()
+                shape = list(real.shape[:depth]) + [batch_size] + list(o.shape)
+                inner = _rewrap_like(o, _ORIG_BROADCAST(real, shape, [depth]))
             else:
-                base = o if isinstance(o, jt.Var) else (o.value if isinstance(o, BatchedVar) else jt.array(o))
+                base = o if isinstance(o, jt.Var) else jt.array(o)
                 inner = _ORIG_BROADCAST(base, [batch_size] + list(base.shape), [0])
             result.append(_moveaxis(inner, 0, d))
         return _tree_unflatten(result, out_spec) if out_is_container else result[0]
@@ -845,6 +892,7 @@ _UNARY_DUNDERS = {"abs": "__abs__", "negative": "__neg__"}
 
 _ORIG_BINARY, _ORIG_UNARY, _ORIG_REDUCE = {}, {}, {}
 _ORIG_ARGREDUCE = {}
+_ORIG_CAST = _ORIG_VAR_CAST = None
 _ORIG_RESHAPE = _ORIG_TRANSPOSE = _ORIG_UNSQUEEZE = _ORIG_BROADCAST = None
 _ORIG_MATMUL = _ORIG_EINSUM = None
 _ORIG_GETITEM = _ORIG_SETITEM = None
@@ -933,6 +981,7 @@ def install_batching_patches():
     check). Called once, lazily, the first time jt.vmap() is used. '''
     global _PATCHED, _ORIG_RESHAPE, _ORIG_TRANSPOSE, _ORIG_UNSQUEEZE, _ORIG_BROADCAST
     global _ORIG_MATMUL, _ORIG_EINSUM, _ORIG_GETITEM, _ORIG_SETITEM, _ORIG_GRAD, _ORIG_RANDOM
+    global _ORIG_CAST, _ORIG_VAR_CAST
     if _PATCHED:
         return
     _PATCHED = True
@@ -1010,6 +1059,19 @@ def install_batching_patches():
         _install(jt.Var, name, make())
         _install(jt, name, make())
 
+    _ORIG_CAST, _ORIG_VAR_CAST = jt.cast, jt.Var.cast
+    def _cast(x, *args, **kwargs):
+        # The free function accepts scalar/array inputs and x=/op= keywords;
+        # a Var method descriptor cannot stand in for that native entry point.
+        return _apply_cast(x, *args, **kwargs)
+    def _var_cast(self, *args, **kwargs):
+        if not isinstance(self, BatchedVar):
+            return _ORIG_VAR_CAST(self, *args, **kwargs)
+        return _apply_cast(self, *args, **kwargs)
+    _install(jt, "cast", _cast)
+    _install(jt.Var, "cast", _var_cast)
+    _install(jt.Var, "astype", _var_cast)
+
     _ORIG_RESHAPE = jt.Var.reshape
     def _reshape(a, *shape):
         return _apply_reshape(a, _flatten_shape_args(shape))
@@ -1039,6 +1101,7 @@ def install_batching_patches():
     _install(jt.Var, "broadcast", _broadcast)
     _install(jt.Var, "broadcast_var", _broadcast)
     _install(jt, "broadcast", _broadcast)
+    _install(jt, "broadcast_var", _broadcast)
 
     _ORIG_MATMUL = jt.matmul
     def _matmul(a, b):

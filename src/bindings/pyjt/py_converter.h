@@ -747,6 +747,10 @@ DEF_IS(ItemData, PyObject*) to_py_object(T a) {
         return PyLong_FromLongLong(a.data);
     if (a.dtype == ns_float64)
         return PyFloat_FromDouble(*(float64*)&a.data);
+    if (a.dtype == ns_complex64) {
+        const float32* parts = (const float32*)&a.data;
+        return PyComplex_FromDoubles(parts[0], parts[1]);
+    }
     if (a.dtype == ns_int16)
         return PyLong_FromLongLong((int64)*(int16*)&a.data);
     if (a.dtype == ns_int8)
