@@ -64,6 +64,7 @@
 # `.stop_grad()` are called at all in preprocessing, not what they do.
 import jittor as jt
 from collections.abc import Sequence as _Sequence
+from operator import index as _index
 
 __all__ = ["vmap", "BatchedVar"]
 
@@ -546,9 +547,16 @@ def _shift_dim_by(dim, nd, depth, required=False):
         # Full reduction (no dim given) must still spare the `depth` leading
         # batch axes -- reduce over exactly the logical (unbatched) axes.
         return list(range(depth, depth + nd))
-    if isinstance(dim, (list, tuple)):
-        return [depth + (d if d >= 0 else d + nd) for d in dim]
-    return depth + (dim if dim >= 0 else dim + nd)
+    def shifted(d):
+        d = _index(d)
+        if not -nd <= d < nd:
+            raise ValueError(f"vmap: dim {d} out of range for a {nd}-D logical tensor")
+        return depth + (d if d >= 0 else d + nd)
+
+    if isinstance(dim, (list, tuple, jt.NanoVector)):
+        # Native empty dims mean full reduction, but only over logical axes.
+        return [shifted(d) for d in dim] if len(dim) else list(range(depth, depth + nd))
+    return shifted(dim)
 
 
 def _apply_reduce(name, a, dim, keepdims):
@@ -557,7 +565,13 @@ def _apply_reduce(name, a, dim, keepdims):
     depth = a._nesting_depth()
     shifted = _shift_dim_by(dim, a.ndim, depth)
     real = a._physical()
-    result = _ORIG_REDUCE[name](real, shifted, keepdims)
+    if a.ndim == 0:
+        # Empty native dims would reduce the physical batch axes. A single
+        # logical element preserves the native reducer's dtype promotion
+        # and gradient, unlike returning the input directly (e.g. bool sum).
+        result = _ORIG_REDUCE[name](_ORIG_UNSQUEEZE(real, depth), depth, False)
+    else:
+        result = _ORIG_REDUCE[name](real, shifted, keepdims)
     return _rewrap_like(a, result)
 
 
@@ -566,7 +580,7 @@ def _apply_maxmin(name, a, dim=None, keepdims=False):
     # The optional legacy Torch frontend can instead return (values, indices).
     # Preserve that result structure; indexing a native Var as if it were a
     # pair would discard physical batch rows and silently change the shape.
-    if dim is None:
+    if dim is None or isinstance(dim, (list, tuple, jt.NanoVector)) and not len(dim):
         return _apply_reduce(name, a, dim, keepdims)
     if not isinstance(a, BatchedVar):
         return _ORIG_REDUCE[name](a, dim, keepdims)
@@ -812,8 +826,16 @@ def vmap(func, in_dims=0, out_dims=0, randomness="different"):
         for o, d in zip(flat_out, flat_out_dims):
             if isinstance(o, BatchedVar) and o.level == level:
                 inner = o.value
+            elif isinstance(o, BatchedVar):
+                # This output is shared at the current level, not at its
+                # enclosing levels. Insert just this batch axis and preserve
+                # every existing wrapper before moving the logical out_dim.
+                depth = o._nesting_depth()
+                real = o._physical()
+                shape = list(real.shape[:depth]) + [batch_size] + list(o.shape)
+                inner = _rewrap_like(o, _ORIG_BROADCAST(real, shape, [depth]))
             else:
-                base = o if isinstance(o, jt.Var) else (o.value if isinstance(o, BatchedVar) else jt.array(o))
+                base = o if isinstance(o, jt.Var) else jt.array(o)
                 inner = _ORIG_BROADCAST(base, [batch_size] + list(base.shape), [0])
             result.append(_moveaxis(inner, 0, d))
         return _tree_unflatten(result, out_spec) if out_is_container else result[0]
