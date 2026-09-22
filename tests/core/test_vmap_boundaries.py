@@ -155,3 +155,95 @@ def test_three_levels_outer_shared_closure(device, shared_depth):
     )
     check(result, np.broadcast_to(expanded, (2, 3, 5, 4)), device)
     check(gradient, np.full_like(weights, 15 if shared_depth == 1 else 5), device)
+
+
+@pytest.mark.parametrize("dtype", ["float32", "complex64"])
+@pytest.mark.parametrize(
+    "source_shape,target_shape,dims,view_shape,output_shape",
+    [
+        ((4,), (3, 4), None, (1, 4), (3, 4)),
+        ((4,), (3, 4), [], (1, 4), (3, 4)),
+        ((4,), (3, 4), [-2], (1, 4), (3, 4)),
+        ((1, 4), (3, 4), None, (1, 4), (3, 4)),
+        ((2, 4), (4,), None, (2, 4), (2, 4)),
+        ((4,), (2, 3, 4), [1], (1, 1, 4), (2, 3, 4)),
+        ((4,), (2, 4, 3), [-1], (1, 4, 1), (2, 4, 3)),
+        ((), (2, 3), None, (1, 1), (2, 3)),
+        ((2, 4), (3,), [2], (2, 4, 1), (2, 4, 3)),
+    ],
+)
+def test_broadcast_keeps_batch_axes(
+    device, dtype, source_shape, target_shape, dims, view_shape, output_shape
+):
+    shape = (2, 3) + source_shape
+    data = (np.arange(np.prod(shape)).reshape(shape) + 1).astype(dtype)
+    if dtype == "complex64":
+        data = data + 0.25j * data
+    x = jt.array(data, dtype=dtype)
+    result = jt.vmap(jt.vmap(lambda row: jt.broadcast(row, target_shape, dims)))(x)
+    assert str(result.dtype) == dtype
+    expected = np.broadcast_to(data.reshape((2, 3) + view_shape), (2, 3) + output_shape)
+    factor = np.prod(output_shape) // np.prod(source_shape)
+    loss = (result * result.conj()).real.sum()
+    gradient = jt.grad(loss, x)
+    second = jt.grad(gradient.sum(), x) if dtype == "float32" else None
+    for value in (result, gradient, second):
+        if value is not None:
+            value.sync()
+    check(result, expected, device)
+    check(gradient, 2 * factor * data, device)
+    if second is not None:
+        check(second, np.full_like(data, 2 * factor), device)
+
+
+def test_broadcast_nondefault_batch_axes_and_tensor_shape(device):
+    data = np.arange(8, dtype=np.float64).reshape(4, 2)
+    x = jt.array(data, dtype="float64")
+    target = jt.zeros((3, 4), dtype="float64")
+    result = jt.vmap(lambda row: row.broadcast(target), in_dims=1, out_dims=-1)(x)
+    assert str(result.dtype) == "float64"
+    gradient = jt.grad((result * result).sum(), x)
+    result.sync()
+    gradient.sync()
+    check(result, np.broadcast_to(data, (3, 4, 2)), device)
+    check(gradient, 6 * data, device)
+
+
+def test_broadcast_rejects_invalid_logical_insert_axes(device):
+    x = jt.ones((2, 4))
+    for dims in ([2], [-3], [0, 0]):
+        with pytest.raises(ValueError, match="out of range|duplicate"):
+            jt.vmap(lambda row: row.broadcast((3, 4), dims))(x)
+
+
+@pytest.mark.parametrize(
+    "entry", ["method", "method_alias", "function", "function_alias"]
+)
+@pytest.mark.parametrize("shared_source", [False, True])
+def test_broadcast_mapped_target_and_aliases(device, entry, shared_source):
+    shape = (4,) if shared_source else (2, 4)
+    data = np.arange(np.prod(shape), dtype=np.float32).reshape(shape)
+    x = jt.array(data)
+    target = jt.zeros((2, 3, 4))
+    calls = []
+
+    def broadcast(source, reference):
+        calls.append(tuple(reference.shape))
+        if entry == "method":
+            return source.broadcast(reference)
+        if entry == "method_alias":
+            return source.broadcast_var(reference)
+        if entry == "function":
+            return jt.broadcast(source, reference)
+        return jt.broadcast_var(source, reference)
+
+    result = jt.vmap(broadcast, in_dims=(None if shared_source else 0, 0))(x, target)
+    assert calls == [(3, 4)]
+    assert str(result.dtype) == "float32"
+    source_gradient, target_gradient = jt.grad((result * result).sum(), [x, target])
+    for value in (result, source_gradient, target_gradient):
+        value.sync()
+    expanded = data if shared_source else data[:, None, :]
+    check(result, np.broadcast_to(expanded, (2, 3, 4)), device)
+    check(source_gradient, (12 if shared_source else 6) * data, device)
+    check(target_gradient, np.zeros((2, 3, 4)), device)

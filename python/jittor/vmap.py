@@ -137,6 +137,8 @@ class BatchedVar:
             return lambda *dims: _apply_transpose(self, _flatten_shape_args(dims) or None)
         if name == "unsqueeze":
             return lambda dim: _apply_unsqueeze(self, dim)
+        if name in ("broadcast", "broadcast_var"):
+            return lambda shape, dims=None: _apply_broadcast(self, shape, dims)
         if name in ("argmax", "argmin"):
             return lambda dim, keepdims=False: _apply_argreduce(name, self, dim, keepdims)
         # jittor-core-gaps.md §3.1: gradfunctional's jvp/vjp (via
@@ -162,7 +164,7 @@ class BatchedVar:
         raise NotImplementedError(
             f"vmap: no batching rule for `.{name}` -- supported ops are limited to "
             "elementwise unary/binary, reduce (sum/mean/max/min/prod/argmax/argmin), "
-            "cast/astype, reshape/transpose/permute/unsqueeze, matmul/einsum, getitem/setitem, "
+            "cast/astype, reshape/transpose/permute/unsqueeze/broadcast, matmul/einsum, getitem/setitem, "
             "detach/start_grad/stop_grad, and random. Avoid calling this op inside a "
             "vmapped function, or restructure so it runs outside vmap.")
 
@@ -639,14 +641,29 @@ def _apply_unsqueeze(a, dim):
 
 
 def _apply_broadcast(a, shape, dims=None):
+    if isinstance(shape, BatchedVar):
+        shape = shape.shape
     if not isinstance(a, BatchedVar):
         return _ORIG_BROADCAST(a, shape, dims) if dims is not None else _ORIG_BROADCAST(a, shape)
+    shape = list(shape.shape if isinstance(shape, jt.Var) else shape)
+    dims = [] if dims is None else list(dims)
+    if len(dims) > len(shape):
+        raise ValueError("vmap: broadcast has more inserted dims than target axes")
+    # Native broadcast right-aligns both operands and permits the target to
+    # have fewer axes than the result. Do that alignment in logical space,
+    # never against the leading physical batch axes.
+    rank = max(a.ndim, len(shape) - len(dims)) + len(dims)
+    inserted = _shift_dim_by(dims, rank, 0) if dims else []
+    if len(set(inserted)) != len(inserted):
+        raise ValueError("vmap: duplicate broadcast insertion dim")
+    missing = rank - a.ndim - len(inserted)
+    inserted += [d for d in range(rank) if d not in inserted][:missing]
     depth = a._nesting_depth()
     real = a._physical()
     batch_dims = list(real.shape[:depth])
-    new_shape = batch_dims + list(shape)
-    new_dims = [i for i in range(depth)] if dims is None else \
-        list(range(depth)) + [depth + (d if d >= 0 else d + len(shape)) for d in dims]
+    new_shape = batch_dims + [1] * (rank - len(shape)) + shape
+    # dims denotes newly inserted axes, not existing axes to preserve.
+    new_dims = [depth + d for d in sorted(inserted)]
     result = _ORIG_BROADCAST(real, new_shape, new_dims)
     return _rewrap_like(a, result)
 
@@ -1084,6 +1101,7 @@ def install_batching_patches():
     _install(jt.Var, "broadcast", _broadcast)
     _install(jt.Var, "broadcast_var", _broadcast)
     _install(jt, "broadcast", _broadcast)
+    _install(jt, "broadcast_var", _broadcast)
 
     _ORIG_MATMUL = jt.matmul
     def _matmul(a, b):
