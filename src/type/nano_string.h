@@ -37,6 +37,7 @@ constexpr int ns_max_len = 16;
     m(float64) \
     m(bfloat16) \
     m(complex64) \
+    m(complex128) \
 \
     m(pow) \
     m(maximum) \
@@ -133,15 +134,18 @@ struct NanoString {
         _unsigned=_n+4,
         // bit5: is float
         _float=_n+5,
-        // bit6-7: dsize(1,2,4,8 byte)
-        _dsize=_n+6, _dsize_nbits=2,
-        // bit8: white list
-        _white_list=_n+8,
-        // bit9: backward opt
-        _no_need_back_in=_n+9,
-        _no_need_back_out=_n+10,
-        // bit11: is complex (real/imag pair; _float/_int both 0)
-        _complex=_n+11,
+        // bit6-8: dsize(1,2,4,8,16 byte). Widened from 2 to 3 bits to fit
+        // complex128 (16 bytes = 2^4); every flag after it shifted by one
+        // bit accordingly (see the historical width-2 comment this replaces
+        // in git blame if the old offsets are ever needed for reference).
+        _dsize=_n+6, _dsize_nbits=3,
+        // bit9: white list
+        _white_list=_n+9,
+        // bit10: backward opt
+        _no_need_back_in=_n+10,
+        _no_need_back_out=_n+11,
+        // bit12: is complex (real/imag pair; _float/_int both 0)
+        _complex=_n+12,
     };
     ns_t data=0;
 
@@ -385,8 +389,25 @@ inline bool ns_scalar_lifts_int_to_default_float(
     return false;
 }
 
+/** Does this operand need complex128 (rather than complex64) if it takes
+ * part in a complex result? True for complex128 itself, and for any
+ * non-complex operand at least as wide as float64/int64/uint64 (so e.g.
+ * `complex64_var * float64_scalar_var` widens instead of silently losing
+ * the float64 side's precision).
+ */
+inline bool complex_needs_double(NanoString x) {
+    return x.is_complex() ? (x.dsize() == 16) : (x.dsize() >= 8);
+}
+
+/** complex64 unless either operand needs double precision, matching the
+ * ordinary real promotion lattice's "widest wins" rule extended to complex.
+ */
+inline NanoString complex_promote(NanoString x, NanoString y) {
+    return (complex_needs_double(x) || complex_needs_double(y)) ? ns_complex128 : ns_complex64;
+}
+
 inline  NanoString dtype_infer(NanoString x, NanoString y, bool xscalar=false, bool yscalar=false) {
-    if (x.is_complex() || y.is_complex()) return ns_complex64;  // complex propagates
+    if (x.is_complex() || y.is_complex()) return complex_promote(x, y);  // complex propagates
     if (x.is_bool() && y.is_bool()) return ns_bool;
     int dsize_ = std::max(x.dsize_(), y.dsize_());
     if (xscalar) dsize_ = y.dsize_();
@@ -404,7 +425,7 @@ inline  NanoString dtype_infer(NanoString x, NanoString y, bool xscalar=false, b
 // @pyjt(binary_dtype_infer)
 inline NanoString binary_dtype_infer(NanoString op, NanoString x, NanoString y, bool xscalar=false, bool yscalar=false) {
     if (op.is_bool()) return ns_bool;   // comparisons -> bool even for complex
-    if (x.is_complex() || y.is_complex()) return ns_complex64;  // complex arithmetic
+    if (x.is_complex() || y.is_complex()) return complex_promote(x, y);  // complex arithmetic
     int dsize_ = std::max(x.dsize_(), y.dsize_());
     if (xscalar) dsize_ = y.dsize_();
     if (yscalar) dsize_ = x.dsize_();
@@ -425,7 +446,10 @@ inline NanoString binary_dtype_infer(NanoString op, NanoString x, NanoString y, 
 
 inline NanoString unary_dtype_infer(NanoString op, NanoString x) {
     if (op.is_bool()) return ns_bool;
-    if (x.is_complex()) return (op==ns_abs) ? ns_float32 : ns_complex64;  // |z|->float
+    if (x.is_complex()) {
+        if (op == ns_abs) return x.dsize() == 16 ? ns_float64 : ns_float32;  // |z|->float
+        return x;  // stays at its own complex width
+    }
     int dsize_ = x.dsize_();
     if (op.is_float()) {
         if (op.is_white() && !(amp_reg & amp_keep_white))
@@ -441,7 +465,7 @@ inline NanoString reduce_dtype_infer(NanoString op, NanoString x, bool preserve_
     // float_ops -- forces a float output dtype, so the kernel tries to assign a complex64
     // accumulator into a double and fails to compile. (sum works already because 'add' is
     // not a float_op.)
-    if (x.is_complex()) return ns_complex64;
+    if (x.is_complex()) return x;  // stays at its own complex width
     bool is_float = x.is_float() || op.is_float();
     int dsize_ = x.dsize_();
     if (is_float) {

@@ -19,6 +19,8 @@
 2026-09-14-vllm-omni-h3-enablement
 2026-09-19-torch-compat-runbook-verification
 2026-09-21-flowey-merge-verification
+2026-09-22-complex-svd-grad-and-complex128
+2026-09-22-sgd-dampening-and-native-vmap-gaps
 ```
 
 ## 按主题索引

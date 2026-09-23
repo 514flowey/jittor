@@ -45,14 +45,17 @@ def _supports_fused_sgd(tensors, *args, **kwargs):
     return True
 
 
-def _source(count, momentum, weight_decay, dampening, nesterov):
+def _source(count, momentum, weight_decay, dampening, nesterov, first_step):
     """File-scope CUDA for exactly this configuration.
 
     The coefficients are baked in as literals rather than passed: they do not
     change between steps, and a branch on `momentum == 0` inside the inner
-    loop would be evaluated once per element.
+    loop would be evaluated once per element. `first_step` is baked in the
+    same way -- it changes exactly once per parameter group (the step-1 ->
+    step-2 transition), so this costs one extra JIT compile there, not a
+    recompile every step.
     """
-    plain = momentum == 0 and dampening == 0 and not nesterov
+    plain = momentum == 0 and not nesterov
     wd = f"{float(weight_decay):.9e}f"
     mom = f"{float(momentum):.9e}f"
     damp = f"{float(dampening):.9e}f"
@@ -65,7 +68,14 @@ def _source(count, momentum, weight_decay, dampening, nesterov):
                 float dp = {dp};
                 arg.dst[t][i] = p - dp * lr;"""
     else:
-        step = f"arg.vel[t][i] = v = fmaf({mom}, arg.vel[t][i], dp * (1.0f - {damp}));"
+        # First real touch of the velocity buffer: seed it from the raw
+        # (undampened) dp, matching PyTorch's `buf = dp.clone()` -- the
+        # dampened recurrence below is only correct from the second update
+        # onward (jittor-core-gaps.md §3.3).
+        if first_step:
+            step = "arg.vel[t][i] = v = dp;"
+        else:
+            step = f"arg.vel[t][i] = v = fmaf({mom}, arg.vel[t][i], dp * (1.0f - {damp}));"
         use = f"fmaf({mom}, v, dp)" if nesterov else "v"
         body = f"""
                 float p = arg.param[t][i];
@@ -102,9 +112,10 @@ def _launch(count, plain):
     return vel
 
 
-def _fused_sgd_cuda(entries, lr, momentum, weight_decay, dampening, nesterov):
+def _fused_sgd_cuda(entries, lr, momentum, weight_decay, dampening, nesterov, step=1):
     """`entries` is a list of (param, grad, velocity). Returns [(new_p, new_v)]."""
-    plain = momentum == 0 and dampening == 0 and not nesterov
+    plain = momentum == 0 and not nesterov
+    first_step = step <= 1
     results = []
     for start in range(0, len(entries), _CHUNK):
         chunk = entries[start:start + _CHUNK]
@@ -127,7 +138,7 @@ def _fused_sgd_cuda(entries, lr, momentum, weight_decay, dampening, nesterov):
         # into the body of `CodeOp::jit_run`, and a definition there is block
         # scope -- nvcc answers "a block-scope function may only have extern
         # storage class". Only the launch belongs in `cuda_src`.
-        header = _source(count, momentum, weight_decay, dampening, nesterov)
+        header = _source(count, momentum, weight_decay, dampening, nesterov, first_step)
         body = f"""
         FusedSgdArgs args;
         {chr(10).join('        ' + line for line in setup)}

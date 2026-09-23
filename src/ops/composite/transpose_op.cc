@@ -55,7 +55,15 @@ TransposeOp::TransposeOp(Var* x, NanoVector axes_) : x(x), axes(axes_) {
     }
     #ifdef HAS_ACCELERATOR
     const auto backend = construction_target_backend(x);
-    if (backend != BackendId::Cpu) {
+    // cuTT (the accelerated transpose library behind OpCapability::Transpose)
+    // plans its permutation kernels for fixed element sizes and does not
+    // cover 16-byte elements -- `cuttPlan` fails outright for complex128
+    // ("cuttPlan failed ... dsize 16"), which is a *device* error and would
+    // otherwise be a hard, un-recoverable crash on the very first `.transpose`
+    // of a complex128 CUDA Var (used pervasively, e.g. every `_conj_transpose`
+    // call in the linalg bridge). Route those dtypes straight to the generic
+    // Tx-templated kernel below instead, which has no such size assumption.
+    if (backend != BackendId::Cpu && x->dtype().dsize() <= 8) {
         auto accelerated_transpose = find_op_capability<VarPtr, Var*, NanoVector>(
             backend, OpCapability::Transpose, x, axes);
         if (accelerated_transpose) {

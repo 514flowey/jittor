@@ -761,6 +761,17 @@ DEF_IS(ItemData, PyObject*) to_py_object(T a) {
         return PyLong_FromUnsignedLongLong((uint64)*(uint32*)&a.data);
     if (a.dtype == ns_uint64)
         return PyLong_FromUnsignedLongLong(*(uint64*)&a.data);
+    // complex64/complex128 are a (real, imag) float32/float64 pair (see
+    // type/complex_compute.h); read the raw bytes directly rather than
+    // pulling in that codegen-only header here.
+    if (a.dtype == ns_complex64) {
+        auto* p = (float32*)&a.data;
+        return PyComplex_FromDoubles((float64)p[0], (float64)p[1]);
+    }
+    if (a.dtype == ns_complex128) {
+        auto* p = (float64*)a.bytes;
+        return PyComplex_FromDoubles(p[0], p[1]);
+    }
     ASSERT(a.dtype == ns_int64) << "Unhandled dtype in item():" << a.dtype;
     return PyLong_FromLongLong(a.data);
 }

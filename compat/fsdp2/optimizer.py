@@ -82,13 +82,13 @@ def _sgd_hparams(opt, pg):
     )
 
 
-def _sgd_update_for_param(opt, pg, state, entry, param, grad, value):
+def _sgd_update_for_param(opt, pg, state, entry, param, grad, value, *, n_step=1):
     lr, momentum, weight_decay, dampening, nesterov = _sgd_hparams(opt, pg)
     if not isinstance(value, jt.Var) or list(value.shape) != list(param.shape):
         value = jt.zeros_like(param).stop_grad()
     updated = sgd_update(
         param, grad, value, lr=lr, momentum=momentum, weight_decay=weight_decay,
-        dampening=dampening, nesterov=nesterov)
+        dampening=dampening, nesterov=nesterov, step=n_step)
     return updated.stop_grad(), value
 
 
@@ -241,7 +241,8 @@ def optimizer_step(opt, loss=None, retain_graph=False, *, native_kind=None):
             param_steps[i] = int(param_steps[i]) + 1
             if kind == "sgd":
                 new_param, new_value = _sgd_update_for_param(
-                    opt, pg, state, entry, entry.shard, grad, values[i])
+                    opt, pg, state, entry, entry.shard, grad, values[i],
+                    n_step=param_steps[i])
                 values[i] = new_value
             else:
                 new_param, new_value, new_momentum = _adam_update_for_param(

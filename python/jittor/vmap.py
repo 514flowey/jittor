@@ -156,12 +156,14 @@ class BatchedVar:
             return lambda: _apply_stop_grad(self)
         if name in ("nelement", "numel"):
             return lambda: _logical_numel(self)
+        if name == "cumsum":
+            return lambda dim=None: _apply_cumsum(self, dim)
         raise NotImplementedError(
             f"vmap: no batching rule for `.{name}` -- supported ops are limited to "
             "elementwise unary/binary, reduce (sum/mean/max/min/prod/argmax/argmin), "
-            "reshape/transpose/permute/unsqueeze, matmul/einsum, getitem/setitem, "
-            "detach/start_grad/stop_grad, and random. Avoid calling this op inside a "
-            "vmapped function, or restructure so it runs outside vmap.")
+            "reshape/transpose/permute/unsqueeze, matmul/einsum, cumsum, "
+            "getitem/setitem, detach/start_grad/stop_grad, and random. Avoid calling "
+            "this op inside a vmapped function, or restructure so it runs outside vmap.")
 
     def __getitem__(self, index):
         return _apply_getitem(self, index)
@@ -335,6 +337,43 @@ def _apply_like(fn, a, *args, **kwargs):
     if not isinstance(a, BatchedVar):
         return fn(a, *args, **kwargs)
     return BatchedVar(_apply_like(fn, a.value, *args, **kwargs), a.level)
+
+
+def _apply_cumsum(a, dim=None):
+    # Axis-sensitive, single-input -- same shape as _apply_reduce/
+    # _apply_transpose (jittor-core-gaps.md §3.4). `dim=None` must resolve
+    # against the LOGICAL (batch-excluded) rank first, via the same
+    # `_cumsum_dim` the real op itself uses, so "last axis" means the same
+    # axis the caller would get calling cumsum outside vmap -- only then is
+    # it shifted by the nesting depth to reach the physical axis.
+    if not isinstance(a, BatchedVar):
+        return _ORIG_CUMSUM(a, dim)
+    depth = a._nesting_depth()
+    resolved = jt.misc._cumsum_dim(dim, a.ndim)
+    shifted = _shift_dim_by(resolved, a.ndim, depth, required=True)
+    real = a._physical()
+    result = _ORIG_CUMSUM(real, shifted)
+    return _rewrap_like(a, result)
+
+
+def _apply_solve(fn, a, b):
+    # Two-input linalg (jittor-core-gaps.md §3.4). jt.linalg.solve already
+    # delegates to np.linalg.solve via numpy_code, which natively broadcasts
+    # leading batch dims between its two operands (square `a`, vector/matrix
+    # RHS `b`) -- exactly the property _apply_linalg's single-input rules
+    # already lean on. So this is _apply_binary's max-level dispatch
+    # WITHOUT _align_logical_rank's rank-padding step: that step exists for
+    # elementwise ops, where a mismatched logical rank would broadcast the
+    # batch axis against a real logical axis, but solve's own leading-dim
+    # broadcast already handles "only one operand is batched" correctly on
+    # its own (a shared, unbatched coefficient matrix solved against a
+    # batched right-hand side, or vice versa).
+    lvl = max(_lvl(a), _lvl(b))
+    if lvl == -1:
+        return fn(a, b)
+    av = a.value if _lvl(a) == lvl else a
+    bv = b.value if _lvl(b) == lvl else b
+    return BatchedVar(_apply_solve(fn, av, bv), lvl)
 
 
 def _apply_linalg(fn, a, *args, **kwargs):
@@ -581,13 +620,26 @@ def _apply_argreduce(name, a, dim, keepdims):
     return _rewrap_like(a, idx), _rewrap_like(a, val)
 
 
-def _apply_reshape(a, shape):
+def _apply_reshape(a, shape, orig=None):
+    # `orig` lets `view` and `reshape` share this one rule's batching logic
+    # while still falling through to their OWN original implementation, not
+    # each other's: `jt.Var.view is jt.Var.reshape` is False (confirmed) --
+    # `expand()` marks its result `_set_storage_view_of` the input, and only
+    # a genuine `.view()` call (not `.reshape()` standing in for it) detects
+    # and preserves that storage-aliasing relationship. Silently routing
+    # `.view()` through reshape's original broke `expand().view()`'s
+    # raw_ptr-sharing invariant once install_batching_patches() started
+    # running unconditionally at `import jittor` instead of only after a
+    # process's first jt.vmap() call (jittor-core-gaps.md §3.4) -- latent
+    # before that, since nothing exercised it without vmap in the picture.
+    if orig is None:
+        orig = _ORIG_RESHAPE
     if not isinstance(a, BatchedVar):
-        return _ORIG_RESHAPE(a, shape)
+        return orig(a, shape)
     depth = a._nesting_depth()
     real = a._physical()
     batch_dims = list(real.shape[:depth])
-    result = _ORIG_RESHAPE(real, batch_dims + list(shape))
+    result = orig(real, batch_dims + list(shape))
     return _rewrap_like(a, result)
 
 
@@ -616,16 +668,24 @@ def _apply_unsqueeze(a, dim):
     return _rewrap_like(a, result)
 
 
-def _apply_broadcast(a, shape, dims=None):
+def _apply_broadcast(a, shape, dims=None, orig=None):
+    # Same `orig`-parametrized sharing as _apply_reshape (jittor-core-gaps.md
+    # §3.4): `jt.Var.broadcast is jt.Var.broadcast_var` is False (confirmed)
+    # -- these were being silently aliased to the same original the same way
+    # view/reshape were, one call away from the same class of bug (not
+    # confirmed to have broken anything concretely yet, fixed alongside the
+    # confirmed view/reshape break out of the same caution).
+    if orig is None:
+        orig = _ORIG_BROADCAST
     if not isinstance(a, BatchedVar):
-        return _ORIG_BROADCAST(a, shape, dims) if dims is not None else _ORIG_BROADCAST(a, shape)
+        return orig(a, shape, dims) if dims is not None else orig(a, shape)
     depth = a._nesting_depth()
     real = a._physical()
     batch_dims = list(real.shape[:depth])
     new_shape = batch_dims + list(shape)
     new_dims = [i for i in range(depth)] if dims is None else \
         list(range(depth)) + [depth + (d if d >= 0 else d + len(shape)) for d in dims]
-    result = _ORIG_BROADCAST(real, new_shape, new_dims)
+    result = orig(real, new_shape, new_dims)
     return _rewrap_like(a, result)
 
 
@@ -850,6 +910,8 @@ _ORIG_MATMUL = _ORIG_EINSUM = None
 _ORIG_GETITEM = _ORIG_SETITEM = None
 _ORIG_GRAD = None
 _ORIG_RANDOM = None
+_ORIG_CUMSUM = None
+_ORIG_NUMPY_CODE = None
 _PATCHED = False
 
 
@@ -933,6 +995,7 @@ def install_batching_patches():
     check). Called once, lazily, the first time jt.vmap() is used. '''
     global _PATCHED, _ORIG_RESHAPE, _ORIG_TRANSPOSE, _ORIG_UNSQUEEZE, _ORIG_BROADCAST
     global _ORIG_MATMUL, _ORIG_EINSUM, _ORIG_GETITEM, _ORIG_SETITEM, _ORIG_GRAD, _ORIG_RANDOM
+    global _ORIG_CUMSUM, _ORIG_NUMPY_CODE
     if _PATCHED:
         return
     _PATCHED = True
@@ -963,7 +1026,20 @@ def install_batching_patches():
             _install(jt.Var, rev, _make_binary_dunder_reverse(name, original))
 
     for name in _UNARY_NAMES:
-        orig = getattr(jt.Var, name, None) or getattr(jt, name, None)
+        # Prefer the free function, same reasoning as _BINARY_NAMES above:
+        # `jt.Var.sqrt` is a bound-method descriptor, and the non-batched
+        # fallback path below calls _ORIG_UNARY[name](a) with whatever `a`
+        # is -- for ops like adam_update's `jt.sqrt(1 - b1**step)`, `a` is a
+        # bare Python float (a bias-correction scalar, not a Var), and the
+        # descriptor form fails with "descriptor 'sqrt' for
+        # 'jittor_core.Var' objects doesn't apply to a 'float' object"
+        # instead of the correct promoted result. Latent until
+        # install_batching_patches() started running unconditionally at
+        # `import jittor` (jittor-core-gaps.md §3.4) instead of only after a
+        # process's first jt.vmap() call -- this exact call was already
+        # broken under vmap before, just never exercised by a plain Adam
+        # step until every process started installing the patches.
+        orig = getattr(jt, name, None) or getattr(jt.Var, name, None)
         if orig is None:
             continue
         _ORIG_UNARY[name] = orig
@@ -1011,10 +1087,13 @@ def install_batching_patches():
         _install(jt, name, make())
 
     _ORIG_RESHAPE = jt.Var.reshape
+    _ORIG_VIEW = jt.Var.view
     def _reshape(a, *shape):
         return _apply_reshape(a, _flatten_shape_args(shape))
+    def _view(a, *shape):
+        return _apply_reshape(a, _flatten_shape_args(shape), orig=_ORIG_VIEW)
     _install(jt.Var, "reshape", _reshape)
-    _install(jt.Var, "view", _reshape)
+    _install(jt.Var, "view", _view)
     _install(jt, "reshape", _reshape)
 
     _ORIG_TRANSPOSE = jt.Var.transpose
@@ -1034,10 +1113,13 @@ def install_batching_patches():
     _install(jt, "unsqueeze", _unsqueeze)
 
     _ORIG_BROADCAST = jt.Var.broadcast
+    _ORIG_BROADCAST_VAR = jt.Var.broadcast_var
     def _broadcast(a, shape, dims=None):
         return _apply_broadcast(a, shape, dims)
+    def _broadcast_var(a, shape, dims=None):
+        return _apply_broadcast(a, shape, dims, orig=_ORIG_BROADCAST_VAR)
     _install(jt.Var, "broadcast", _broadcast)
-    _install(jt.Var, "broadcast_var", _broadcast)
+    _install(jt.Var, "broadcast_var", _broadcast_var)
     _install(jt, "broadcast", _broadcast)
 
     _ORIG_MATMUL = jt.matmul
@@ -1056,6 +1138,16 @@ def install_batching_patches():
                 return _apply_linalg(orig, a, *args, **kwargs)
             return f
         _install(jt.linalg, name, make_linalg())
+
+    _ORIG_SOLVE = jt.linalg.solve
+    def _solve(a, b):
+        return _apply_solve(_ORIG_SOLVE, a, b)
+    _install(jt.linalg, "solve", _solve)
+
+    _ORIG_CUMSUM = jt.cumsum
+    def _cumsum(a, dim=None):
+        return _apply_cumsum(a, dim)
+    _install(jt, "cumsum", _cumsum)
 
     _ORIG_EINSUM = jt.linalg.einsum
     def _einsum(spec, *operands):
@@ -1091,6 +1183,29 @@ def install_batching_patches():
     _ORIG_SETITEM = jt.Var.__setitem__
     _install(jt.Var, "__getitem__", lambda a, index: _apply_getitem(a, index))
     _install(jt.Var, "__setitem__", lambda a, index, value: _apply_setitem(a, index, value))
+
+    # numpy_code wraps an arbitrary opaque Python/NumPy callback
+    # (jittor-core-gaps.md §3.4) -- there is no general batching rule for
+    # that: correctly vmapping it would mean invoking the callback once per
+    # batch element, which is exactly the per-sample Python loop vmap
+    # exists to avoid. Rather than let a raw BatchedVar cross the pybind
+    # boundary and fail with a low-level type error from inside the
+    # binding layer, fail loud and clear at the Python entry point instead.
+    _ORIG_NUMPY_CODE = jt.numpy_code
+    def _numpy_code(*args, **kwargs):
+        flat = list(args) + list(kwargs.values())
+        for a in flat:
+            if isinstance(a, BatchedVar) or (
+                    isinstance(a, (list, tuple)) and any(isinstance(x, BatchedVar) for x in a)):
+                raise NotImplementedError(
+                    "vmap: no batching rule for numpy_code -- it wraps an "
+                    "arbitrary callback, which cannot be vmapped without "
+                    "invoking it once per batch element. Avoid calling "
+                    "numpy_code (directly, or via an op built on it, e.g. "
+                    "solve/svd/qr/eigh with an argument shape those don't "
+                    "already batch) inside a vmapped function.")
+        return _ORIG_NUMPY_CODE(*args, **kwargs)
+    _install(jt, "numpy_code", _numpy_code)
 
     # BatchedVar is not a jt.Var, so it needs its own copies of the operator
     # dunders (patching jt.Var alone doesn't make `batched + 1` work, since

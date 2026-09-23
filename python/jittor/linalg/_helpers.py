@@ -76,7 +76,11 @@ def _native_to_cn(z):
 
 
 def _cn_to_native(cn):
-    # nn.ComplexNumber  ->  native complex64 [...]  (differentiable, via P1 bridge)
-    # cn.value is the float32 [..., 2] stack; _real2_to_complex64 rebuilds complex64.
-    from ..nn.functional.complex import _real2_to_complex64
-    return _real2_to_complex64(cn.value)
+    # nn.ComplexNumber  ->  native complex64/complex128 [...]  (differentiable,
+    # via P1 bridge). cn.value is a float32-or-float64 [..., 2] stack;
+    # _real2_to_complex rebuilds whichever native complex width matches --
+    # NOT the width-fixed _real2_to_complex64, which would silently downcast
+    # a complex128 result (e.g. from svd()/qr() on a native complex128 input)
+    # back to complex64 on the way out of this bridge.
+    from ..nn.functional.complex import _real2_to_complex
+    return _real2_to_complex(cn.value)

@@ -10,12 +10,24 @@ from ..base import (
 )
 
 def sgd_update(param, grad, velocity, *, lr, momentum=0, weight_decay=0,
-               dampening=0, nesterov=False):
-    """Native SGD arithmetic shared by full parameters and FSDP shards."""
+               dampening=0, nesterov=False, step=1):
+    """Native SGD arithmetic shared by full parameters and FSDP shards.
+
+    ``step`` is the 1-based optimizer step this call represents (matching
+    ``adam_update``'s own ``step`` convention). Dampening is a PyTorch
+    "dampening for momentum" knob -- meaningless without momentum, so it
+    must not scale the update when momentum is off. And momentum's buffer
+    is *seeded* from the raw gradient on its first real touch, not folded
+    into the zero-initialized buffer via the dampened recurrence: that
+    recurrence is only correct from the second update onward.
+    """
     dp = grad if weight_decay == 0 else param * weight_decay + grad
-    if momentum == 0 and dampening == 0 and not nesterov:
+    if momentum == 0 and not nesterov:
         return param - dp * lr
-    _update_preserve_dtype(velocity, momentum * velocity + dp * (1 - dampening))
+    if step <= 1:
+        _update_preserve_dtype(velocity, dp)
+    else:
+        _update_preserve_dtype(velocity, momentum * velocity + dp * (1 - dampening))
     return param - (dp + momentum * velocity if nesterov else velocity) * lr
 
 
@@ -35,7 +47,7 @@ def _momentum_buffer(param):
     return _state_buffer(param).contiguous().stop_grad()
 
 
-def _acl_fused_sgd_updates(entries, lr, momentum, weight_decay, dampening, nesterov):
+def _acl_fused_sgd_updates(entries, lr, momentum, weight_decay, dampening, nesterov, step=1):
     """One op for the whole parameter list.
 
     The portable update is five elementwise passes per parameter, and on ACL
@@ -49,7 +61,7 @@ def _acl_fused_sgd_updates(entries, lr, momentum, weight_decay, dampening, neste
     velocities = [entry[2] for entry in entries]
     new_parameters, new_velocities = fused_sgd_acl(
         parameters, velocities, gradients, lr, momentum, weight_decay,
-        dampening, nesterov)
+        dampening, nesterov, step)
     return list(zip(new_parameters, new_velocities))
 
 
@@ -103,6 +115,14 @@ class SGD(Optimizer):
         self.pre_step(loss, retain_graph=retain_graph)
         jt.flags.node_order = 1
         for pg in self.param_groups:
+            # Counts optimizer steps (not backward calls), like Adam's own
+            # bias-correction counter (Optimizer._advance_step_count) -- SGD
+            # needs it too now, to know whether this call is the momentum
+            # buffer's first real touch (seed from the raw gradient) or a
+            # later one (the dampened recurrence). Persists through
+            # state_dict/load_state_dict, so a resumed checkpoint does not
+            # get treated as step 1 again.
+            n = self._advance_step_count(pg)
             # get arguments from each param_groups
             lr = pg.get("lr", self.lr)
             momentum = pg.get("momentum", self.momentum)
@@ -116,10 +136,7 @@ class SGD(Optimizer):
             # lr. Keeping it costs a full write and read of every parameter, and
             # this is the default configuration -- on a ViT training step the
             # fused update kernel was 17% of the whole step, against 6% for the
-            # same update in PyTorch. `dampening` still scales the update here
-            # even at momentum 0 (unlike torch, where it only applies inside the
-            # momentum branch), so the shortcut is limited to dampening 0 rather
-            # than quietly changing that. `v` is then left at whatever it held;
+            # same update in PyTorch. `v` is then left at whatever it held;
             # turning momentum on later resumes from zeros, which is what this
             # optimizer has always started from.
             active = [(p, g, v) for p, g, v in zip(pg["params"], pg["grads"], pg["values"])
@@ -154,7 +171,7 @@ class SGD(Optimizer):
                     [var for item in active for var in item
                      if isinstance(var, jt.Var)])
             if fused is not None:
-                updates = fused(active, lr, momentum, weight_decay, dampening, nesterov)
+                updates = fused(active, lr, momentum, weight_decay, dampening, nesterov, n)
                 for (p, _, v), (new_p, new_v) in zip(active, updates):
                     # Without momentum the velocity buffer holds nothing the
                     # step needs, and a kernel that keeps it updates it in
@@ -168,5 +185,5 @@ class SGD(Optimizer):
                 # `p * 0 + g` is a whole extra pass over the parameter.
                 _update_preserve_dtype(p, sgd_update(
                     p, g, v, lr=lr, momentum=momentum, weight_decay=weight_decay,
-                    dampening=dampening, nesterov=nesterov))
+                    dampening=dampening, nesterov=nesterov, step=n))
         self.post_step()

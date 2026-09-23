@@ -109,7 +109,14 @@ struct DataView {
 PyObject* new_var_data_owner(VarHolder* vh);
 
 struct ItemData {
-    int64 data;
+    // Widened from a flat int64 (8 bytes) to fit complex128 (16 bytes)
+    // without the memcpy in VarHolder::item() overflowing into `dtype`.
+    // `data` keeps its old name/type for every existing 8-byte-or-narrower
+    // dtype's read sites; `bytes` is only for the complex128 (16-byte) path.
+    union {
+        int64 data;
+        char bytes[16];
+    };
     NanoString dtype;
 };
 

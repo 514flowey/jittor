@@ -7,10 +7,10 @@ namespace jittor {
 FusedSgdOp::FusedSgdOp(
     vector<Var*>&& parameters, vector<Var*>&& velocities, vector<Var*>&& gradients,
     float64 lr, float64 momentum, float64 weight_decay, float64 dampening,
-    bool nesterov, bool maximize)
+    bool nesterov, bool maximize, bool first_step)
     : parameters(parameters), velocities(velocities), gradients(gradients),
       lr(lr), momentum(momentum), weight_decay(weight_decay), dampening(dampening),
-      nesterov(nesterov), maximize(maximize) {
+      nesterov(nesterov), maximize(maximize), first_step(first_step) {
     USER_CHECKop(parameters.size(),>,0);
     USER_CHECKop(parameters.size(),==,velocities.size());
     USER_CHECKop(parameters.size(),==,gradients.size());

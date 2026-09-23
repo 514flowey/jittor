@@ -40,6 +40,11 @@ class TestSharedOptimizerMath(unittest.TestCase):
         import jittor as jt
         from jittor.optim.algorithms.sgd import sgd_update
 
+        # v starts nonzero (0.2, 0.4): this deliberately exercises the
+        # RECURRENCE path (a buffer that already holds real running
+        # momentum), so step=2 (not the buffer's first touch) -- see
+        # jittor-core-gaps.md §3.3, which is why `step` is now required for
+        # correctness rather than merely accepted.
         for momentum, dampening, nesterov in ((0, 0, False), (0.9, 0.1, False), (0.9, 0, True)):
             p = np.array([1, -2], dtype=np.float32)
             g = np.array([0.1, -0.3], dtype=np.float32)
@@ -50,8 +55,29 @@ class TestSharedOptimizerMath(unittest.TestCase):
             value = jt.array(v).stop_grad()
             result = sgd_update(jt.array(p), jt.array(g), value, lr=0.02,
                                 momentum=momentum, dampening=dampening,
-                                nesterov=nesterov, weight_decay=0.05)
+                                nesterov=nesterov, weight_decay=0.05, step=2)
             np.testing.assert_allclose(result.numpy(), p - 0.02 * update, rtol=2e-6, atol=2e-7)
+
+    def test_sgd_momentum_first_touch_seeds_from_raw_gradient(self):
+        # Companion to the recurrence case above: step=1 (the buffer's first
+        # touch) must seed v from the raw (undampened) dp, ignoring whatever
+        # the caller passed as the existing buffer value entirely.
+        import jittor as jt
+        from jittor.optim.algorithms.sgd import sgd_update
+
+        p = np.array([1, -2], dtype=np.float32)
+        g = np.array([0.1, -0.3], dtype=np.float32)
+        v = np.array([0.2, 0.4], dtype=np.float32)  # must be ignored on first touch
+        momentum, dampening = 0.9, 0.5
+        direction = g + 0.05 * p
+        new_v = direction  # undampened first touch
+        update = new_v
+        value = jt.array(v).stop_grad()
+        result = sgd_update(jt.array(p), jt.array(g), value, lr=0.02,
+                            momentum=momentum, dampening=dampening,
+                            nesterov=False, weight_decay=0.05, step=1)
+        np.testing.assert_allclose(result.numpy(), p - 0.02 * update, rtol=2e-6, atol=2e-7)
+        np.testing.assert_allclose(value.numpy(), new_v, rtol=2e-6, atol=2e-7)
 
 
 if __name__ == "__main__":

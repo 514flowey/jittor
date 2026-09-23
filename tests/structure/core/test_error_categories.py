@@ -95,8 +95,15 @@ MIGRATED_BROADCAST_SHAPE_BOUNDARIES = {
 # caller handed in. The two `CHECK`s further down (`x->num >= 0`,
 # `ydsize > 0`) stay internal: they restate what `is_dtype()` and the Var
 # invariants already guarantee.
+#
+# 2026-09-22: 8 -> 10. Native complex128 dtype support (KI-COMPLEX-001)
+# extended `infer_shape`'s two complex<->real pairing checks
+# (`complex64 -> float32 requires [..., 2]` / vice versa) with the same
+# checks for `complex128 <-> float64` -- two more user-facing shape
+# boundaries on the same caller-supplied `(x, shape, dtype)` triple, not
+# internal invariants.
 MIGRATED_REINTERPRET_VIEW_BOUNDARIES = {
-    "src/ops/composite/reinterpret_view_op.cc": 8,
+    "src/ops/composite/reinterpret_view_op.cc": 10,
 }
 
 # 2026-09-11: 1 -> 3. Besides the shape check this entry was named for,
