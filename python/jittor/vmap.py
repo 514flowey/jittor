@@ -697,13 +697,19 @@ def _apply_broadcast(a, shape, dims=None, orig=None):
     # Same `orig`-parametrized sharing as _apply_reshape (jittor-core-gaps.md
     # §3.4): `jt.Var.broadcast is jt.Var.broadcast_var` is False (confirmed)
     # -- these were being silently aliased to the same original the same way
-    # view/reshape were, one call away from the same class of bug (not
-    # confirmed to have broken anything concretely yet, fixed alongside the
-    # confirmed view/reshape break out of the same caution).
+    # view/reshape were, one call away from the same class of bug. That
+    # distinction only matters for the true pass-through below: once `shape`
+    # has been reduced from a BatchedVar to its logical shape, or once `a`
+    # is itself batched, this is inherently shape-based broadcasting for
+    # vmap's own bookkeeping and must go through the shape-taking
+    # `_ORIG_BROADCAST` -- native `broadcast_var` (`broadcast_to_`) wants an
+    # actual Var to broadcast against, not a NanoVector, and cannot serve a
+    # shape that's already been reduced to one.
     if orig is None:
         orig = _ORIG_BROADCAST
     if isinstance(shape, BatchedVar):
         shape = shape.shape
+        orig = _ORIG_BROADCAST
     if not isinstance(a, BatchedVar):
         return orig(a, shape, dims) if dims is not None else orig(a, shape)
     shape = list(shape.shape if isinstance(shape, jt.Var) else shape)
@@ -723,9 +729,12 @@ def _apply_broadcast(a, shape, dims=None, orig=None):
     real = a._physical()
     batch_dims = list(real.shape[:depth])
     new_shape = batch_dims + [1] * (rank - len(shape)) + shape
-    # dims denotes newly inserted axes, not existing axes to preserve.
+    # dims denotes newly inserted axes, not existing axes to preserve. The
+    # target has already been reduced to a concrete shape by this point
+    # regardless of which alias was called, so this final native call is
+    # always shape-based.
     new_dims = [depth + d for d in sorted(inserted)]
-    result = orig(real, new_shape, new_dims)
+    result = _ORIG_BROADCAST(real, new_shape, new_dims)
     return _rewrap_like(a, result)
 
 
