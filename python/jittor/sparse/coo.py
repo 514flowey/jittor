@@ -61,10 +61,29 @@ class SparseVar:
             and isinstance(shape, jt.NanoVector)
         ):
             raise TypeError("SparseVar requires Var indices/values and a NanoVector shape")
+        if indices.ndim != 2 or indices.shape[0] != len(shape):
+            raise ValueError(
+                f"indices must be shape (ndim={len(shape)}, nnz), "
+                f"got {tuple(indices.shape)}")
+        if values.ndim == 0 or values.shape[0] != indices.shape[1]:
+            raise ValueError("values must have a leading nnz dimension matching indices")
+        if "int" not in str(indices.dtype):
+            raise TypeError("indices must be an integer dtype")
         self.indices = indices
         self.values = values
         self.shape = shape
         self.ndim = len(shape)
+
+    @property
+    def nnz(self):
+        return self.indices.shape[1]
+
+    @property
+    def dtype(self):
+        return self.values.dtype
+
+    def is_sparse(self):
+        return True
         
     def _indices(self):
         return self.indices

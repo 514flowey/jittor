@@ -410,8 +410,10 @@ inline  NanoString dtype_infer(NanoString x, NanoString y, bool xscalar=false, b
     if (x.is_complex() || y.is_complex()) return complex_promote(x, y);  // complex propagates
     if (x.is_bool() && y.is_bool()) return ns_bool;
     int dsize_ = std::max(x.dsize_(), y.dsize_());
-    if (xscalar) dsize_ = y.dsize_();
-    if (yscalar) dsize_ = x.dsize_();
+    // A lone scalar adopts the tensor width. Two scalars must retain the
+    // widest width, rather than letting operand order choose the result.
+    if (xscalar && !yscalar) dsize_ = y.dsize_();
+    if (yscalar && !xscalar) dsize_ = x.dsize_();
     bool is_float = x.is_float() || y.is_float();
     bool has_bf16 = x==ns_bfloat16 || y==ns_bfloat16;
     if (is_float) {
@@ -427,8 +429,10 @@ inline NanoString binary_dtype_infer(NanoString op, NanoString x, NanoString y, 
     if (op.is_bool()) return ns_bool;   // comparisons -> bool even for complex
     if (x.is_complex() || y.is_complex()) return complex_promote(x, y);  // complex arithmetic
     int dsize_ = std::max(x.dsize_(), y.dsize_());
-    if (xscalar) dsize_ = y.dsize_();
-    if (yscalar) dsize_ = x.dsize_();
+    // A reduction to rank 0 also carries _is_scalar. For 3 * sum(float64),
+    // both flags are set; neither operand is a tensor whose width should win.
+    if (xscalar && !yscalar) dsize_ = y.dsize_();
+    if (yscalar && !xscalar) dsize_ = x.dsize_();
     bool is_float = !op.is_int() && 
         (x.is_float() || y.is_float() || op.is_float());
     bool has_bf16 = x==ns_bfloat16 || y==ns_bfloat16;
