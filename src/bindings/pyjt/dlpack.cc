@@ -128,6 +128,7 @@ static NanoString dltype_to_ns(DLDataType dt) {
             break;
         case kDLComplex:
             if (dt.bits == 64) return ns_complex64;
+            if (dt.bits == 128) return ns_complex128;
             break;
     }
     LOGf << "dlpack: unsupported DLDataType(code=" << (int)dt.code
