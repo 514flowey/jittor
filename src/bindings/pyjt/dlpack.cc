@@ -25,11 +25,12 @@
 //    exactly once" enforcement (rename "dltensor"->"used_dltensor" on
 //    import; a capsule destructor fires the same deleter exactly once if
 //    the capsule is garbage-collected without ever being imported).
-//  - Contiguity: Jittor's Var/Allocation have no stride concept at all (only
-//    ever row-major contiguous) -- so a non-contiguous producer (e.g. a
-//    transposed/permuted/step-sliced PyTorch tensor) can never be aliased
-//    zero-copy. It IS, however, real, first-class supported by materializing
-//    a correctly-valued contiguous copy: dlpack_peek() lets from_dlpack()'s
+//  - Contiguity: Vars can carry storage strides, but this DLPack boundary
+//    exports only row-major contiguous storage. Non-contiguous export is
+//    rejected before either aliasing or copy=True's dense memcpy; callers
+//    must explicitly materialize with .contiguous(). Importing a strided
+//    producer still materializes a contiguous copy rather than aliasing its
+//    layout: dlpack_peek() lets from_dlpack()'s
 //    Python wrapper read the producer's shape/strides without consuming the
 //    capsule, decide it is non-contiguous, compute the minimal flat element
 //    span the strides can reach, import THAT span as a genuinely contiguous
@@ -128,6 +129,7 @@ static NanoString dltype_to_ns(DLDataType dt) {
             break;
         case kDLComplex:
             if (dt.bits == 64) return ns_complex64;
+            if (dt.bits == 128) return ns_complex128;
             break;
     }
     LOGf << "dlpack: unsupported DLDataType(code=" << (int)dt.code
@@ -259,6 +261,8 @@ static ResolvedExport resolve_export(VarHolder* v, bool force_copy) {
     v->sync(true, false);
     Var* var = v->var;
     ASSERT(var->mem_ptr || var->num == 0) << "dlpack: exporting an unmaterialized Var";
+    USER_CHECK(var->is_contiguous())
+        << "dlpack: non-contiguous storage cannot be exported; call .contiguous() explicitly first";
 
     DLDevice dev = var_to_dldevice(v);
     DLDataType dtype = ns_to_dltype(var->dtype());
@@ -285,7 +289,7 @@ static void fill_dl_tensor(DLTensor& t, const ResolvedExport& r) {
     t.ndim = (int32_t)r.ctx->shape.size();
     t.dtype = r.dtype;
     t.shape = r.ctx->shape.empty() ? nullptr : r.ctx->shape.data();
-    t.strides = nullptr;   // Jittor Vars are always row-major contiguous
+    t.strides = nullptr;   // resolve_export() requires row-major contiguous storage.
     t.byte_offset = 0;
 }
 
