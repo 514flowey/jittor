@@ -708,6 +708,13 @@ def _skip_reason(report):
 def _is_accelerator_case(report):
     """Recognize a test whose nodeid names an accelerator path or backend."""
     nodeid = str(getattr(report, "nodeid", "")).lower()
+    # Backend-parametrized tests can live outside tests/backends/cuda and
+    # carry IDs such as [cuda-float64] or [float64-cuda], not "_cuda".
+    # Match whole parameter labels, not unrelated words containing "cuda".
+    if "[" in nodeid and nodeid.endswith("]"):
+        parameters = nodeid.rsplit("[", 1)[1][:-1].split("-")
+        if any(backend in parameters for backend in ("cuda", "rocm", "npu")):
+            return True
     return any(
         token in nodeid
         for token in (

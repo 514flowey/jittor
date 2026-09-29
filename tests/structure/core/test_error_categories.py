@@ -437,6 +437,16 @@ def test_public_dimension_boundary_migration_is_explicit_and_bounded():
             actual = source.count('USER_CHECK(dim>=0 && dim<ydim)')
         else:
             actual = source.count("USER_CHECK(") + source.count("USER_CHECKop(")
+        if relative == "src/ops/composite/argsort_op.cc":
+            # Stable-sort backend support is not a dimension boundary. Pin
+            # that guard separately instead of enlarging the dimension ledger.
+            backend_guard = (
+                "USER_CHECK(!stable || backend == BackendId::Cpu || "
+                "backend == BackendId::Cuda)"
+            )
+            assert source.count(backend_guard) == 1
+            assert "stable argsort is only supported on CPU and CUDA" in source
+            actual -= 1
         counts[relative] = actual
     # Report every disagreement, not just the first. Three entries went stale
     # behind one that failed earlier in iteration order and stayed invisible

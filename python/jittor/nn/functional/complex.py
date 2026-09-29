@@ -119,9 +119,8 @@ def _real2_to_complex64(x):
 # *or* float64 pair <-> complex128, picking the target/expected width from
 # whichever side is already concrete (the component dtype on the way in,
 # the complex dtype on the way out). `_real2_to_complex64`/`_complex64_to_real2`
-# stay float32-only above -- the legacy `nn.ComplexNumber` bridge
-# (`linalg/_helpers.py::_cn_to_native`) always carries float32 components by
-# construction and is unaffected by complex128 landing.
+# stay float32-only above; the public view and linalg bridges use the
+# width-generic helpers below to preserve float64 components as complex128.
 _COMPLEX_REAL_DTYPE = {"complex64": "float32", "complex128": "float64"}
 _REAL_COMPLEX_DTYPE = {"float32": "complex64", "float64": "complex128"}
 
@@ -161,11 +160,11 @@ def _real2_to_complex_raw(x):
     complex_dtype = _REAL_COMPLEX_DTYPE[real_name]
     reinterpret_view = getattr(jt, "reinterpret_view", None)
     if reinterpret_view is not None:
-        return reinterpret_view(x, list(x.shape[:-1]) or [1], complex_dtype)
+        return reinterpret_view(x, list(x.shape[:-1]), complex_dtype)
     n = 1
     for s in x.shape[:-1]:
         n *= s
-    out_shape = list(x.shape[:-1]) or [1]
+    out_shape = list(x.shape[:-1])
     if complex_dtype == "complex64":
         cpu_src = """
         for (int i=0; i<in0_shape0; i++) {
@@ -187,7 +186,8 @@ class _ComplexToReal2(jt.Function):
         return _complex_to_real2_raw(z)
 
     def grad(self, g):  # adjoint of view_as_real is view_as_complex
-        return _real2_to_complex_raw(g)
+        # Preserve the AD chain even when execute uses the opaque code fallback.
+        return None if g is None else _real2_to_complex(g)
 
 
 class _Real2ToComplex(jt.Function):
@@ -195,7 +195,7 @@ class _Real2ToComplex(jt.Function):
         return _real2_to_complex_raw(x)
 
     def grad(self, g):  # adjoint of view_as_complex is view_as_real
-        return _complex_to_real2_raw(g)
+        return None if g is None else _complex_to_real2(g)
 
 
 def _complex_to_real2(z):

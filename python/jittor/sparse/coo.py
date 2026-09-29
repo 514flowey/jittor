@@ -39,10 +39,12 @@ class _CoalesceCOO(jt.Function):
         np.add.at(merged, inverse, values_np)
         new_row = uniq_key // N
         new_col = uniq_key % N
-        self.inverse = jt.array(inverse)
-        return (jt.array(new_row).cast(row.dtype),
-                jt.array(new_col).cast(col.dtype),
-                jt.array(merged).cast(values.dtype))
+        # Specify dtype before construction: the default array conversion
+        # narrows float64/int64, and a later cast cannot recover lost bits.
+        self.inverse = jt.array(inverse, dtype="int64")
+        return (jt.array(new_row, dtype=row.dtype),
+                jt.array(new_col, dtype=col.dtype),
+                jt.array(merged, dtype=values.dtype))
 
     def grad(self, d_row, d_col, d_values):
         # each original (possibly-duplicate) entry receives the gradient of

@@ -813,7 +813,7 @@ def bitwise_xor(x: Var, y: Var)-> Var:
 
 	    * [in] y: the second input, jt.Var (integal or boolean).'''
 	...
-def argsort(x: Var, dim: _builtins.int=-1, descending: _builtins.bool=False, dtype: str="int32")-> Tuple[Var, ...]:
+def argsort(x: Var, dim: _builtins.int=-1, descending: _builtins.bool=False, dtype: str="int32", stable: _builtins.bool=False)-> Tuple[Var, ...]:
 	'''Document:
 	*
 	    Argsort Operator Perform an indirect sort by given key or compare function.
@@ -837,6 +837,9 @@ def argsort(x: Var, dim: _builtins.int=-1, descending: _builtins.bool=False, dty
 	    * [in] descending:  the elements are sorted in descending order or not(default False).
 
 	    * [in] dtype: type of return indexes
+
+	    * [in] stable: preserve the input order of equal keys (default False).
+	      CPU uses std::stable_sort; CUDA segmented radix sort is already stable.
 
 	    * [out] index: index have the same size with sorted dim
 
@@ -5120,7 +5123,7 @@ class Var:
 
 		    * [in] y: the second input, jt.Var (integal or boolean).'''
 		...
-	def argsort(self, dim: _builtins.int=-1, descending: _builtins.bool=False, dtype: str="int32")-> Tuple[Var, ...]:
+	def argsort(self, dim: _builtins.int=-1, descending: _builtins.bool=False, dtype: str="int32", stable: _builtins.bool=False)-> Tuple[Var, ...]:
 		'''Document:
 		*
 		    Argsort Operator Perform an indirect sort by given key or compare function.
@@ -5144,6 +5147,9 @@ class Var:
 		    * [in] descending:  the elements are sorted in descending order or not(default False).
 
 		    * [in] dtype: type of return indexes
+
+		    * [in] stable: preserve the input order of equal keys (default False).
+		      CPU uses std::stable_sort; CUDA segmented radix sort is already stable.
 
 		    * [out] index: index have the same size with sorted dim
 

@@ -1,4 +1,4 @@
-"""COO metadata and construction checks must not require tensor execution."""
+"""COO construction, metadata, and sparse numerical contracts."""
 
 import numpy as np
 import pytest
@@ -113,3 +113,81 @@ def test_valid_coo_roundtrip_and_value_gradient_execute_on_device(device, index_
     np.testing.assert_array_equal(dense.numpy(), expected)
     np.testing.assert_array_equal(restored.numpy(), expected)
     np.testing.assert_array_equal(gradient.numpy(), np.ones(3, dtype=np.float32))
+
+
+def test_coalesce_preserves_float64_values_and_gradient(device):
+    indices = jt.array([[1, 0, 1], [2, 1, 2]], dtype="int64")
+    # These binary fractions are exact in float64 but disappear in float32.
+    source = np.array([1 + 2**-40, -3 + 2**-39, 2 + 2**-38], dtype=np.float64)
+    values = jt.array(source, dtype="float64")
+    sparse = make_coo(indices, values, [2, 3])
+    with jt.flag_scope(auto_convert_64_to_32=1):
+        result = sparse.coalesce()
+    weights_np = np.array([2 + 2**-42, -1 + 2**-41], dtype=np.float64)
+    weights = jt.array(weights_np, dtype="float64")
+    gradient = jt.grad((result._values() * weights).sum(), values)
+    assert result.nnz == 2
+    assert str(result.dtype) == "float64"
+    assert str(result._indices().dtype) == "int64"
+    assert str(gradient.dtype) == "float64"
+    # Coalesce still computes on the host. This checks output placement, not
+    # a claim that the deduplication itself has become a device-side kernel.
+    for tensor in (result._indices(), result._values(), gradient):
+        tensor.sync()
+        assert tensor.location() == ("device" if device == "cuda" else "cpu")
+    np.testing.assert_array_equal(result._indices().numpy(), [[0, 1], [1, 2]])
+    np.testing.assert_array_equal(
+        result._values().numpy(), np.array([source[1], source[0] + source[2]])
+    )
+    np.testing.assert_array_equal(gradient.numpy(), weights_np[[1, 0, 1]])
+
+
+def test_coalesce_preserves_int64_values(device):
+    indices = jt.array([[1, 0, 1], [2, 1, 2]], dtype="int64")
+    source = np.array([2**40 + 3, -(2**40) + 7, 2**40 + 5], dtype=np.int64)
+    values = jt.array(source, dtype="int64")
+    sparse = make_coo(indices, values, [2, 3])
+    with jt.flag_scope(auto_convert_64_to_32=1):
+        result = sparse.coalesce()
+    assert result.nnz == 2
+    assert str(result.dtype) == "int64"
+    result._values().sync()
+    assert result._values().location() == ("device" if device == "cuda" else "cpu")
+    np.testing.assert_array_equal(
+        result._values().numpy(), np.array([source[1], source[0] + source[2]])
+    )
+
+
+@pytest.mark.parametrize("large_axis", [0, 1], ids=["large_row", "large_column"])
+def test_coalesce_preserves_large_int64_coordinates_without_densifying(
+    device, monkeypatch, large_axis
+):
+    large = 2**31 + 17
+    if large_axis == 0:
+        coordinates = [[large, 1, large], [2, 0, 2]]
+        shape = [large + 2, 3]
+        expected = [[1, large], [0, 2]]
+    else:
+        coordinates = [[2, 0, 2], [large, 1, large]]
+        shape = [3, large + 2]
+        expected = [[0, 2], [1, large]]
+    indices = jt.array(coordinates, dtype="int64")
+    values = jt.array([1.25, 2.0, 3.75], dtype="float64")
+    sparse = make_coo(indices, values, shape)
+
+    def forbidden_dense(_self):
+        raise AssertionError("large sparse coordinates must never be densified")
+
+    monkeypatch.setattr(jt.sparse.SparseVar, "to_dense", forbidden_dense)
+    # Only three valid nonzeros are allocated; even row * ncols + col fits
+    # int64. Do not convert this large logical shape to CSR or a dense tensor.
+    with jt.flag_scope(auto_convert_64_to_32=1):
+        result = sparse.coalesce()
+    assert tuple(result.shape) == tuple(shape)
+    assert result.nnz == 2
+    assert str(result._indices().dtype) == "int64"
+    for tensor in (result._indices(), result._values()):
+        tensor.sync()
+        assert tensor.location() == ("device" if device == "cuda" else "cpu")
+    np.testing.assert_array_equal(result._indices().numpy(), expected)
+    np.testing.assert_array_equal(result._values().numpy(), [2.0, 5.0])

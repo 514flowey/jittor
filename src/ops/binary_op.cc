@@ -452,6 +452,22 @@ BinaryOp::BinaryOp(Var* x, Var* y, NanoString op) : x(x), y(y) {
         return;
     }
 
+    // Complex C++ operators are width-specific. Promoting only the output
+    // leaves c64*f64 computing in c64 (and c64+c128 cannot compile at all).
+    // Cast operands through the differentiable unary path before arithmetic.
+    // Use add's promotion for comparisons too: their output dtype is bool,
+    // but their operands must still be compared at the common complex width.
+    if (x->dtype() != y->dtype() &&
+        (x->dtype().is_complex() || y->dtype().is_complex())) {
+        auto dtype = binary_dtype_infer(ns_add, x->ns, y->ns,
+            x->flag(VarFlags::_is_scalar), y->flag(VarFlags::_is_scalar));
+        auto xp = make_unary(x, dtype);
+        auto yp = make_unary(y, dtype);
+        auto zp = make_binary(xp, yp, op);
+        forward(zp);
+        return;
+    }
+
     #ifdef IS_ACL
     if (x->dtype() != y->dtype()) {
         auto dtype = binary_dtype_infer(ns_add, x->ns, y->ns, 0, 0);
@@ -615,7 +631,7 @@ VarPtr BinaryOp::grad(Var* out, Var* dout, Var* v, int v_index) {
             return dout;
         else {
             auto a = make_unary(make_binary(x, y, ns_divide), ns_floor);
-            return make_unary(a, ns_negative);
+            return make_binary(dout, make_unary(a, ns_negative), ns_multiply);
         }
     }
     if (ns == ns_maximum || ns == ns_minimum) {

@@ -28,13 +28,15 @@ static auto make_binary = op_constructor<VarPtr, Var*, Var*, NanoString>("binary
 static auto make_transpose = op_constructor<VarPtr, Var*, NanoVector>("transpose");
 #endif
 
-ArgsortOp::ArgsortOp(Var* x, int dim, bool descending, NanoString dtype)
-    : x(x), dim(dim), descending(descending) {
+ArgsortOp::ArgsortOp(Var* x, int dim, bool descending, NanoString dtype, bool stable)
+    : x(x), dim(dim), descending(descending), stable(stable) {
     if  (this->dim == -1)
         this->dim = x->shape.size() - 1;
     dim = this->dim;
     #ifdef HAS_ACCELERATOR
     const auto backend = construction_target_backend(x);
+    USER_CHECK(!stable || backend == BackendId::Cpu || backend == BackendId::Cuda)
+        << "stable argsort is only supported on CPU and CUDA";
     if (backend != BackendId::Cpu) {
         if (has_op_capability(backend, OpCapability::SegmentedArgsort)) {
             int dims = x->shape.size();
@@ -135,6 +137,7 @@ void ArgsortOp::jit_prepare(JK& jk) {
     jk << "«XDIM=" << JK::hex1(x->shape.size());
     jk << "«DIM=" << JK::hex1(dim);
     jk << "«CMP:" << (descending ? '>' : '<');
+    jk << "«STABLE:" << (stable ? '1' : '0');
 }
 
 #else // JIT
@@ -160,7 +163,7 @@ void ArgsortOp::jit_run() {
             tempx[i@DIM] = xp[xid];
             tempy[i@DIM] = i@DIM;
         }
-        std::sort(tempy.begin(), tempy.end(), [&](Ty i, Ty j) -> bool { return tempx[i]@CMP@@tempx[j]; });
+        @if(STABLE,std::stable_sort,std::sort)(tempy.begin(), tempy.end(), [&](Ty i, Ty j) -> bool { return tempx[i]@CMP@@tempx[j]; });
 
         for (index_t i@DIM=0; i@DIM < xshape@DIM; i@DIM++){
             auto xid = @for(d, 0, XDIM, + i@d * xstride@d);

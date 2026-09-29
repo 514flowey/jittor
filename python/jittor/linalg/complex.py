@@ -297,8 +297,8 @@ def complex_svd(x:ComplexNumber):
     v's shape (...,K,N)
     where K is min(M,N).
     First-order backward supports distinct, nonzero singular values and
-    separately phase-invariant singular-vector losses. Joint U/V phase
-    coupling and higher-order callback derivatives are not supported yet.
+    phase-invariant losses, including joint U/V reconstruction losses.
+    Higher-order callback derivatives are not supported yet.
     :param x:
     :return:u,s,v.
     '''
