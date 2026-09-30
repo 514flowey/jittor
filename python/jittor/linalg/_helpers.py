@@ -13,6 +13,36 @@ from jittor._core.dtypes import dtype_name as _jittor_dtype_name
 import numpy as np
 
 
+def _is_batched(value):
+    # vmap's BatchedVar, recognised without importing jittor.vmap on the hot
+    # path (and without touching BatchedVar.__getattr__, which raises for
+    # unknown names).
+    return type(value).__name__ == "BatchedVar" and type(value).__module__ == "jittor.vmap"
+
+
+def _batching_aware(rule):
+    """Route a BatchedVar argument to vmap's rule for this function.
+
+    vmap installs its batching patches on first use, so a reference saved
+    before that (``solve = jt.linalg.solve``) used to call the plain function
+    with BatchedVar arguments. The check lives in the function itself; the
+    rule receives the undecorated function as its base case.
+    """
+    import functools
+
+    def decorate(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            if any(_is_batched(arg) for arg in args):
+                # The submodule, not the `jittor.vmap` function attribute.
+                from jittor.vmap import dispatch_linalg
+                return dispatch_linalg(rule, fn, *args, **kwargs)
+            return fn(*args, **kwargs)
+        wrapper.__wrapped_linalg__ = fn
+        return wrapper
+    return decorate
+
+
 def _reconnect(cached, live):
     """Give a stop-grad'd numpy_code result a real, higher-order-differentiable
     gradient path, without changing its value.
@@ -35,6 +65,30 @@ def _reconnect(cached, live):
     standard "stop-gradient trick".
     """
     return cached + (live - live.detach())
+
+
+def _conj_T(v):
+    """Conjugate transpose of the last two axes of a Var (a plain transpose
+    for real dtypes)."""
+    return v.transpose(-1, -2).conj()
+
+
+def _eye_like(ref, k):
+    """A (k, k) identity Var in `ref`'s (real) dtype, broadcastable over batches."""
+    import jittor as jt
+    return jt.array(np.eye(k), dtype=_jittor_dtype_name(ref.dtype))
+
+
+def _diag_of(m):
+    """The diagonal of the last two axes of a square Var, differentiably."""
+    k = m.shape[-1]
+    return (m * _eye_like(m.real if "complex" in _jittor_dtype_name(m.dtype) else m, k)).sum(-1)
+
+
+def _diag_embed(vec, k):
+    """(..., k) -> (..., k, k) with `vec` on the diagonal, differentiably."""
+    real = vec.real if "complex" in _jittor_dtype_name(vec.dtype) else vec
+    return vec.unsqueeze(-1) * _eye_like(real, k)
 
 
 def _transpose(x):

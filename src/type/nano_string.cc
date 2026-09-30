@@ -135,6 +135,7 @@ static unordered_set<string> binary_ops = {
     "divide",
     "floor_divide",
     "mod",
+    "fmod",
     "less",
     "less_equal",
     "greater",

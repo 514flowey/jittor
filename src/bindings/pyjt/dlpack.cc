@@ -389,8 +389,54 @@ PyObject* VarHolder::dlpack_device() {
 // import: DLManagedTensor capsule -> Var
 // ---------------------------------------------------------------------
 
+// Producer-supplied layout, validated with overflow-checked arithmetic
+// before anything reads the buffer or the capsule is consumed. `min_off`/
+// `max_off` are the element offsets (relative to data+byte_offset) of the
+// lowest and highest element the shape/strides can reach; both are 0 and
+// meaningless when numel==0.
+struct DLTensorSpan {
+    int64 numel = 1;
+    int64 min_off = 0;
+    int64 max_off = 0;
+};
+
+static DLTensorSpan validate_dl_tensor(const DLTensor& t, NanoString dtype) {
+    USER_CHECK(t.ndim >= 0 && t.ndim <= 10)
+        << "dlpack: ndim=" << t.ndim << " is out of range (Jittor supports 0..10 dims)";
+    USER_CHECK(t.ndim == 0 || t.shape != nullptr) << "dlpack: DLTensor.shape is null";
+    DLTensorSpan span;
+    for (int32_t i = 0; i < t.ndim; i++) {
+        USER_CHECK(t.shape[i] >= 0) << "dlpack: negative extent" << t.shape[i] << "on axis" << i;
+        USER_CHECK(!__builtin_mul_overflow(span.numel, (int64)t.shape[i], &span.numel))
+            << "dlpack: element count overflows int64";
+    }
+    int64 nbytes;
+    USER_CHECK(!__builtin_mul_overflow(span.numel, (int64)dtype.dsize(), &nbytes))
+        << "dlpack: byte size overflows int64";
+    USER_CHECK(t.byte_offset <= (uint64_t)INT64_MAX) << "dlpack: byte_offset overflows int64";
+    if (span.numel == 0) return span;
+    int64 contiguous_stride = 1;
+    for (int32_t i = t.ndim - 1; i >= 0; i--) {
+        int64 stride = t.strides ? t.strides[i] : contiguous_stride;
+        int64 extent;
+        USER_CHECK(!__builtin_mul_overflow(stride, (int64)t.shape[i] - 1, &extent))
+            << "dlpack: stride span overflows int64 on axis" << i;
+        USER_CHECK(!__builtin_add_overflow(extent < 0 ? span.min_off : span.max_off, extent,
+            extent < 0 ? &span.min_off : &span.max_off))
+            << "dlpack: stride span overflows int64 on axis" << i;
+        // Only reached for the implicit (null-strides) layout, and bounded by
+        // numel, which did not overflow above.
+        contiguous_stride *= t.shape[i];
+    }
+    return span;
+}
+
 static bool dl_tensor_is_contiguous(const DLTensor& t) {
     if (t.strides == nullptr) return true;
+    // An empty tensor has no bytes, so its strides constrain nothing (CuPy
+    // reports non-row-major strides for a (0,3) array).
+    for (int32_t i = 0; i < t.ndim; i++)
+        if (t.shape[i] == 0) return true;
     int64_t expect = 1;
     for (int32_t i = t.ndim - 1; i >= 0; i--) {
         if (t.shape[i] != 1 && t.strides[i] != expect)
@@ -446,6 +492,8 @@ static DLTensor* unwrap_capsule(PyObject* capsule, bool& versioned,
 PyObject* dlpack_peek(PyObject* capsule) {
     bool versioned; DLManagedTensor* managed; DLManagedTensorVersioned* managed_v;
     DLTensor& t = *unwrap_capsule(capsule, versioned, managed, managed_v, false);
+    USER_CHECK(t.ndim >= 0 && (t.ndim == 0 || t.shape != nullptr))
+        << "dlpack: malformed DLTensor (ndim=" << t.ndim << ")";
     PyObject* shape_tuple = PyTuple_New(t.ndim);
     for (int32_t i = 0; i < t.ndim; i++)
         PyTuple_SET_ITEM(shape_tuple, i, PyLong_FromLongLong((long long)t.shape[i]));
@@ -490,10 +538,23 @@ VarHolder* from_dlpack_capsule(PyObject* capsule, PyObject* flat_len, int64 elem
     // reachable via the strides (which can be negative-offset from
     // `data+byte_offset` for a reversed/negative-stride view), so index 0 of
     // the flat buffer is well-defined.
+    // The consumer validates the producer's metadata itself, before any
+    // other field is interpreted: a bad shape, stride or flat span must be
+    // rejected here, while the capsule is still unconsumed, not discovered
+    // later as an out-of-bounds device read.
+    NanoString dtype = dltype_to_ns(t.dtype);
+    DLTensorSpan span = validate_dl_tensor(t, dtype);
+
     bool use_flat = flat_len && flat_len != Py_None;
     int64 flat_n = 0;
     if (use_flat) {
+        USER_CHECK(PyLong_Check(flat_len)) << "dlpack: flat_len must be an int";
         flat_n = PyLong_AsLongLong(flat_len);
+        if (flat_n == -1 && PyErr_Occurred()) {
+            PyErr_Clear();
+            USER_ERROR << "dlpack: flat_len does not fit in int64";
+        }
+        USER_CHECK(flat_n >= 0) << "dlpack: flat_len must be non-negative, got" << flat_n;
     } else if (!dl_tensor_is_contiguous(t)) {
         LOGf << "dlpack: importing a non-contiguous (strided) tensor directly via "
              << "from_dlpack_capsule() is not supported -- Jittor's Var has no stride "
@@ -504,7 +565,25 @@ VarHolder* from_dlpack_capsule(PyObject* capsule, PyObject* flat_len, int64 elem
         LOGf << "dlpack: unsupported DLDevice.device_type=" << (int)t.device.device_type
              << " (only kDLCPU and kDLCUDA are supported)";
 
-    NanoString dtype = dltype_to_ns(t.dtype);
+    if (use_flat) {
+        if (flat_n == 0) {
+            USER_CHECK(elem_offset == 0) << "dlpack: an empty flat span must have elem_offset=0";
+        } else {
+            USER_CHECK(span.numel > 0 && elem_offset >= span.min_off
+                && elem_offset <= span.max_off && flat_n - 1 <= span.max_off - elem_offset)
+                << "dlpack: flat span [" << elem_offset << "," << elem_offset << "+" << flat_n
+                << ") is outside the producer's reachable elements ["
+                << span.min_off << "," << span.max_off << "]";
+        }
+    } else {
+        USER_CHECK(elem_offset == 0) << "dlpack: elem_offset requires flat_len";
+    }
+    USER_CHECK(t.data != nullptr || (use_flat ? flat_n : span.numel) == 0)
+        << "dlpack: non-empty tensor with a null data pointer";
+    int64 offset_bytes;
+    USER_CHECK(!__builtin_mul_overflow(elem_offset, (int64)dtype.dsize(), &offset_bytes)
+        && !__builtin_add_overflow(offset_bytes, (int64)t.byte_offset, &offset_bytes))
+        << "dlpack: data offset overflows int64";
     NanoVector shape;
     if (use_flat)
         shape = NanoVector(flat_n);
@@ -519,7 +598,11 @@ VarHolder* from_dlpack_capsule(PyObject* capsule, PyObject* flat_len, int64 elem
     // looking "consumed" (jittor_dlpack_capsule_destructor no-ops on it)
     // while nothing ever took ownership of the producer's buffer, permanently
     // leaking it (real accelerator memory, for a CUDA producer).
-    PyCapsule_SetName(capsule, versioned ? "used_dltensor_versioned" : "used_dltensor");
+    if (PyCapsule_SetName(capsule, versioned ? "used_dltensor_versioned" : "used_dltensor") < 0) {
+        // Not consumed: the capsule's own destructor still owns the deleter.
+        PyErr_Clear();
+        LOGf << "dlpack: failed to mark the capsule as consumed";
+    }
 
     // A producer may supply a null deleter. Keep a callable no-op in that
     // case: ForeignAllocator still invokes its release callback exactly once.
@@ -531,43 +614,73 @@ VarHolder* from_dlpack_capsule(PyObject* capsule, PyObject* flat_len, int64 elem
             if (deleter) deleter(managed);
         });
 
-    VarPtr vp(shape, dtype);
-    vp->finish_pending_liveness();
-    vp->mem_ptr = (char*)t.data + t.byte_offset + elem_offset * (int64)dtype.dsize();
+    // From here on this function owns the producer's deleter. Until an
+    // Allocation takes it over, any failure must still release it exactly
+    // once, since the renamed capsule's destructor no longer will.
+    std::function<void()> release_producer = fire_deleter;
+    bool producer_owned = false;
+    int target_device_id = t.device.device_type == kDLCPU ? -1 : t.device.device_id;
+    try {
+        VarPtr vp(shape, dtype);
+        vp->finish_pending_liveness();
+        void* data = (char*)t.data + offset_bytes;
 
-    Allocation allocation;
-    int target_device_id = -1;
-    if (t.device.device_type == kDLCPU) {
-        make_foreign_allocation(allocation, vp->mem_ptr, vp->size, std::move(fire_deleter));
-    } else {
-        target_device_id = t.device.device_id;
-        // Consumer-side half of the simplified stream contract: make sure
-        // any work the producer queued on ITS device is visible before
-        // Jittor (which only ever reads/writes via the default stream)
-        // touches the memory.
-        backend_synchronize(Device{accelerator_backend_id(), target_device_id});
-        make_foreign_allocation(allocation, vp->mem_ptr, vp->size, std::move(fire_deleter),
-            &get_foreign_allocator(target_device_id));
+        Allocation allocation;
+        if (t.data == nullptr) {
+            // Producers legitimately hand back a null pointer for an empty
+            // tensor (CuPy does for a (0,3) array). There are no bytes to
+            // alias, so give the Var a genuine zero-byte buffer from the
+            // target device's normal allocator stack -- the same one every
+            // native empty Var gets, which returns non-null (the raw device
+            // allocator deliberately returns null for zero bytes) -- and
+            // release the producer right away.
+            ASSERT(vp->size == 0);
+            Device dev = target_device_id < 0 ? Device{}
+                : Device{accelerator_backend_id(), target_device_id};
+            Allocation empty(get_allocator(dev, false), 0);
+            USER_CHECK(empty.ptr) << "dlpack: allocator returned no storage for an empty tensor";
+            std::swap(allocation.ptr, empty.ptr);
+            std::swap(allocation.allocation, empty.allocation);
+            std::swap(allocation.size, empty.size);
+            std::swap(allocation.allocator, empty.allocator);
+            producer_owned = true;
+            release_producer();
+        } else if (target_device_id < 0) {
+            make_foreign_allocation(allocation, data, vp->size, std::move(fire_deleter));
+            producer_owned = true;
+        } else {
+            make_foreign_allocation(allocation, data, vp->size, std::move(fire_deleter),
+                &get_foreign_allocator(target_device_id));
+            producer_owned = true;
+            // Consumer-side half of the simplified stream contract: make
+            // sure any work the producer queued on ITS device is visible
+            // before Jittor (which only ever reads/writes via the default
+            // stream) touches the memory.
+            backend_synchronize(Device{accelerator_backend_id(), target_device_id});
+        }
+        vp->mem_ptr = allocation.ptr;
+        vp->allocator = allocation.allocator;
+        vp->allocation = allocation.allocation;
+        allocation.ptr = nullptr;
+        allocation.allocator = nullptr;
+        allocation.allocation = 0;
+
+        if (target_device_id >= 0) {
+            // Explicit placement (mirrors device_copy_op.cc's explicit-backend
+            // branch) so later ops route to the correct physical device without
+            // depending on the ambient global use_cuda flag, and pair it with
+            // _stop_fuse (mirrors VarHolder's own migrate-to-device path) so the
+            // fuser cannot silently merge this Var's consumer op with a
+            // neighbor targeting a different device.
+            vp->placement = TensorPlacement({accelerator_backend_id(), target_device_id});
+            vp->device_id = target_device_id;
+            vp->set_flag(VarFlags::_stop_fuse);
+        }
+        return new VarHolder(std::move(vp));
+    } catch (...) {
+        if (!producer_owned) release_producer();
+        throw;
     }
-    vp->allocator = allocation.allocator;
-    vp->allocation = allocation.allocation;
-    allocation.ptr = nullptr;
-    allocation.allocator = nullptr;
-    allocation.allocation = 0;
-
-    if (target_device_id >= 0) {
-        // Explicit placement (mirrors device_copy_op.cc's explicit-backend
-        // branch) so later ops route to the correct physical device without
-        // depending on the ambient global use_cuda flag, and pair it with
-        // _stop_fuse (mirrors VarHolder's own migrate-to-device path) so the
-        // fuser cannot silently merge this Var's consumer op with a
-        // neighbor targeting a different device.
-        vp->placement = TensorPlacement({accelerator_backend_id(), target_device_id});
-        vp->device_id = target_device_id;
-        vp->set_flag(VarFlags::_stop_fuse);
-    }
-
-    return new VarHolder(std::move(vp));
 }
 
 } // jittor

@@ -74,9 +74,11 @@ struct FP16OpType : OpByType {
             {"pow", "::pow(($2),($4))"},
             {"maximum", "::max($1($2), $1($4))"},
             {"minimum", "::min($1($2), $1($4))"},
-            {"mod", "$1(($2)-::hfloor(($2)/($4))*($4))"},
-            // Half floor division: divide, then floor. KI-OPS-003.
-            {"floor_divide", "$1(::hfloor(($1($2))/($1($4))))"},
+            // Half operands go through the float32 divmod
+            // (type/floor_divide_compute.h), then round once to half.
+            {"mod", "$1(jittor::_floor_mod_float((float)($2), (float)($4)))"},
+            {"fmod", "$1(jittor::_fmod_ieee((float)($2), (float)($4)))"},
+            {"floor_divide", "$1(jittor::_floor_divide_float((float)($2), (float)($4)))"},
             {"init_maximum", "@if(@strcmp($1,float16)==0,-65000.0f,-1e38)"},
             {"init_minimum", "@if(@strcmp($1,float16)==0,65000.0f,1e38)"},
             {"equal", "(($2)==($4))"},
@@ -125,8 +127,9 @@ struct FP16OpType : OpByType {
             // `jittor::max(float16, float16)` in `type/fp16_compute.h`.
             {"maximum", "jittor::_max<float32>(float32($2), float32($4))"},
             {"minimum", "jittor::_min<float32>(float32($2), float32($4))"},
-            {"mod", "$1(($2)-std::floor(($2)/($4))*($4))"},
-            {"floor_divide", "$1(std::floor(($1($2))/($1($4))))"},
+            {"mod", "$1(jittor::_floor_mod_float((float)($2), (float)($4)))"},
+            {"fmod", "$1(jittor::_fmod_ieee((float)($2), (float)($4)))"},
+            {"floor_divide", "$1(jittor::_floor_divide_float((float)($2), (float)($4)))"},
             {"init_maximum", "-32768.0f"},
             {"init_minimum", "32768.0f"},
             {"equal", "(float($2)==float($4))"},
@@ -236,8 +239,12 @@ struct FP16OpType : OpByType {
         // ever built, and the half kernel that would have been built instead
         // did not exist. The header is `#pragma once` and declares two
         // function templates.
+        // Half mod/fmod/floor_divide compute in float32 through
+        // type/floor_divide_compute.h (see this table's entries).
+        string divmod = src.find("jittor::_f") != string::npos
+            ? "#include \"type/floor_divide_compute.h\"\n" : "";
         src = src.substr(0, i) + "#include \"type/fp16_compute.h\"\n"
-            "#include \"type/minmax_compute.h\"\n" + 
+            "#include \"type/minmax_compute.h\"\n" + divmod +
             src.substr(i);
         return;
     }

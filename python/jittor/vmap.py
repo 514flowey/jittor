@@ -62,6 +62,7 @@
 # argument above); create_graph=True (higher-order jvp/vjp) likewise needs
 # no special-casing, since it only changes whether `.detach()`/
 # `.stop_grad()` are called at all in preprocessing, not what they do.
+import numpy as np
 import jittor as jt
 from collections.abc import Sequence as _Sequence
 from operator import index as _index
@@ -371,23 +372,31 @@ def _apply_cumsum(a, dim=None):
 
 
 def _apply_solve(fn, a, b):
-    # Two-input linalg (jittor-core-gaps.md §3.4). jt.linalg.solve already
-    # delegates to np.linalg.solve via numpy_code, which natively broadcasts
-    # leading batch dims between its two operands (square `a`, vector/matrix
-    # RHS `b`) -- exactly the property _apply_linalg's single-input rules
-    # already lean on. So this is _apply_binary's max-level dispatch
-    # WITHOUT _align_logical_rank's rank-padding step: that step exists for
-    # elementwise ops, where a mismatched logical rank would broadcast the
-    # batch axis against a real logical axis, but solve's own leading-dim
-    # broadcast already handles "only one operand is batched" correctly on
-    # its own (a shared, unbatched coefficient matrix solved against a
-    # batched right-hand side, or vice versa).
+    # Two-input linalg (jittor-core-gaps.md §3.4). Everything is decided on
+    # LOGICAL shapes before peeling a level: which operand is a vector RHS
+    # (jt.linalg.solve's own rule, applied to the logical shapes), and the
+    # logical batch ranks. The RHS is then solved in matrix form, the shorter
+    # operand gets leading logical axes so both batch ranks agree, and an
+    # operand that is not batched at this level gets a size-1 axis where the
+    # other has this level's batch axis. The physical call is then an ordinary
+    # batch-broadcasting solve: its output has the broadcast shape, and its
+    # backward sums a shared operand's gradient over the batch axis.
     lvl = max(_lvl(a), _lvl(b))
     if lvl == -1:
         return fn(a, b)
-    av = a.value if _lvl(a) == lvl else a
-    bv = b.value if _lvl(b) == lvl else b
-    return BatchedVar(_apply_solve(fn, av, bv), lvl)
+    from jittor.linalg.solving import _solve_rhs_is_vector
+    vector = _solve_rhs_is_vector(list(a.shape), list(b.shape))
+    if vector:
+        b = _apply_unsqueeze(b, -1)
+    rank_a, rank_b = a.ndim - 2, b.ndim - 2
+    for _ in range(rank_b - rank_a):
+        a = _apply_unsqueeze(a, 0)
+    for _ in range(rank_a - rank_b):
+        b = _apply_unsqueeze(b, 0)
+    av = a.value if _lvl(a) == lvl else _apply_unsqueeze(a, 0)
+    bv = b.value if _lvl(b) == lvl else _apply_unsqueeze(b, 0)
+    result = BatchedVar(_apply_solve(fn, av, bv), lvl)
+    return _squeeze_logical(result, -1) if vector else result
 
 
 def _apply_linalg(fn, a, *args, **kwargs):
@@ -416,6 +425,17 @@ def _apply_linalg(fn, a, *args, **kwargs):
     if isinstance(inner, (tuple, list)):
         return tuple(BatchedVar(r, lvl) for r in inner)
     return BatchedVar(inner, lvl)
+
+
+def dispatch_linalg(rule, fn, *args, **kwargs):
+    """Entry for linalg functions called directly with a BatchedVar.
+
+    See jittor/linalg/_helpers.py::_batching_aware. `fn` is the undecorated
+    function, the base case of the rule.
+    """
+    if rule == "solve":
+        return _apply_solve(fn, *args, **kwargs)
+    return _apply_linalg(fn, *args, **kwargs)
 
 
 def _align_logical_rank(av, bv):
@@ -524,25 +544,72 @@ def _apply_random(shape, *args, **kwargs):
     return result
 
 
+def _levels(x):
+    """BatchedVar levels in physical-axis order (axis 0 first)."""
+    levels = []
+    while isinstance(x, BatchedVar):
+        levels.append(x.level)
+        x = x.value
+    return levels[::-1]
+
+
+def _wrap_levels(physical, levels):
+    for lvl in levels:
+        physical = BatchedVar(physical, lvl)
+    return physical
+
+
 def _apply_grad(loss, targets, retain_graph=True):
-    # vmap(grad(f)) / per-example gradients: since the vmapped forward pass
-    # makes example i's loss depend only on example i's inputs (there is no
-    # cross-batch mixing anywhere in the batching rules above), summing the
-    # (per-example) loss to a true scalar and differentiating ONCE gives
-    # exactly the per-example gradient back out -- d(sum_i loss_i)/d(target_j)
-    # collapses to d(loss_j)/d(target_j) because all cross terms are zero.
-    # This is the standard "vmap-of-grad via sum-then-backward" trick.
+    # vmap(grad(f)) / per-example gradients. Where a target is batched at the
+    # same levels as the loss, example i's loss depends only on example i's
+    # slice of it, so summing the loss to a scalar and differentiating once
+    # gives every per-example gradient (the cross terms are zero): the
+    # standard "vmap-of-grad via sum-then-backward" trick.
+    #
+    # A target that is NOT batched at some level of the loss -- a shared
+    # parameter captured by the vmapped function -- breaks that: the summed
+    # gradient is the total over the examples, not each example's own. Those
+    # levels are separated explicitly, one backward per example along them,
+    # and the result gains their batch axes (the per-example gradient of a
+    # shared parameter differs per example). grad(sum(vmap(f)), shared)
+    # outside the vmap, which does want the total, is unaffected.
     single = not isinstance(targets, (list, tuple))
     tlist = [targets] if single else list(targets)
     if not isinstance(loss, BatchedVar) and not any(isinstance(t, BatchedVar) for t in tlist):
         return _ORIG_GRAD(loss, targets, retain_graph)
+    loss_levels = _levels(loss)
     real_loss = loss._physical() if isinstance(loss, BatchedVar) else loss
-    while real_loss.ndim > 0:
-        real_loss = real_loss.sum()
-    real_targets = [t._physical() if isinstance(t, BatchedVar) else t for t in tlist]
-    grads = _ORIG_GRAD(real_loss, real_targets, retain_graph)
-    wrapped = [_rewrap_like(t, g) if isinstance(t, BatchedVar) else g for t, g in zip(tlist, grads)]
-    return wrapped[0] if single else wrapped
+    grads = []
+    for t in tlist:
+        t_levels = _levels(t)
+        real_t = t._physical() if isinstance(t, BatchedVar) else t
+        missing = [i for i, lvl in enumerate(loss_levels) if lvl not in t_levels]
+        if not missing:
+            scalar = real_loss
+            while scalar.ndim > 0:
+                scalar = scalar.sum()
+            grads.append(_rewrap_like(t, _ORIG_GRAD(scalar, real_t, True))
+                         if isinstance(t, BatchedVar) else _ORIG_GRAD(scalar, real_t, True))
+            continue
+        sizes = [int(real_loss.shape[i]) for i in missing]
+        per_example = []
+        for flat in range(int(np.prod(sizes))):
+            index = [slice(None)] * real_loss.ndim
+            for axis, k in zip(missing, np.unravel_index(flat, sizes)):
+                index[axis] = int(k)
+            scalar = real_loss[tuple(index)]
+            while scalar.ndim > 0:
+                scalar = scalar.sum()
+            per_example.append(_ORIG_GRAD(scalar, real_t, True))
+        # (missing axes..., target's own batch axes..., logical) -> the
+        # loss's physical level order.
+        stacked = jt.stack(per_example).reshape(sizes + list(per_example[0].shape))
+        order = [loss_levels[i] for i in missing] + t_levels
+        target_order = loss_levels + [lvl for lvl in t_levels if lvl not in loss_levels]
+        perm = [order.index(lvl) for lvl in target_order]
+        perm += list(range(len(order), stacked.ndim))
+        grads.append(_wrap_levels(_ORIG_TRANSPOSE(stacked, perm), target_order))
+    return grads[0] if single else grads
 
 
 def _apply_einsum(spec, *operands):
@@ -933,7 +1000,7 @@ def vmap(func, in_dims=0, out_dims=0, randomness="different"):
 # Registering original callables + patching entry points
 # ---------------------------------------------------------------------------
 
-_BINARY_NAMES = ["add", "subtract", "multiply", "divide", "floor_divide", "mod", "pow",
+_BINARY_NAMES = ["add", "subtract", "multiply", "divide", "floor_divide", "mod", "fmod", "pow",
     "less", "less_equal", "greater", "greater_equal", "equal", "not_equal",
     "left_shift", "right_shift", "bitwise_and", "bitwise_or", "bitwise_xor",
     "minimum", "maximum", "logical_and", "logical_or", "logical_xor"]
@@ -1202,7 +1269,7 @@ def install_batching_patches():
     _install(jt.Var, "matmul", _matmul)
     _install(jt.Var, "__matmul__", _matmul)
 
-    for name in ("qr", "svd", "svdvals", "eigh", "inv"):
+    for name in ("qr", "svd", "svdvals", "eigh", "inv", "cholesky"):
         orig = getattr(jt.linalg, name, None)
         if orig is None:
             continue

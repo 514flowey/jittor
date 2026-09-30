@@ -11,40 +11,49 @@
 # file 'LICENSE.txt', which is part of this source code package.
 # ***************************************************************
 
+import numpy as np
 import jittor as jt
 
 
 class _CoalesceCOO(jt.Function):
     """Merge duplicate ``(row, col)`` entries by summing their values.
 
-    nnz can shrink, which is a genuinely data-dependent output shape --
-    unlike CSR's row-sort permutation (``csr._coo_row_to_csr``), this cannot
-    stay in the lazy graph and needs a real host sync to even know the output
-    shape, so it goes through ``jt.Function`` (whose Python-level
-    ``execute()`` can return a freshly-shaped Var) with numpy doing the
-    dedup. Deliberately host-only regardless of ``jt.flags.use_cuda`` -- the
-    output nnz is only known after deduping either way; ``jt.array(...)``
-    still places the result back on the ambient device as usual.
+    nnz can shrink, which is a genuinely data-dependent output shape, so this
+    goes through ``jt.Function`` (whose Python-level ``execute()`` can return
+    a freshly-shaped Var). The work stays on the operands' device: the
+    linearised keys are sorted, run starts are flagged and prefix-summed into
+    each entry's output slot, and values are summed into those slots with
+    ``reindex_reduce``. Only the merged count -- the output shape -- is read
+    back to the host. The output is in ascending key (row-major) order, the
+    order ``np.unique`` gave the previous host implementation.
     """
 
     def execute(self, row, col, values, N):
-        import numpy as np
-        row_np = row.numpy().astype(np.int64)
-        col_np = col.numpy().astype(np.int64)
-        values_np = values.numpy()
-        key = row_np * N + col_np
-        uniq_key, inverse = np.unique(key, return_inverse=True)
-        inverse = inverse.reshape(-1).astype(np.int64)
-        merged = np.zeros(len(uniq_key), dtype=values_np.dtype)
-        np.add.at(merged, inverse, values_np)
-        new_row = uniq_key // N
-        new_col = uniq_key % N
-        # Specify dtype before construction: the default array conversion
-        # narrows float64/int64, and a later cast cannot recover lost bits.
-        self.inverse = jt.array(inverse, dtype="int64")
-        return (jt.array(new_row, dtype=row.dtype),
-                jt.array(new_col, dtype=col.dtype),
-                jt.array(merged, dtype=values.dtype))
+        nnz = int(row.shape[0])
+        trailing = list(values.shape[1:])
+        if nnz == 0:
+            self.inverse = jt.zeros((0,), dtype="int64")
+            return row.clone(), col.clone(), values.clone()
+        # N as an int64 Var: a Python int operand is narrowed to int32, and
+        # keys past 2^31 then wrap.
+        n = jt.array(np.array(N, dtype=np.int64), dtype="int64")
+        key = row.cast("int64") * n + col.cast("int64")
+        order, sorted_key = jt.argsort(key, 0)
+        new_run = (sorted_key[1:] != sorted_key[:-1]).cast("int64")
+        starts = jt.concat([jt.ones((1,), dtype="int64"), new_run], 0)
+        slot_sorted = jt.cumsum(starts, 0) - 1
+        count = int(starts.sum().item())
+        # order is a permutation: each original entry is written exactly once.
+        inverse = slot_sorted.reindex_reduce("add", [nnz], ["@e0(i0)"], extras=[order])
+        # every entry of a run carries the same key
+        merged_key = sorted_key.reindex_reduce(
+            "maximum", [count], ["@e0(i0)"], extras=[slot_sorted])
+        index = ["@e0(i0)"] + ["i%d" % (d + 1) for d in range(len(trailing))]
+        merged = values.reindex_reduce("add", [count] + trailing, index, extras=[inverse])
+        self.inverse = inverse
+        return ((merged_key // n).cast(row.dtype),
+                (merged_key % n).cast(col.dtype),
+                merged)
 
     def grad(self, d_row, d_col, d_values):
         # each original (possibly-duplicate) entry receives the gradient of

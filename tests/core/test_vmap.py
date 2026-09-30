@@ -455,7 +455,14 @@ class TestVmapPatchTiming(unittest.TestCase):
     # (prefer `vmap(lambda x: jt.linalg.qr(x))` over a bare function
     # reference); this test locks that documented, still-current behavior
     # rather than a fix that was tried and found to cost more than it closed.
-    def test_reference_captured_before_first_vmap_call_stays_unpatched(self):
+    #
+    # The linalg functions (qr/svd/svdvals/eigh/inv/solve) no longer depend
+    # on the patch: each checks for a BatchedVar argument itself and routes
+    # to its rule (jittor/linalg/_helpers.py::_batching_aware), which keeps
+    # every alias the same object. A saved linalg reference therefore works
+    # before the first vmap() call; other saved references keep the
+    # limitation above.
+    def test_linalg_reference_captured_before_first_vmap_call_dispatches(self):
         from tests._helpers.child_process import run_child_script
         script = """
 import numpy as np
@@ -472,24 +479,19 @@ rng = np.random.RandomState(0)
 a = np.stack([rand_spd(3, rng) for _ in range(2)])
 b = rng.randn(2, 3, 1).astype("float32")
 A, B = jt.array(a), jt.array(b)
-try:
-    jt.vmap(lambda av, bv: solve_ref(av, bv))(A, B)
-    print("UNEXPECTEDLY SUCCEEDED")
-except Exception as e:
-    print("FAILED AS DOCUMENTED:", type(e).__name__)
-
-# The documented workaround (call through a lambda instead of a bare
-# reference) still works, since install_batching_patches() has now run
-# (triggered by the vmap() call above).
-out = jt.vmap(lambda av, bv: jt.linalg.solve(av, bv))(A, B)
 expect = np.stack([np.linalg.solve(a[i], b[i]) for i in range(2)])
+out = jt.vmap(lambda av, bv: solve_ref(av, bv))(A, B)
 np.testing.assert_allclose(out.numpy(), expect, atol=1e-3, rtol=1e-3)
-print("WORKAROUND OK")
+print("SAVED REFERENCE OK")
+
+out = jt.vmap(lambda av, bv: jt.linalg.solve(av, bv))(A, B)
+np.testing.assert_allclose(out.numpy(), expect, atol=1e-3, rtol=1e-3)
+print("LAMBDA OK")
 """
         result = run_child_script(script, text=True)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn("FAILED AS DOCUMENTED", result.stdout)
-        self.assertIn("WORKAROUND OK", result.stdout)
+        self.assertIn("SAVED REFERENCE OK", result.stdout)
+        self.assertIn("LAMBDA OK", result.stdout)
 
 
 if __name__ == "__main__":

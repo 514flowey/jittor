@@ -192,6 +192,31 @@ unordered_set<string> binary_ops = {
     "mod",
 
     /**
+    Returns the element-wise truncated remainder of division (C ``fmod``).
+
+    The result has the sign of ``x`` and magnitude below ``|y|``: it is
+    ``x - trunc(x / y) * y`` computed exactly, where :func:`mod` (``%``) uses
+    the floored quotient and takes the sign of ``y``. A finite ``x`` over an
+    infinite ``y`` is ``x``; ``y == 0`` gives NaN for floats.
+
+    ----------------
+
+    * [in] x: the first input,  a python number or jt.Var.
+
+    * [in] y: the second input, a python number or jt.Var.
+
+    ----------------
+
+    Example-1::
+        >>> jt.fmod(jt.array([-3.0, 3.0]), 2.0)
+        jt.Var([-1.  1.], dtype=float32)
+        >>> jt.array([-3.0, 3.0]) % 2.0
+        jt.Var([1. 1.], dtype=float32)
+     */
+    // @pybind(fmod)
+    "fmod",
+
+    /**
     Returns ``x < y`` element-wise.
 
     This operation is equivalent to ``x < y``.
@@ -627,11 +652,23 @@ VarPtr BinaryOp::grad(Var* out, Var* dout, Var* v, int v_index) {
         }
     }
     if (ns == ns_mod) {
+        // x - floor_divide(x, y) * y: the quotient is the same corrected one
+        // the forward uses, not floor(x / y) of the rounded quotient.
         if (v_index == 0)
             return dout;
         else {
-            auto a = make_unary(make_binary(x, y, ns_divide), ns_floor);
+            auto a = make_binary(x, y, ns_floor_divide);
             return make_binary(dout, make_unary(a, ns_negative), ns_multiply);
+        }
+    }
+    if (ns == ns_fmod) {
+        // x - trunc(x / y) * y, with the exact truncated quotient
+        // (x - fmod(x, y)) / y.
+        if (v_index == 0)
+            return dout;
+        else {
+            auto q = make_binary(make_binary(x, z, ns_subtract), y, ns_divide);
+            return make_binary(dout, make_unary(q, ns_negative), ns_multiply);
         }
     }
     if (ns == ns_maximum || ns == ns_minimum) {

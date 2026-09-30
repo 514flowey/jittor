@@ -48,6 +48,7 @@ constexpr int ns_max_len = 16;
     m(divide) \
     m(floor_divide) \
     m(mod) \
+    m(fmod) \
     m(less) \
     m(less_equal) \
     m(greater) \

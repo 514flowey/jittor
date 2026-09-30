@@ -17,10 +17,11 @@ from jittor._core.dtypes import dtype_name as _jittor_dtype_name
 from jittor._runtime.dispatch import register_kernel
 
 
-#: Tensors per launch. Each one costs three pointers and a length in the
-#: argument struct (28 bytes), and a kernel's parameter space is 4 KB; 96 is
-#: 2688 bytes, which leaves room for the scalars and the ABI's own overhead.
-_CHUNK = 96
+#: Tensors per launch. Each one costs up to five pointers and a length in
+#: the argument struct (44 bytes with momentum), and a kernel's parameter
+#: space is 4 KB; 80 is 3520 bytes, which leaves room for the scalars and the
+#: ABI's own overhead.
+_CHUNK = 80
 
 
 def _supports_fused_sgd(tensors, *args, **kwargs):
@@ -72,10 +73,14 @@ def _source(count, momentum, weight_decay, dampening, nesterov, first_step):
         # (undampened) dp, matching PyTorch's `buf = dp.clone()` -- the
         # dampened recurrence below is only correct from the second update
         # onward (jittor-core-gaps.md §3.3).
+        # The new velocity goes to its own output, not back into the input
+        # buffer: an in-place write is invisible to the graph, so reading the
+        # buffer before the parameter was evaluated returned the old value
+        # (and a state_dict saved right after step() could store it).
         if first_step:
-            step = "arg.vel[t][i] = v = dp;"
+            step = "arg.vel_dst[t][i] = v = dp;"
         else:
-            step = f"arg.vel[t][i] = v = fmaf({mom}, arg.vel[t][i], dp * (1.0f - {damp}));"
+            step = f"arg.vel_dst[t][i] = v = fmaf({mom}, arg.vel[t][i], dp * (1.0f - {damp}));"
         use = f"fmaf({mom}, v, dp)" if nesterov else "v"
         body = f"""
                 float p = arg.param[t][i];
@@ -84,7 +89,7 @@ def _source(count, momentum, weight_decay, dampening, nesterov, first_step):
                 float v;
                 {step}
                 arg.dst[t][i] = p - ({use}) * lr;"""
-    vel = "" if plain else f"float* vel[{count}];"
+    vel = "" if plain else f"float* vel[{count}];\n        float* vel_dst[{count}];"
     # No member may be called `out`: the code op's JIT template does
     # `#define out out0` around the body, so `args.out[k]` would be rewritten
     # to `args.out0[k]` and nvcc reports a struct with no such member.
@@ -107,11 +112,6 @@ def _source(count, momentum, weight_decay, dampening, nesterov, first_step):
     """
 
 
-def _launch(count, plain):
-    vel = "" if plain else "        args.vel[k] = nullptr;\n"
-    return vel
-
-
 def _fused_sgd_cuda(entries, lr, momentum, weight_decay, dampening, nesterov, step=1):
     """`entries` is a list of (param, grad, velocity). Returns [(new_p, new_v)]."""
     plain = momentum == 0 and not nesterov
@@ -131,6 +131,7 @@ def _fused_sgd_cuda(entries, lr, momentum, weight_decay, dampening, nesterov, st
             setup.append(f"args.dst[{k}] = out{k}_p;")
             if not plain:
                 setup.append(f"args.vel[{k}] = in{2 * count + k}_p;")
+                setup.append(f"args.vel_dst[{k}] = out{count + k}_p;")
             setup.append(f"args.len[{k}] = {int(params[k].numel())};")
         longest = max(int(p.numel()) for p in params)
         blocks = max(1, min(256, (longest + 255) // 256))
@@ -144,18 +145,19 @@ def _fused_sgd_cuda(entries, lr, momentum, weight_decay, dampening, nesterov, st
         {chr(10).join('        ' + line for line in setup)}
         fused_sgd_kernel<<<dim3({blocks}, {count}), 256>>>(args, {float(lr):.9e}f);
         """
+        outputs = params if plain else params + vels
         outs = jt.code(
-            [p.shape for p in params],
-            [p.dtype for p in params],
+            [p.shape for p in outputs],
+            [p.dtype for p in outputs],
             inputs,
             cuda_header=header,
             cuda_src=body,
         )
         if not isinstance(outs, (list, tuple)):
             outs = [outs]
-        # The velocity is written in place by the kernel, so it is handed back
-        # unchanged rather than as a new Var.
-        results.extend(zip(outs, vels))
+        # Without momentum the velocity is neither read nor written, so it is
+        # handed back unchanged; with momentum it is the kernel's own output.
+        results.extend(zip(outs[:count], vels if plain else outs[count:]))
     return results
 
 

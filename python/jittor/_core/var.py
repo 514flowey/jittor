@@ -1664,7 +1664,8 @@ def _dlpack_is_contiguous(shape, strides):
     # C++ side re-derives it independently from the same DLTensor as a
     # defense-in-depth check, but the *choice* of which import path to take
     # is made here, before the capsule is consumed.
-    if strides is None:
+    if strides is None or 0 in shape:
+        # An empty tensor has no bytes, so its strides constrain nothing.
         return True
     expect = 1
     for i in range(len(shape) - 1, -1, -1):
@@ -1682,9 +1683,9 @@ def _dlpack_flat_span(shape, strides):
     # reversed/flipped view) correctly, not just the common "all strides >=
     # 0" case. Zero-length axes are excluded from both min and max: an axis
     # with shape[i]==0 contributes no actual index (0..shape[i]-1 is empty),
-    # so its stride must not be allowed to inflate/deflate the span -- the
-    # caller special-cases a wholly empty (0 total element) tensor before
-    # this is ever called with such a shape for exactly this reason.
+    # so its stride must not be allowed to inflate/deflate the span -- a
+    # wholly empty tensor counts as contiguous (_dlpack_is_contiguous) and
+    # never reaches this function for exactly this reason.
     min_off = 0
     max_off = 0
     for s, st in zip(shape, strides):
@@ -1752,17 +1753,6 @@ def from_dlpack(obj):
     # Strided producer: materialize a real, correctly-valued, independently
     # owned contiguous copy instead of rejecting the tensor -- see the
     # docstring above for the full design rationale.
-    total = 1
-    for s in shape:
-        total *= s
-    if total == 0:
-        # An empty tensor has no bytes to read regardless of its strides
-        # (any per-axis stride*[shape-1] term would be spurious for a
-        # zero-length axis) -- import an empty flat buffer and reshape,
-        # which is well-defined between any two shapes with the same
-        # (zero) total element count.
-        return core.from_dlpack_capsule(capsule, 0, 0).reshape(shape)
-
     min_off, max_off = _dlpack_flat_span(shape, strides)
     flat_len = max_off - min_off + 1
     flat = core.from_dlpack_capsule(capsule, flat_len, min_off)

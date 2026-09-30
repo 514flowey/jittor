@@ -9,46 +9,31 @@
 
 namespace jittor {
 
-cuda_gen_create_t cuda_gen_create_hook = nullptr;
-cuda_gen_destroy_t cuda_gen_destroy_hook = nullptr;
-cuda_gen_set_seed_offset_t cuda_gen_set_seed_offset_hook = nullptr;
+// Marks the counter-based CUDA offset. Strings written before it carry a
+// curand host-generator offset, which cannot be replayed on this stream.
+static const char* const kCudaStreamTag = "philox";
 
 RandomGeneratorState::RandomGeneratorState(int64 seed, int device_id)
     : seed_(seed), device_id(device_id), cpu_engine(seed) {}
-
-RandomGeneratorState::~RandomGeneratorState() {
-    if (cuda_gen && cuda_gen_destroy_hook)
-        cuda_gen_destroy_hook(cuda_gen);
-}
 
 void RandomGeneratorState::set_seed(int64 seed) {
     seed_ = seed;
     cpu_engine.seed((uint64)seed);
     cuda_offset = 0;
-    if (cuda_gen)
-        cuda_gen_set_seed_offset_hook(cuda_gen, seed_, 0);
 }
 
-void* RandomGeneratorState::get_cuda_generator() {
-    if (!cuda_gen) {
-        ASSERT(cuda_gen_create_hook) << "CUDA random generator requested but "
-            "the curand extension is not loaded (CUDA not available in this build).";
-        // cuda_offset may already be non-zero here if this state was
-        // restored via set_state() before its first CUDA use -- create()
-        // seeds it directly to (seed_, cuda_offset) so the deferred
-        // generator picks up exactly where the saved state left off.
-        cuda_gen = cuda_gen_create_hook(seed_, cuda_offset, device_id);
-    }
-    return cuda_gen;
-}
-
-void RandomGeneratorState::advance_cuda_offset(int64 n) {
-    cuda_offset += n;
+int64 RandomGeneratorState::reserve_cuda(int64 raw_count) {
+    ASSERT(raw_count >= 0);
+    int64 base = cuda_offset;
+    USER_CHECK(!__builtin_add_overflow(cuda_offset, raw_count, &cuda_offset))
+        << "Generator: CUDA stream position overflows int64";
+    return base;
 }
 
 string RandomGeneratorState::get_state() {
     std::ostringstream oss;
-    oss << seed_ << ' ' << device_id << ' ' << cuda_offset << ' ' << cpu_engine;
+    oss << seed_ << ' ' << device_id << ' ' << cuda_offset << ' '
+        << kCudaStreamTag << ' ' << cpu_engine;
     return oss.str();
 }
 
@@ -56,21 +41,40 @@ void RandomGeneratorState::set_state(const string& s) {
     std::istringstream iss(s);
     int64 new_seed, new_offset;
     int new_device;
+    iss >> new_seed >> new_device >> new_offset >> std::ws;
+    USER_CHECK(!iss.fail()) << "Generator.set_state(): malformed state string "
+        "(expected the byte string previously returned by get_state()).";
+    auto engine_start = iss.tellg();
+    string tag;
+    iss >> tag;
+    bool tagged = !iss.fail() && tag == kCudaStreamTag;
+    if (!tagged) {
+        // A state from before the counter-based CUDA stream. Its CPU part is
+        // still exact; a CUDA position into the old curand stream is not.
+        USER_CHECK(new_device < 0 || new_offset == 0)
+            << "Generator.set_state(): this CUDA state was saved by an older "
+               "Jittor whose curand stream cannot be replayed here; reseed with "
+               "manual_seed() instead of restoring it.";
+        iss.clear();
+        iss.seekg(engine_start);
+    }
+    std::default_random_engine new_engine;
     // std::default_random_engine's own operator>> does not skip leading
     // whitespace (unlike operator>> for the built-in numeric types before
     // it) -- without the explicit std::ws here it tries to parse starting
     // at the separating space itself and silently fails every time.
-    iss >> new_seed >> new_device >> new_offset >> std::ws >> cpu_engine;
-    ASSERT(!iss.fail()) << "Generator.set_state(): malformed state string "
+    iss >> std::ws >> new_engine;
+    USER_CHECK(!iss.fail() && new_offset >= 0)
+        << "Generator.set_state(): malformed state string "
         "(expected the byte string previously returned by get_state()).";
+    USER_CHECK(new_device == device_id)
+        << "Generator.set_state(): the state belongs to"
+        << (new_device < 0 ? string("cpu") : "cuda:" + std::to_string(new_device))
+        << "but this generator is on"
+        << (device_id < 0 ? string("cpu") : "cuda:" + std::to_string(device_id));
     seed_ = new_seed;
-    device_id = new_device;
     cuda_offset = new_offset;
-    if (cuda_gen)
-        // Re-seed the already-created generator and jump it directly to the
-        // restored offset (curandSetGeneratorOffset), continuing exactly
-        // where the saved state left off.
-        cuda_gen_set_seed_offset_hook(cuda_gen, seed_, cuda_offset);
+    cpu_engine = new_engine;
 }
 
 static int parse_device(const string& device) {

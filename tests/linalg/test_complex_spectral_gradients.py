@@ -107,8 +107,15 @@ loss.backward()
 np.save({str(out_path)!r}, A.grad.numpy())
 """
         subprocess.run([python, "-c", script], check=True,
-                        capture_output=True, timeout=120)
+                        capture_output=True, timeout=120, env=_oracle_env())
         return np.load(out_path)
+
+
+def _oracle_env():
+    """The oracle's own environment: the suite's PYTHONPATH puts Jittor's
+    torch shim first, which would make the "real" interpreter import it."""
+    return {k: v for k, v in os.environ.items()
+            if k not in ("PYTHONPATH", "JITTOR_TORCH_SHIM")}
 
 
 def _real_torch_python():
@@ -126,7 +133,7 @@ def _real_torch_python():
             continue
         probe = subprocess.run(
             [python, "-c", "import torch; assert not hasattr(torch, 'compat')"],
-            capture_output=True, timeout=60)
+            capture_output=True, timeout=60, env=_oracle_env())
         if probe.returncode == 0:
             return python
     raise RuntimeError(

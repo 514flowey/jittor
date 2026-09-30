@@ -616,6 +616,30 @@ def mod(x: Var, y: Var)-> Var:
 	        >>> a % b
 	        jt.Var([0.19774088 0.20159635 0.22973768], dtype=float32)'''
 	...
+def fmod(x: Var, y: Var)-> Var:
+	'''Document:
+	*
+	    Returns the element-wise truncated remainder of division (C ``fmod``).
+
+	    The result has the sign of ``x`` and magnitude below ``|y|``: it is
+	    ``x - trunc(x / y) * y`` computed exactly, where :func:`mod` (``%``) uses
+	    the floored quotient and takes the sign of ``y``. A finite ``x`` over an
+	    infinite ``y`` is ``x``; ``y == 0`` gives NaN for floats.
+
+	    ----------------
+
+	    * [in] x: the first input,  a python number or jt.Var.
+
+	    * [in] y: the second input, a python number or jt.Var.
+
+	    ----------------
+
+	    Example-1::
+	        >>> jt.fmod(jt.array([-3.0, 3.0]), 2.0)
+	        jt.Var([-1.  1.], dtype=float32)
+	        >>> jt.array([-3.0, 3.0]) % 2.0
+	        jt.Var([1. 1.], dtype=float32)'''
+	...
 def less(x: Var, y: Var)-> Var:
 	'''Document:
 	*
@@ -4925,6 +4949,30 @@ class Var:
 		        jt.Var([0.19774088 0.20159635 0.22973768], dtype=float32)
 		        >>> a % b
 		        jt.Var([0.19774088 0.20159635 0.22973768], dtype=float32)'''
+		...
+	def fmod(self, y: Var)-> Var:
+		'''Document:
+		*
+		    Returns the element-wise truncated remainder of division (C ``fmod``).
+
+		    The result has the sign of ``x`` and magnitude below ``|y|``: it is
+		    ``x - trunc(x / y) * y`` computed exactly, where :func:`mod` (``%``) uses
+		    the floored quotient and takes the sign of ``y``. A finite ``x`` over an
+		    infinite ``y`` is ``x``; ``y == 0`` gives NaN for floats.
+
+		    ----------------
+
+		    * [in] x: the first input,  a python number or jt.Var.
+
+		    * [in] y: the second input, a python number or jt.Var.
+
+		    ----------------
+
+		    Example-1::
+		        >>> jt.fmod(jt.array([-3.0, 3.0]), 2.0)
+		        jt.Var([-1.  1.], dtype=float32)
+		        >>> jt.array([-3.0, 3.0]) % 2.0
+		        jt.Var([1. 1.], dtype=float32)'''
 		...
 	def less(self, y: Var)-> Var:
 		'''Document:

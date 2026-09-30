@@ -9,6 +9,10 @@ from .types import _dtype_to_str
 from ..diagnostics import EXPECTED, swallowed
 from typing import Any, Dict, List
 from .. import fsdp_hooks as _fsdp_hooks
+from jittor.optim.algorithms.sgd import (
+    MOMENTUM_INITIALIZED as _MOMENTUM_INITIALIZED,
+    momentum_initialized_flags as _momentum_initialized_flags,
+)
 from .. import optimizer_kinds as _optimizer_kinds
 from .tensor_state import get_tensor_state
 from .installers.tensor.autograd_api import _optimizer_maybe_has_fsdp_params
@@ -92,6 +96,8 @@ class _OptState:
                     yield p
     def _reset_slot(self, pg, i):
         _torch_param_steps(pg)[i] = 0
+        if _torch_optimizer_kind(self._opt) == "sgd":
+            _momentum_initialized_flags(pg)[i] = False
         for key in ("m", "values", "v", "d", "pre_grad"):
             buffers = pg.get(key)
             if not isinstance(buffers, list) or i >= len(buffers):
@@ -124,8 +130,17 @@ class _OptState:
         }
         target = mappings.get(kind, {}).get(key)
         buffers = pg.get(target) if target is not None else None
+        if kind == "sgd" and key == "momentum_buffer" and value is None:
+            # torch's "no buffer yet": the next momentum update seeds it.
+            if isinstance(buffers, list) and i < len(buffers) \
+                    and isinstance(buffers[i], jt.Var):
+                buffers[i] = jt.zeros_like(buffers[i]).stop_grad()
+            _momentum_initialized_flags(pg)[i] = False
+            return
         if isinstance(buffers, list) and i < len(buffers):
             buffers[i] = value
+            if kind == "sgd" and key == "momentum_buffer":
+                _momentum_initialized_flags(pg)[i] = True
     def get(self, param, default=None):
         pg, i = self._find(param)
         if pg is None:
@@ -139,10 +154,13 @@ class _OptState:
                 "exp_avg": pg["m"][i],
                 "exp_avg_sq": pg["values"][i],
                 "step": float(steps[i])})
-        if kind == "sgd" and "values" in pg and pg.get(
-                "momentum", getattr(self._opt, "momentum", 0)):
-            return _ParamState(self, param, {
-                "momentum_buffer": pg["values"][i]})
+        if kind == "sgd":
+            # Present exactly while a buffer exists, like torch: independent
+            # of the *current* momentum, so pausing momentum keeps it.
+            if "values" in pg and _momentum_initialized_flags(pg)[i]:
+                return _ParamState(self, param, {
+                    "momentum_buffer": pg["values"][i]})
+            return default
         if kind == "rmsprop" and "values" in pg:
             return _ParamState(self, param, {
                 "square_avg": pg["values"][i],
@@ -217,7 +235,7 @@ def _state_dict_torch(self):
             params.append(pid)
         for k, v in pg.items():
             if k in ("params", "grads", "m", "values", "v", "d",
-                     "pre_grad", "_torch_steps"):
+                     "pre_grad", "_torch_steps", _MOMENTUM_INITIALIZED):
                 continue
             group[k] = v
         group.setdefault("lr", pg.get("lr", getattr(self, "lr", 0.0)))
@@ -272,9 +290,8 @@ def _state_dict_torch(self):
                 if "values" in pg and i < len(pg["values"]):
                     entry["exp_avg_sq"] = pg["values"][i]
             elif kind == "sgd":
-                momentum = pg.get(
-                    "momentum", getattr(self, "momentum", 0))
-                if momentum and "values" in pg and i < len(pg["values"]):
+                if "values" in pg and i < len(pg["values"]) \
+                        and _momentum_initialized_flags(pg)[i]:
                     entry["momentum_buffer"] = pg["values"][i]
             elif kind == "rmsprop":
                 if "values" in pg and i < len(pg["values"]):
@@ -355,6 +372,10 @@ def _load_state_dict_torch(self, state_dict):
         steps = _torch_param_steps(pg)
         for i in range(len(steps)):
             steps[i] = 0
+        if kind == "sgd":
+            flags = _momentum_initialized_flags(pg)
+            for i in range(len(flags)):
+                flags[i] = False
         for key in ("m", "values", "v", "d", "pre_grad"):
             buffers = pg.get(key)
             if not isinstance(buffers, list):
@@ -366,7 +387,7 @@ def _load_state_dict_torch(self, state_dict):
         pg = self.param_groups[gi]
         steps = _torch_param_steps(pg)
         for k, v in saved_pg.items():
-            if k == "params":
+            if k in ("params", _MOMENTUM_INITIALIZED):
                 continue
             pg[k] = v
         for i, (st, step) in enumerate(slots):
@@ -376,8 +397,9 @@ def _load_state_dict_torch(self, state_dict):
                 if "values" in pg and i < len(pg["values"]) \
                         and "exp_avg_sq" in st:
                     pg["values"][i] = st["exp_avg_sq"]
-            elif kind == "sgd" and "momentum_buffer" in st:
+            elif kind == "sgd" and st.get("momentum_buffer") is not None:
                 pg["values"][i] = st["momentum_buffer"]
+                _momentum_initialized_flags(pg)[i] = True
             elif kind == "rmsprop" and "square_avg" in st:
                 pg["values"][i] = st["square_avg"]
             elif kind == "adan":
