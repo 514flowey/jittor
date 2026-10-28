@@ -1235,6 +1235,40 @@ workaround.
 - Exit condition: remove each sub-item only with focused CPU and accelerator
   tests for its operation and derivative order.
 
+## KI-AUTOGRAD-004: a `jt.Function` class built per call that closes over a Var is freed only by full GC passes
+
+- Severity: Limitation
+- Status: Limitation, confirmed 2026-10-30 on `f995bd1f4` plus the linalg fix
+  that moved jittor's own linalg Functions to module level.
+- Owner: autograd maintainers
+- Symptom: a chain of calls to a function that defines its `jt.Function`
+  subclass inside the call, with a method that reads an outer Var, keeps the
+  chain alive after its output is dropped. Each full `gc.collect()` frees one
+  link per chain, so a loop of such chains grows in Vars and time between
+  generation-2 collections:
+
+  ```python
+  def f(x):
+      class F(jt.Function):
+          def execute(self, xt): return xt * 2
+          def grad(self, g): x; return g * 2   # closes over x
+      return F()(x)
+  ```
+
+- Cause: a class is a reference cycle, so only the cyclic GC frees it. The
+  tape holds the call context, the context holds its class, the class's
+  closure holds `x`, and `x` reaches the previous call's tape through C++ graph
+  edges that `tp_traverse` does not report. The GC sees each class as
+  externally referenced until the link after it is gone.
+- Workaround: define the Function class once, at module level, and give
+  `grad` what it needs as attributes: set in `__init__` (`F(x)(x)`) or saved
+  in `execute`. `jittor.linalg`'s Functions do this.
+- Evidence: `tests/linalg/test_linalg_call_lifetime.py` pins the linalg
+  chains to refcount-only release.
+- Exit condition: the Tapes node reports its Python callback to the GC, or
+  `jt.Function` breaks the cycle itself, so the example above frees with the
+  GC disabled.
+
 ## KI-AUTOGRAD-005: a `numpy_code` or `jt.code` gradient cannot be differentiated again
 
 - Severity: Limitation
