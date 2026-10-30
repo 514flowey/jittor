@@ -467,6 +467,29 @@ class TestFunctionHigherOrder(unittest.TestCase):
                     second = jt.grad(first.real.sum(), x)
                 np.testing.assert_allclose(second.numpy(), [12 - 6j, -9 - 3j], rtol=1e-6)
 
+    def test_a_call_leaves_no_cyclic_garbage(self):
+        # The container walk was a recursive local function, which refers to
+        # itself through its closure: every call left a cycle for the cyclic
+        # GC (eight objects a call), on the path every Function takes.
+        import gc
+        save, load = self.CONTAINERS["mixed"]
+        cube = self._cube_saving(save, load)
+
+        def step():
+            x = jt.array([2.0, -1.5])
+            first = jt.grad(cube.apply(x).sum(), x)
+            jt.grad(first.sum(), x).sync()
+
+        step()
+        gc.collect()
+        gc.disable()
+        try:
+            for _ in range(5):
+                step()
+            self.assertEqual(gc.collect(), 0)
+        finally:
+            gc.enable()
+
     def test_one_input_saved_in_several_containers_stays_one_var(self):
         class Saves(Function):
             def execute(self, x):

@@ -197,25 +197,24 @@ can also be None)::
         taped = {t.id for t in taped_inputs}
         rebinds = {}
         # Containers already walked, by id: a container saved twice, or one
-        # that holds itself, is walked once.
+        # that holds itself, is walked once. An explicit stack rather than a
+        # recursive local function: one that calls itself refers to itself
+        # through its closure, so every Function call left a reference cycle
+        # for the cyclic GC.
         seen = set()
-
-        def visit(value):
+        pending = list(self.__dict__.values())
+        while pending:
+            value = pending.pop()
             kind = type(value)
             if kind is tuple or kind is list or kind is dict:
-                if id(value) in seen:
-                    return
-                seen.add(id(value))
-                for item in (value.values() if kind is dict else value):
-                    visit(item)
+                if id(value) not in seen:
+                    seen.add(id(value))
+                    pending.extend(value.values() if kind is dict else value)
             elif (isinstance(value, Var) and value.id in taped
                     and not value.is_finished):
                 old = value.id
                 value.swap(value._input(0))
                 rebinds[old] = value.id
-
-        for value in tuple(self.__dict__.values()):
-            visit(value)
         if rebinds:
             self._taped_input_rebinds = rebinds
 
