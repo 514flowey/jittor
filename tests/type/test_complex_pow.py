@@ -121,3 +121,60 @@ def test_second_derivative(device):
     first = jt.grad((jt.array(w, dtype="complex128") * xv ** exponent).real.sum(), xv)
     second = jt.grad(first.real.sum(), xv)
     np.testing.assert_allclose(second.numpy(), np.conj(6 * w * x), rtol=1e-10, atol=1e-10)
+
+
+# Far from |z| = 1. The complex log, division, abs and sqrt formed
+# re^2 + im^2, which overflows from |z| ~ 1e19 (complex64) / 1e154
+# (complex128) and underflows below their reciprocals, although every result
+# here is representable: z ** 0.5 came back NaN and z ** -1 zero or inf. Zero
+# absolute tolerance, so a wrong zero cannot pass as a small number.
+_EXTREMES = {"complex64": [1e20, 1e-30], "complex128": [1e200, 1e-200]}
+
+
+@pytest.mark.parametrize("dtype", ["complex64", "complex128"])
+def test_far_from_unit_magnitude(device, dtype):
+    for s in _EXTREMES[dtype]:
+        z_np = np.array([s + s * 1j, -s + 0.5 * s * 1j, s * 1j], dtype=dtype)
+        z = jt.array(z_np, dtype=dtype)
+        # exp(w log z) carries log z's error times |w log z| (~460 at 1e200),
+        # hence the comparison tolerances of the 2026-10-30 pow audit.
+        rtol = 3e-5 if dtype == "complex64" else 1e-10
+        for name, got, expected in (
+            ("z ** 0.5", z ** 0.5, z_np ** 0.5),
+            ("z ** -1", z ** -1, z_np ** -1),
+            ("z ** (0.5+0.25j)", z ** (0.5 + 0.25j), z_np.astype(complex) ** (0.5 + 0.25j)),
+            ("1 / z", 1 / z, 1 / z_np),
+            ("abs(z)", z.abs(), np.abs(z_np)),
+            ("sqrt(z)", z.sqrt(), np.sqrt(z_np)),
+            ("log(z)", z.log(), np.log(z_np)),
+        ):
+            got = got.numpy()
+            assert np.isfinite(got).all(), (name, s, got)
+            np.testing.assert_allclose(got, np.asarray(expected).astype(got.dtype),
+                                       rtol=rtol, atol=0, err_msg=f"{name} at {s}")
+
+
+# A Python number is staged at single precision; against a complex128 operand
+# it used to stay there, and z ** 1.2345678901234567 was off by about 2e-8.
+@pytest.mark.parametrize("exponent", [1.2345678901234567, 1.2345678901234567 + 0.345678901234567j],
+                         ids=["float", "complex"])
+def test_python_exponent_keeps_double_precision_on_complex128(device, exponent):
+    z_np = np.array([1 + 1j, -2j, 0.3 - 2.5j, 1.7 + 0.2j])
+    z = jt.array(z_np, dtype="complex128")
+    np.testing.assert_allclose((z ** exponent).numpy(), z_np ** exponent, rtol=1e-14, atol=0)
+    # The same widening reaches every binary op, and a float64 base meeting a
+    # complex scalar promotes to complex128 at full precision as well.
+    np.testing.assert_allclose((z * exponent).numpy(), z_np * exponent, rtol=1e-15, atol=0)
+    x_np = np.array([0.5, 1.25, 3.0])
+    x = jt.array(x_np, dtype="float64")
+    out = x + exponent
+    assert str(out.dtype) == ("complex128" if isinstance(exponent, complex) else "float64")
+    np.testing.assert_allclose(out.numpy(), x_np + exponent, rtol=1e-15, atol=0)
+
+
+def test_python_exponent_stays_single_precision_on_complex64(device):
+    # A Python number is a weak scalar: against complex64 the result is
+    # complex64, computed at that precision.
+    z = jt.array(np.array([1 + 1j, -2j], dtype="complex64"))
+    assert str((z ** 1.2345678901234567).dtype) == "complex64"
+    assert str((z * (0.5 + 0.25j)).dtype) == "complex64"

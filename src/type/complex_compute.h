@@ -33,23 +33,38 @@ inline JT_CPLX_HD complex64 operator*(complex64 a, complex64 b) {
     return complex64(a.real*b.real - a.imag*b.imag, a.real*b.imag + a.imag*b.real);
 }
 inline JT_CPLX_HD complex64 operator/(complex64 a, complex64 b) {
-    float d = b.real*b.real + b.imag*b.imag;
-    return complex64((a.real*b.real + a.imag*b.imag)/d, (a.imag*b.real - a.real*b.imag)/d);
+    // Smith's algorithm: scale by the larger component of b instead of
+    // forming |b|^2, which overflows from |b| ~ 1e19 (1e154 for double) and
+    // underflows below the square root of the smallest normal number.
+    if (::fabsf(b.real) >= ::fabsf(b.imag)) {
+        if (b.real == 0) {  // b == 0: the unscaled formula's 0/0 and x/0
+            float d = b.real*b.real + b.imag*b.imag;
+            return complex64((a.real*b.real + a.imag*b.imag)/d, (a.imag*b.real - a.real*b.imag)/d);
+        }
+        float r = b.imag / b.real, d = b.real + b.imag*r;
+        return complex64((a.real + a.imag*r)/d, (a.imag - a.real*r)/d);
+    }
+    float r = b.real / b.imag, d = b.imag + b.real*r;
+    return complex64((a.real*r + a.imag)/d, (a.imag*r - a.real)/d);
 }
 inline JT_CPLX_HD bool operator==(complex64 a, complex64 b) { return a.real==b.real && a.imag==b.imag; }
 inline JT_CPLX_HD bool operator!=(complex64 a, complex64 b) { return !(a==b); }
 inline JT_CPLX_HD complex64 jt_conj(complex64 a) { return complex64(a.real, -a.imag); }
 inline JT_CPLX_HD float jt_creal(complex64 a) { return a.real; }
-inline JT_CPLX_HD float jt_cabs(complex64 a) { return ::sqrtf(a.real*a.real + a.imag*a.imag); }
+// hypot, not the square root of a sum of squares, which overflows or
+// underflows for components far from 1 although |z| is representable.
+inline JT_CPLX_HD float jt_cabs(complex64 a) { return ::hypotf(a.real, a.imag); }
 
 // Complex transcendentals (principal branches), matching numpy/torch. ::expf/::cosf/etc are
-// __host__ __device__ under JIT_cuda (same as jt_cabs's ::sqrtf), so these work on both backends.
+// __host__ __device__ under JIT_cuda (as is jt_cabs's ::hypotf), so these work on both backends.
 inline JT_CPLX_HD complex64 jt_cexp(complex64 a) {
     float e = ::expf(a.real);
     return complex64(e*::cosf(a.imag), e*::sinf(a.imag));        // e^(a+bi)=e^a(cos b + i sin b)
 }
 inline JT_CPLX_HD complex64 jt_clog(complex64 a) {              // log z = ln|z| + i*arg z
-    return complex64(0.5f*::logf(a.real*a.real + a.imag*a.imag), ::atan2f(a.imag, a.real));
+    // ln|z| from hypot: halving the log of a sum of squares overflowed from
+    // |z| ~ 1e19 and underflowed below 1e-19 (1e154 / 1e-154 for double).
+    return complex64(::logf(::hypotf(a.real, a.imag)), ::atan2f(a.imag, a.real));
 }
 inline JT_CPLX_HD complex64 jt_csin(complex64 a) {
     return complex64(::sinf(a.real)*::coshf(a.imag), ::cosf(a.real)*::sinhf(a.imag));
@@ -58,9 +73,15 @@ inline JT_CPLX_HD complex64 jt_ccos(complex64 a) {
     return complex64(::cosf(a.real)*::coshf(a.imag), -::sinf(a.real)*::sinhf(a.imag));
 }
 inline JT_CPLX_HD complex64 jt_csqrt(complex64 a) {             // principal sqrt
-    float r = ::sqrtf(a.real*a.real + a.imag*a.imag);
-    float re = ::sqrtf(0.5f*(r + a.real));
-    float im = ::sqrtf(0.5f*(r - a.real));
+    // t = sqrt((|re| + |z|) / 2) never cancels, and the other component is
+    // |im| / 2t; |z| is a hypot, and the halves are taken before the sum, so
+    // nothing overflows for a representable result.
+    float h = ::hypotf(a.real, a.imag);
+    if (h == 0) return complex64(0, 0);
+    float t = ::sqrtf(0.5f*::fabsf(a.real) + 0.5f*h);
+    float other = 0.5f*::fabsf(a.imag)/t;
+    float re = a.real >= 0 ? t : other;
+    float im = a.real >= 0 ? other : t;
     return complex64(re, a.imag < 0 ? -im : im);
 }
 
@@ -117,21 +138,34 @@ inline JT_CPLX_HD complex128 operator*(complex128 a, complex128 b) {
     return complex128(a.real*b.real - a.imag*b.imag, a.real*b.imag + a.imag*b.real);
 }
 inline JT_CPLX_HD complex128 operator/(complex128 a, complex128 b) {
-    double d = b.real*b.real + b.imag*b.imag;
-    return complex128((a.real*b.real + a.imag*b.imag)/d, (a.imag*b.real - a.real*b.imag)/d);
+    // Smith's algorithm: scale by the larger component of b instead of
+    // forming |b|^2, which overflows from |b| ~ 1e19 (1e154 for double) and
+    // underflows below the square root of the smallest normal number.
+    if (::fabs(b.real) >= ::fabs(b.imag)) {
+        if (b.real == 0) {  // b == 0: the unscaled formula's 0/0 and x/0
+            double d = b.real*b.real + b.imag*b.imag;
+            return complex128((a.real*b.real + a.imag*b.imag)/d, (a.imag*b.real - a.real*b.imag)/d);
+        }
+        double r = b.imag / b.real, d = b.real + b.imag*r;
+        return complex128((a.real + a.imag*r)/d, (a.imag - a.real*r)/d);
+    }
+    double r = b.real / b.imag, d = b.imag + b.real*r;
+    return complex128((a.real*r + a.imag)/d, (a.imag*r - a.real)/d);
 }
 inline JT_CPLX_HD bool operator==(complex128 a, complex128 b) { return a.real==b.real && a.imag==b.imag; }
 inline JT_CPLX_HD bool operator!=(complex128 a, complex128 b) { return !(a==b); }
 inline JT_CPLX_HD complex128 jt_conj(complex128 a) { return complex128(a.real, -a.imag); }
 inline JT_CPLX_HD double jt_creal(complex128 a) { return a.real; }
-inline JT_CPLX_HD double jt_cabs(complex128 a) { return ::sqrt(a.real*a.real + a.imag*a.imag); }
+// hypot, not the square root of a sum of squares, which overflows or
+// underflows for components far from 1 although |z| is representable.
+inline JT_CPLX_HD double jt_cabs(complex128 a) { return ::hypot(a.real, a.imag); }
 
 inline JT_CPLX_HD complex128 jt_cexp(complex128 a) {
     double e = ::exp(a.real);
     return complex128(e*::cos(a.imag), e*::sin(a.imag));
 }
 inline JT_CPLX_HD complex128 jt_clog(complex128 a) {
-    return complex128(0.5*::log(a.real*a.real + a.imag*a.imag), ::atan2(a.imag, a.real));
+    return complex128(::log(::hypot(a.real, a.imag)), ::atan2(a.imag, a.real));
 }
 inline JT_CPLX_HD complex128 jt_csin(complex128 a) {
     return complex128(::sin(a.real)*::cosh(a.imag), ::cos(a.real)*::sinh(a.imag));
@@ -140,9 +174,12 @@ inline JT_CPLX_HD complex128 jt_ccos(complex128 a) {
     return complex128(::cos(a.real)*::cosh(a.imag), -::sin(a.real)*::sinh(a.imag));
 }
 inline JT_CPLX_HD complex128 jt_csqrt(complex128 a) {
-    double r = ::sqrt(a.real*a.real + a.imag*a.imag);
-    double re = ::sqrt(0.5*(r + a.real));
-    double im = ::sqrt(0.5*(r - a.real));
+    double h = ::hypot(a.real, a.imag);
+    if (h == 0) return complex128(0, 0);
+    double t = ::sqrt(0.5*::fabs(a.real) + 0.5*h);
+    double other = 0.5*::fabs(a.imag)/t;
+    double re = a.real >= 0 ? t : other;
+    double im = a.real >= 0 ? other : t;
     return complex128(re, a.imag < 0 ? -im : im);
 }
 
