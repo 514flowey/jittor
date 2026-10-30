@@ -1537,6 +1537,31 @@ workaround.
   runs across cards that the single observation is treated as a one-off
   and this entry closed.
 
+## KI-EXEC-018: graph kept alive by Python cyclic garbage counts toward the 100,000-op eager switch
+
+- Severity: Limitation
+- Status: Limitation, measured 2026-10-30 on `f54d1a5fb` (RTX 4090).
+- Owner: execution maintainers
+- Symptom: `Executor::submit_pending` (`src/core/executor.cc`) executes every
+  new op eagerly once `number_of_lived_ops` reaches 100,000. That count includes
+  executed ops held for backward by Vars that are only cyclic garbage. When
+  enough accumulates between two full GCs the run crosses the line, its batches
+  per call jump (39 to 2,694 for a 4-site MPS gradient) and new unfused kernels
+  compile: calls of seconds to minutes, then a lasting slowdown.
+- Cause: jittor's own per-call cycles are gone (KI-AUTOGRAD-004), but a library
+  can still hold Vars in cycles. TensorNetwork's `BaseMPS.__init__` defines
+  `svd`/`qr`/`rq` closures over `self`, so every `FiniteMPS` that
+  TensorCircuit builds, with its tensors, waits for the cyclic GC. A 12-qubit
+  depth-4 MPS gradient keeps about 5,500 such ops per call and peaks at 61,000
+  live ops between collections; it did not cross the line in 204 calls.
+- Workaround: none needed at the measured sizes. A larger circuit that does
+  cross it recovers below the line after `gc.collect()`.
+- Evidence: the CUDA MPS long-tail investigation of 2026-10-30 (per-call live
+  ops, executor calls and cyclic-garbage census).
+- Exit condition: the switch counts pending work rather than retained graph,
+  or reclaims cyclic garbage before switching, with the MPS gradient at 16
+  qubits staying below it.
+
 ## KI-COMPAT-001: Torch namespaces publish native-only helpers and imported symbols
 
 - Severity: Medium
