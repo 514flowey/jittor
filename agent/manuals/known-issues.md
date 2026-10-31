@@ -1167,13 +1167,16 @@ workaround.
 - Status: Open; measured 2026-10-26 on RTX 4090 / 16 cores of an EPYC 7763
   against torch 2.5.1 in the same Slurm job. The 2-D CUDA forwards are native
   since then (`backends/cuda/kernels/cusolver`, `cublas_trsm`): solve 64x64
-  210 us (torch 147), QR 128x64 396 us (torch 370).
+  210 us (torch 147), QR 128x64 396 us (torch 370). A batch of CUDA solves is
+  native too (`cublas_solve_batched`, `cusolver_solve` per matrix above
+  n = 256): complex64 (4,32,32) x (4,32,4) forward 0.15 ms (torch 0.11),
+  value-and-grad 0.43-0.46 ms (torch 0.44), measured 2026-10-31.
 - Owner: linalg maintainers
 - Symptom: complex64 `jt.linalg.solve` 64x64 takes 254 us on CPU (torch 97);
   from n = 128 up numpy's OpenBLAS LAPACK is 3-5x behind torch's MKL for QR.
   On CUDA, QR 128x64 forward plus backward takes 1.53 ms (torch 0.74). Batched
-  (rank > 2) CUDA solve/QR/SVD, and every CUDA linalg op on a NVIDIA-wheel
-  CUDA stack (which carries no cuSOLVER), still go through CuPy.
+  (rank > 2) CUDA inv/QR/SVD, and every CUDA linalg op but a batched solve on a
+  NVIDIA-wheel CUDA stack (which carries no cuSOLVER), still go through CuPy.
 - Cause: the host forwards are `numpy_code` callbacks into numpy's OpenBLAS,
   whose LAPACK does not scale with threads at these sizes (`_host_lapack`
   keeps it on one thread below 2^25 units of work, where its own pool lost to

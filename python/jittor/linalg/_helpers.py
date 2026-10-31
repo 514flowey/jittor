@@ -262,8 +262,10 @@ def _cuda_svd_reduced(cp, a):
 #: cuBLAS ops on Jittor's own stream, the way torch calls them from ATen.
 #: Through the ``numpy_code`` callbacks a 64x64 complex64 solve paid ~130 us
 #: in the executor's Python callback and CuPy's array wrapping on top of the
-#: library calls, and QR a host sync torch does not make. A batch, or a CUDA
-#: toolchain without cuSOLVER (``setup_cusolver``), keeps the callbacks.
+#: library calls, and QR a host sync torch does not make. A batch of solves
+#: takes cuBLAS's batched LU (``cublas_solve_batched``) or, for large matrices,
+#: ``cusolver_solve`` one matrix after another; a batch of the other three, or
+#: a CUDA toolchain without cuSOLVER (``setup_cusolver``), keeps the callbacks.
 _LAPACK_DTYPES = {"float32", "float64", "complex64", "complex128"}
 
 
@@ -275,8 +277,32 @@ def _cublas_ops():
     return get_library_ops("cublas", load=True)
 
 
+#: The largest order a batch of solves takes cuBLAS's batched LU for; above
+#: it, cuSOLVER's getrf/getrs one matrix after another is faster, as torch
+#: also chooses. Measured on an RTX 4090, complex64, a batch of 4.
+_CUBLAS_BATCHED_SOLVE_MAX_N = 256
+
+
+def _has_cublas_solve_batched():
+    return getattr(_cublas_ops(), "cublas_solve_batched", None) is not None
+
+
 def _supports_cuda_solve(a, b):
-    return a.ndim == 2 and b.ndim == 2 and a.dtype == b.dtype and _cusolver_ops() is not None
+    # `solve` has broadcast the batch dimensions already, so a batch of `a`
+    # and `b` share them.
+    if a.dtype != b.dtype or b.ndim != a.ndim or a.ndim < 2 or _cusolver_ops() is None:
+        return False
+    return (a.ndim == 2 or a.shape[-1] > _CUBLAS_BATCHED_SOLVE_MAX_N
+            or not _has_cublas_solve_batched())
+
+
+def _supports_cuda_solve_batched(a, b):
+    # One `getrfBatched`/`getrsBatched` pair takes the whole batch, where the
+    # CuPy callback paid the executor's Python callback and array wrapping on
+    # every call, and its backward three times.
+    return (a.ndim > 2 and b.ndim == a.ndim and a.dtype == b.dtype
+            and _has_cublas_solve_batched()
+            and (a.shape[-1] <= _CUBLAS_BATCHED_SOLVE_MAX_N or _cusolver_ops() is None))
 
 
 def _supports_cuda_square(a):
@@ -288,8 +314,17 @@ def _supports_cuda_trsm(a, b, upper):
             and getattr(_cublas_ops(), "cublas_trsm", None) is not None)
 
 
+def _dense(x):
+    # A broadcast batch is an expand view; the ops address matrices densely.
+    return x if x._storage_is_contiguous() else x.contiguous()
+
+
 def _cuda_solve(a, b):
-    return _cusolver_ops().cusolver_solve(a, b)
+    return _cusolver_ops().cusolver_solve(_dense(a), _dense(b))
+
+
+def _cuda_solve_batched(a, b):
+    return _cublas_ops().cublas_solve_batched(_dense(a), _dense(b))
 
 
 def _cuda_inv(a):
@@ -307,6 +342,8 @@ def _cuda_solve_triangular(a, b, upper):
 
 register_kernel("linalg_solve", "cuda", _cuda_solve, dtypes=_LAPACK_DTYPES,
                 supports=_supports_cuda_solve)
+register_kernel("linalg_solve", "cuda", _cuda_solve_batched, dtypes=_LAPACK_DTYPES,
+                supports=_supports_cuda_solve_batched)
 register_kernel("linalg_inv", "cuda", _cuda_inv, dtypes=_LAPACK_DTYPES,
                 supports=_supports_cuda_square)
 register_kernel("linalg_qr", "cuda", _cuda_qr, dtypes=_LAPACK_DTYPES,

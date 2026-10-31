@@ -380,9 +380,13 @@ def solve(a,b):
     return x.squeeze(-1) if vector else x
 
 
-def _solve_matrix(a, b):
-    """solve() on (...,M,M) and (...,M,K) operands with identical batch dims."""
-    return _Solve(a, b)(a, b)
+def _solve_matrix(a, b, known=None):
+    """solve() on (...,M,M) and (...,M,K) operands with identical batch dims.
+
+    ``known`` is the solution when it has been computed already: the result
+    then has that value without solving again, and the gradients of a solve.
+    """
+    return _Solve(a, b, known)(a, b)
 
 
 @_host_lapack
@@ -411,11 +415,14 @@ class _Solve(Function):
     # `b` is always a matrix, so both gradients have exactly the input
     # shapes. Both recursive calls use the live `a`/`b`, so this
     # composes to any order.
-    def __init__(self, a, b):
-        self.a, self.b = a, b
+    def __init__(self, a, b, known=None):
+        self.a, self.b, self.known = a, b, known
 
     def execute(self, at, bt):
         import jittor as jt
+        if self.known is not None:
+            self.x = self.known
+            return self.x
         kernel = select_kernel("linalg_solve", at, bt)
         if kernel is not None:
             self.x = kernel(at, bt)
@@ -427,7 +434,10 @@ class _Solve(Function):
         import jittor as jt
         a, b = self.a, self.b
         db = _solve_matrix(_T(a), dout)
-        x = _reconnect(self.x, _solve_matrix(a, b))
+        # x itself, as a solve of the live a and b: its value is the one the
+        # forward computed, so the first-order backward does not factorize a a
+        # second time, while every higher order differentiates through it.
+        x = _solve_matrix(a, b, known=self.x)
         dA = -jt.matmul(db, _T(x))
         return dA, db
 
