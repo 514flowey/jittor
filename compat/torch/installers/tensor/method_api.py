@@ -1636,24 +1636,35 @@ def _true_division(self, other, opname):
             get_install_context(_owner.jt).target_namespace.result_type(self, other))
         tgt = _truediv_target(rt, rt)
         src_dt = _jittor_dtype_name(self.dtype)
-        # CPU/CUDA widen Python floats for PyTorch 1-ulp parity; torch_npu
-        # stays in the tensor dtype because ACL has no float64 arithmetic.
-        acl_active = bool(getattr(_owner.jt.compiler, "has_acl", 0)) and (
-            bool(getattr(_owner.jt.flags, "use_acl", 0)) and bool(_owner.jt.flags.use_cuda))
-        # Half precision widens to float32 only: that is PyTorch's opmath for
-        # it, and a float64 division ran every diffusers attention block's
-        # `/ rescale_output_factor` in double -- 15 ms of a 20-step SD1.5
-        # sample on a part with 1/64-rate double -- to round to the same half.
-        wide = "float32" if src_dt in ("float16", "bfloat16") else "float64"
-        use_wide = sd.startswith("float") and src_dt != "float64" and not acl_active
-        calc_dt = wide if use_wide else tgt
+        # CPU/CUDA used to widen a float32 operand to float64 here "for PyTorch
+        # 1-ulp parity"; measured against torch 2.11 that is the wrong way
+        # round. `x / 0.28209479177387814` for 20000 float32 `x` matches
+        # `x / float32(scale)` bit for bit (0 differ) and differs from the
+        # float64 route on 12615 of them: torch computes a Python float in the
+        # tensor's own dtype (the weak-scalar rule the promotion above already
+        # applies). Half precision still widens to float32, which is its
+        # opmath, and the float64 route also cost 0.55 ms of a diffusers
+        # UNet2D step on a part whose double rate is 1/64.
+        calc_dt = "float32" if src_dt in ("float16", "bfloat16") else tgt
         a = self if src_dt == calc_dt else self.cast(calc_dt)
-        if use_wide or isinstance(other, _owner.np.generic):
+        if sd.startswith("float") or isinstance(other, _owner.np.generic):
             with _owner.jt.no_grad():
                 b = _owner.jt.array(other, dtype=calc_dt)
         else:
             b = other
-        out = _binary_native(opname, a, b)
+        if (opname == "__rtruediv__" and src_dt in ("float32", "float64")
+                and sd.startswith("float")):
+            # torch answers `pyfloat / t` as `t_dtype(scalar) * (1 / t)`, not
+            # as a division: over 20000 values that form matches it bit for
+            # bit in both float32 and float64 (0 differ) while an IEEE
+            # division differs on 5106 and 5109 of them. Half precision does
+            # not follow it, so it keeps the division below.
+            with _owner.jt.no_grad():
+                one = _owner.jt.array(1, dtype=calc_dt).stop_grad()
+            out = _binary_native(
+                "__mul__", b, _binary_native("__truediv__", one, a))
+        else:
+            out = _binary_native(opname, a, b)
         if isinstance(out, _NativeVar) and _jittor_dtype_name(out.dtype) != tgt:
             out = out.cast(tgt)
         return out
