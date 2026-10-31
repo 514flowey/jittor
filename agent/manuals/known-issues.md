@@ -2,7 +2,7 @@
 
 - Status: Maintained
 - Last reviewed: 2026-10-31
-- Baseline: `bc9894654`
+- Baseline: `0e46efa51`
 - Owner: Jittor core maintainers
 - Review when: an entry is fixed or narrowed, a strict expected failure
   XPASSes, a new defect is reproduced, or at quarterly maintenance
@@ -1633,23 +1633,6 @@ workaround.
 - Exit condition: decide whether 1-ulp parity is worth FP64 on consumer GPUs (for
   example widen only where FP64 is fast, or compute `x * (1/s)` with a
   correction), update the promotion tests with the decision, and delete the entry.
-
-## KI-COMPAT-010: torchmetrics' classification and regression metrics fail under the Torch frontend on CUDA
-
-- Severity: Medium (an ecosystem library's core metrics do not run)
-- Status: Open; reproduced 2026-10-12 on CUDA with torchmetrics installed (the
-  gates do not install it, so the cases skip there)
-- Owner: torch compatibility maintainers
-- Symptom: `test_classification_metrics` dies in `reduce_op.cc` with "Reduce
-  dim out of range: requested dims [0,] for a 0-D var"; `test_regression_metrics`
-  fails to compile a fused operator; `test_torchmetrics_required_torch_ops`
-  reports a required op as unsupported.
-- Cause: not isolated; the first is a `dim=0` reduction of a 0-d tensor, which
-  torch accepts.
-- Workaround: none.
-- Evidence: `JITTOR_TORCH_SHIM=1 python -m pytest -q compat/tests/torch/test_torchmetrics_compat.py`
-  on a CUDA machine with torchmetrics.
-- Exit condition: the three cases pass on CUDA.
 
 ## KI-COMPAT-011: an RNN under the Torch frontend on CUDA does not run through cuDNN
 
