@@ -287,8 +287,13 @@ def test_second_gpu_round_trip_keeps_the_callers_device():
         np.testing.assert_array_equal(cp.asnumpy(doubled), (cp.asnumpy(source) + 1) * 2)
 
 
+# A strided import is permuted back to its dense order for an elementwise op
+# (layout propagation), which rebuilds the `1` as a broadcast of its own. That
+# constant was made on the current device and stayed there next to an operand
+# with an explicit placement on device 1, so the kernel on device 1 read a
+# device-0 pointer and faulted with an illegal address.
 _STRIDED_SECOND_GPU = """
-import numpy as np, jittor as jt
+import numpy as np, jittor as jt, cupy as cp
 jt.flags.use_cuda = 1
 a = jt.array(np.random.rand(64, 64).astype("float32"))
 float(jt.matmul(a, a).sum().numpy())          # some work on device 0 first
@@ -298,20 +303,22 @@ with jt.flag_scope(transpose_storage_view=1):
 view.sync()
 imported = jt.from_dlpack(view.__dlpack__())   # strided foreign memory on device 1
 assert np.array_equal((imported + 1).numpy(), b.numpy().T + 1)
+with cp.cuda.Device(1):
+    source = cp.arange(12, dtype=cp.float32).reshape(3, 4)
+    transposed = jt.from_dlpack(source.T)
+assert np.array_equal((transposed * 2 + 1).numpy(), cp.asnumpy(source).T * 2 + 1)
 print("STRIDED-SECOND-GPU-OK", flush=True)
 """
 
 
-@pytest.mark.xfail(strict=True, reason="KI-EXEC-019: an elementwise op on a strided DLPack "
-                   "import on a second GPU faults with an illegal address")
-def test_strided_import_on_a_second_gpu_after_device_zero_work():
+def test_strided_import_on_a_second_gpu_takes_python_scalars():
     from _helpers.child_process import run_child_script
     if not capability.check_accelerator("cuda", backend=jt).enabled:
         pytest.skip("CUDA is unavailable in this build")
     cp = pytest.importorskip("cupy")
     if cp.cuda.runtime.getDeviceCount() < 2:
         pytest.skip("needs two visible GPUs")
-    # In a child: the fault poisons the CUDA context of the process it hits.
+    # In a child: a fault would poison the CUDA context of the process it hits.
     result = run_child_script(_STRIDED_SECOND_GPU, text=True, timeout=600,
                               merge_stderr=True, name="strided_second_gpu")
     assert "STRIDED-SECOND-GPU-OK" in result.stdout, result.stdout[-2000:]

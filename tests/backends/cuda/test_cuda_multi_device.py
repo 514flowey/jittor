@@ -311,6 +311,26 @@ class TestSecondDevice(_DeviceCase):
         a.sync()
         self.assertEqual(_pointer_device(a.device_raw_ptr), 1)
 
+    def test_an_implicit_tensor_is_refused_next_to_an_explicitly_placed_one(self):
+        # A DLPack import carries an explicit placement. An implicitly placed
+        # tensor on another card used to pass the explicit-placement check
+        # unnoticed, and the kernel on the import's card then read the other
+        # card's pointer; a Python number is still moved.
+        with jt.flag_scope(device_id=1):
+            source = jt.array(np.arange(6, dtype="float32"))
+            source.sync()
+        imported = jt.from_dlpack(source)
+        self.assertEqual(imported.device_id, 1)
+        local = jt.array(np.ones(6, "float32"))
+        local.sync()
+        with self.assertRaises(Exception) as caught:
+            imported + local
+        self.assertIn("same CUDA device", str(caught.exception))
+        self.assertEqual(local.device_id, 0)
+        shifted = imported * 3 + 1
+        self.assertEqual(shifted.device_id, 1)
+        np.testing.assert_array_equal(shifted.numpy(), np.arange(6) * 3 + 1)
+
     def test_a_pending_host_copy_is_not_retargeted_either(self):
         host = jt.ones((3,), "float32").cpu()
         other = jt.ones((3,), "float32").cuda(1)

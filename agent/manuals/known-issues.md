@@ -1562,29 +1562,6 @@ workaround.
   or reclaims cyclic garbage before switching, with the MPS gradient at 16
   qubits staying below it.
 
-## KI-EXEC-019: an elementwise op on a strided DLPack import on a second GPU faults
-
-- Severity: High
-- Status: Open, reproduced 2026-10-31 on `31cb18223` (the old gather import)
-  and with the strided zero-copy import that replaced it; two RTX 4090.
-- Owner: execution maintainers
-- Symptom: a strided tensor imported through DLPack on device 1 -- a CuPy
-  `x.T` inside `cupy.cuda.Device(1)`, or a Jittor strided view on device 1
-  exported and imported again -- followed by an elementwise op such as `v + 1`
-  fails with `cudaErrorIllegalAddress`, after which every CUDA call in the
-  process fails (cuBLAS reports `CUBLAS_STATUS_NOT_INITIALIZED`). With
-  `jt.flags.propagate_storage_layout = 0` the same import computes correctly;
-  a contiguous import and a native strided view on device 1 are unaffected.
-- Cause: not isolated. The fault needs foreign (DLPack) storage, a strided
-  layout and a device other than the one work started on; the elementwise op
-  reads it through the storage-layout propagation path
-  (`src/ops/layout_propagation.cc`).
-- Workaround: import contiguous data on a second GPU (`.contiguous()` on the
-  producer), or set `jt.flags.propagate_storage_layout = 0` for that code.
-- Evidence: `tests/bindings/test_dlpack_export_layout.py::test_strided_import_on_a_second_gpu_after_device_zero_work`
-  (strict expected failure, run in a child process).
-- Exit condition: that test passes on a two-GPU host.
-
 ## KI-COMPAT-001: Torch namespaces publish native-only helpers and imported symbols
 
 - Severity: Medium
