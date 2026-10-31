@@ -164,8 +164,11 @@ CUDA 设备侧 profile 需要 CUPTI：`JITTOR_CUPTI_LIB=<...>/nvidia/cuda_cupti/
   所在解释器没有装 `asv`，与本改动无关。
 - 生态 parity（`test_ecosystem_parity.py -k EcosystemParityCUDA`）：10 passed /
   6 skipped / 1 failed。唯一失败是 `transformers_t5` 的一个解码器 MLP 梯度
-  3.337e-02（带宽 2e-2），在 `008cae211` 上数值完全相同，属既有问题，记在
-  KI-COMPAT-021。
+  3.337e-02（带宽 2e-2），在 `008cae211` 上数值完全相同，当时记为 KI-COMPAT-021。
+  该条已在 2026-10-31 关闭：两侧**关掉 TF32** 后同一比较的 48 个梯度全部吻合到
+  9e-7（CPU 上 1e-6），说明差的是 TF32 十位尾数而不是内核；这个用例现在显式
+  `tf32=False` 地与参考实现对比（其余用例仍按 `JITTOR_ECOSYSTEM_TF32` 默认开
+  TF32 跑，策略本身照旧被覆盖）。
 
 ## 未结
 

@@ -187,9 +187,13 @@ The device profile needs CUPTI:
 - `tests/structure`: 1571 passed / 4 skipped; the only failure is
   `test_asv_entrypoints` because that interpreter has no `asv`, unrelated here.
 - Ecosystem parity (`test_ecosystem_parity.py -k EcosystemParityCUDA`):
-  10 passed / 6 skipped / 1 failed. The failure is a T5 decoder MLP gradient at
-  3.337e-02 against a 2e-2 band, identical at `008cae211`, so it is
-  pre-existing and recorded as KI-COMPAT-021.
+  10 passed / 6 skipped / 1 failed. The failure was a T5 decoder MLP gradient at
+  3.337e-02 against a 2e-2 band, identical at `008cae211`, recorded then as
+  KI-COMPAT-021. It closed on 2026-10-31: with **TF32 off on both sides** the
+  same comparison agrees to 9e-7 on all 48 gradients (1e-6 on the CPU), so the
+  difference is TF32's ten-bit mantissa, not a kernel. That case now states
+  `tf32=False`; every other case still runs with the
+  `JITTOR_ECOSYSTEM_TF32` policy, so the switch stays exercised.
 
 ## Open
 
