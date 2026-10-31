@@ -1,7 +1,7 @@
 # Known-Issues Ledger
 
 - Status: Maintained
-- Last reviewed: 2026-10-31
+- Last reviewed: 2026-11-01
 - Baseline: `d8e30464c`
 - Owner: Jittor core maintainers
 - Review when: an entry is fixed or narrowed, a strict expected failure
@@ -1615,3 +1615,213 @@ workaround.
   including absence of unintended accumulator activation. Preserve the existing
   old/new graph snapshots and storage/gradient contracts when adding this support.
 
+## KI-COMPAT-011: an RNN under the Torch frontend on CUDA does not run through cuDNN
+
+- Severity: Medium (the precision policy it is meant to follow is not exercised)
+- Status: Open; reproduced 2026-10-12 on CUDA, with CUPTI available
+- Owner: torch compatibility / RNN maintainers
+- Symptom: `test_precision_policy_isolation.py`'s two RNN cases find no
+  `rnn precision select:` line from `cudnn_rnn_descriptor` ("the RNN must execute
+  actual cuDNN descriptors"); the outputs are computed by another path.
+- Cause: not isolated.
+- Workaround: none needed for results.
+- Evidence: `compat/tests/torch/test_precision_policy_isolation.py::test_fp32_rnn_native_default_and_torch_cudnn_policy_match_cpu_recurrence`,
+  `::test_grouped_rnn_backward_retains_forward_precision_after_policy_switch`.
+- Exit condition: both cases pass on CUDA.
+
+## KI-COMPAT-012: in-process `JITTOR_TORCH_SHIM=1` publishes no `torch` distribution metadata
+
+- Severity: Medium (Transformers and Diffusers decide PyTorch is absent)
+- Status: Open (verification pending: downstream install). `c6aef610a` makes
+  the in-process shim register a process-local torch distribution finder on
+  activation and remove it on release; the metadata-dependent library cases
+  still need Transformers/Diffusers installed on the acceptance machine.
+- Owner: torch compatibility maintainers
+- Symptom: `AutoModel ... requires the PyTorch library but it was not found in
+  your environment` / `UNet2DModel requires the PyTorch library` from
+  `importlib.metadata`: twelve cases in `test_torch_hf_models.py`,
+  `test_torch_hf_alias.py`, `test_torch_hf_cuda_device.py` and
+  `test_diffusers.py` raise `ImportError`, and `test_peft.py` fails collection.
+- Cause: the shim installs a `torch` module in the process but no `torch`
+  distribution, and those libraries ask `importlib.metadata` rather than
+  importing. A user who runs `import torch` with the deployed shim does not hit
+  it.
+- Workaround: deploy the shim (`jittor-torch-shim`, see
+  `docs/compatibility/torch-shim.md`) rather than enabling it in-process.
+- Evidence: the four test files above on a machine with transformers/diffusers.
+- Exit condition: the four evidence files' cases run on an environment with
+  Transformers/Diffusers installed (the metadata mechanism itself is covered by
+  `compat/tests/torch/test_torch_shim_distribution_metadata.py`).
+
+## KI-DIST-001: FSDP2 flat sharding peaks above the unsharded model
+
+- Severity: Limitation (memory; numerics are correct)
+- Status: Open; measured 2026-09-08 on two CUDA ranks
+- Owner: torch compatibility / distributed (FSDP2)
+- Symptom: allocator high-water mark 19,977,728 B unsharded against 23,123,456 B
+  with flat sharding (about 15.7% higher), flat over five steps, so it is a peak,
+  not growth. A smaller CUDA Var snapshot is not a peak measurement and must not
+  be cited as one: `core.get_peak_allocator_used_memory()` reads the memory
+  profiler's executor-checkpoint high-water mark, and
+  `get_mem_info().total_cuda_used` includes cached blocks.
+- Cause: not isolated; the flat update regrouping and temporaries that are alive
+  together are the suspects.
+- Workaround: nonflat sharding peaked lower in the diagnostic run; neither is
+  below unsharded.
+- Evidence: `compat/tests/fsdp2/test_fsdp_memory.py` (four 512x512 Linear layers,
+  batch 2, Adam, five steps, fresh ranks per mode); numerics in
+  `compat/tests/fsdp2/test_fsdp2_nccl.py` and
+  `compat/tests/fsdp2/test_fsdp_optimizer_math.py`. Reproduce in Torch mode
+  (`JITTOR_TORCH_SHIM=1`, CUDA with NCCL):
+  `JITTOR_FSDP2_MEMORY_MODE=full mpirun -np 2 python -m pytest -q -s compat/tests/fsdp2/test_fsdp_memory.py`,
+  then `JITTOR_FSDP2_MEMORY_MODE=shard JITTOR_FSDP2_REFERENCE_PEAK_BYTES=<full peak> mpirun -np 2 ...`;
+  the second fails today.
+- Exit condition: the reference-peak run passes. NPU/HCCL and multi-node have no
+  evidence yet (see [deferred-hardware.md](deferred-hardware.md)).
+
+## KI-BACKEND-020: the NPU work in #18036 and #18039 was only partly on this branch
+
+- Severity: Medium (supported operations failed or answered wrongly), Fixed
+- Status: Fixed (2026-10-14), verified on a 910B3
+- Owner: ACL backend / Torch compatibility
+- Symptom: the maintainer's cherry-picks from #18035, #18036, #18039 and
+  #18031 took their backend-agnostic parts, so the Ascend-specific halves
+  were missing. What that cost, each confirmed on hardware before the fix:
+  `labels[:, mask]` raised `NotImplementedError: ACL getitem does not support
+  Var slice indices`; a boolean slice assignment had no lowering because CANN
+  refuses a bool payload; `x[None]` raised a TypeError; `roll` declined int64;
+  `nonzero` counted with a bool sum, so more than one match shaped the output
+  for a single row, and an all-false mask reached a kernel that rejects a
+  zero-row output. `torch.npu.is_available()` answered False and
+  `device_count()` 0 on a machine with eight 910Bs, because `torch.npu` got
+  the same placeholders as `torch.mps` and `torch.xpu`; a downstream library
+  that asks before choosing a device believed it. `torch.use_deterministic_
+  algorithms` was a no-op setter and the query a constant False. A
+  device-to-device copy between two cards was refused outright. The ACL RNG
+  counter was one process-wide pair, not one per device, and could not be
+  checkpointed.
+- Cause: the cherry-picks were deliberately scoped to backend-agnostic
+  changes; nothing recorded which Ascend-specific parts were left, so they
+  were not picked up later either.
+- Workaround: none.
+- Evidence: six commits, each with its own hardware verification, from
+  `a48b4e828` to `1df5bef15`. New tests, all run on a 910B3: four ACL index
+  cases in `tests/backends/acl/test_acl_torch_compat.py`, five in
+  `compat/tests/torch/test_npu_device_protocol.py` (and its CPU half, which
+  asserts the facade still refuses rather than inventing a device), the
+  deterministic-policy case, ten in
+  `tests/backends/comm/hccl/test_hccl_backend_status.py`,
+  `compat/tests/torch/test_npu_peer_copy.py` on two visible cards, and four
+  per-device RNG cases including one that runs the draws on the
+  async-execution worker. Gates after the merge: core tier 322 passed; the
+  NPU gate's failure set byte-identical to the pre-merge baseline (91 both
+  ways, `comm` empty) with passes up from 466+241 to 471+245;
+  `tests/structure` green except the upstream ratchet below.
+- Not merged, and why: #18030's getitem stride fix and #18031's ACL changes
+  are already on this branch; #18028 shares #18031's head against a different
+  base. #18036's `truth_reduce` keepdims push-down duplicates the reshape
+  `_truth_reduce_keepdims` already does, and its `getitem_op.py` and
+  `tensor.py` are behind this branch's memoization work, which was kept.
+  `torch.npu`'s memory metrics were left refusing rather than answered,
+  because the memory-pool bindings they read (`device_pool_memory_used` and
+  the rest) are not on this branch; a zero peak reads as a measurement.
+- Open alongside this: ACL `all()`/`any()` with no dim returns shape (1,)
+  where torch returns a scalar -- `test_reference_all_*`/`test_reference_any_*`
+  in the NPU gate's baseline failures. Neither branch nor PR fixes it.
+
+
+## KI-LINT-001: mypy covers the build utilities and part of compat only
+
+- Severity: Limitation (static checking coverage)
+- Status: Open. Import direction is gated separately
+  (`tools/lint/check_import_layering.py` via `tests/structure/test_import_layering.py`
+  and `nox -s imports`, with the remaining cycles as a ratchet that may only
+  shrink).
+- Owner: build and tooling maintainers
+- Symptom: `python/jittor` outside `python/jittor/build` and the `backends/`
+  overlay are not type-checked; when last measured they carried about 2,500 and
+  80 errors respectively (about 2,600 errors in about 200 files).
+- Workaround: none.
+- Evidence: `[tool.mypy] files` in `pyproject.toml`; `nox -s typing`.
+- Exit condition: extend `files` one package at a time with real fixes (no
+  `# type: ignore`, no relaxed configuration); delete the entry when
+  `python/jittor` and `backends/` are covered.
+
+## KI-CODEGEN-006: a rank-1 full sum still materializes a pending reshaped producer
+
+- Severity: Medium (allocation and performance; values are correct)
+- Status: Open; reproduced 2026-10-26 on current `2.0-refactor` (real CUDA,
+  RTX 4090). The multi-dimensional spelling was fixed by `c56b4c2bc` and is
+  pinned by `tests/backends/cuda/test_full_reduce.py`.
+- Owner: CUDA reduction and codegen maintainers.
+- Symptom: `(jt.ones((1,)).expand(1 << 24) * 2).sum()` allocates 68,157,440
+  bytes cold because the two-stage CUB path materializes the multiply. The 2-D
+  `(4096,1).expand(4096,4096)` spelling allocates 1 MiB.
+- Cause: the rank-1 route needs a reshape/view above the pending producer;
+  `ReshapeOp` is `OpType::other` and `edge_fusable` refuses it, so the fused
+  route stops at that barrier. The only non-materializing alternative measured
+  is a single-block `use_shared_reduce=2` fold at ~3.8 GB/s versus ~757 GB/s
+  CUB (131 ms vs 0.66 ms at 512 MB); the atomic generated reduce is
+  nondeterministic (15 distinct values in 20 runs).
+- Workaround: reduce an explicit axis or materialize the producer when the
+  allocation matters.
+- Evidence: unversioned probe/logs under
+  `$JITTOR_LAB_ROOT/_state/fix-codegen5/`; the multi-dimensional allocation
+  gate is `tests/backends/cuda/test_full_reduce.py`.
+- Exit condition: codegen fuses through the reshape above a pending producer
+  deterministically and near CUB throughput, or a justified deterministic
+  strategy is selected; the rank-1 allocation gate passes.
+
+## KI-TEST-016: the ACL Torch-compat suite is red under the shim for placement reasons
+
+- Severity: Medium (fourteen pre-existing failures in one file would hide a real
+  regression in the same file)
+- Status: Open; reproduced 2026-10-29 on an Ascend 910B3 at `1a750dbee` and
+  `d3ae2bbd6` with identical results.
+- Owner: test infrastructure maintainers
+- Symptom: in native mode `pytest tests/backends/acl` reports 1 failed (the
+  rfft case) / 441 passed / 11 skipped. Under `JITTOR_TORCH_SHIM=1` the same
+  directory reports 15 failed / 455 passed / 12 skipped, and 14 of the failures
+  are in `test_acl_torch_compat.py`: relu, silu, pad, roll, rms_norm,
+  group_norm, batch_norm and fused_adamw among them. Their assertions
+  (`_assert_acl_device`, `output.is_cuda is False`) see `'cpu' != 'device'`.
+- Cause: under the shim on this machine a tensor made by `torch.tensor(...)`
+  lands on the host, so the ACL provider is never asked and the recorders and
+  placement checks see nothing. Those cases rely on `jt.flag_scope(use_acl=1,
+  use_cuda=1)` making the accelerator the default device, which does not happen
+  in this mode on this machine. Not yet distinguished: the flag scope's default
+  device against the shim's device resolution.
+- Workaround: run the ACL gate in native mode, where the numbers above hold; a
+  case that needs shim placement states `device="npu"` itself, as
+  `test_sdpa_boolean_mask_layouts_stay_on_acl` now does.
+- Evidence: the two directory runs above on a 910B3.
+- Exit condition: the file passes under the shim on a 910B3, or every placement
+  case states its device explicitly.
+
+
+## KI-COMPAT-023: `jt.nn.silu` and the Torch frontend's SiLU differ by a half-ulp on CUDA
+
+- Severity: Low (one half-precision ulp, about 25% of elements; the values are
+  the same to within a half's rounding)
+- Status: Open; reproduced 2026-11-01 at `2869f2c5b` and, with the division
+  changes reverted and the core rebuilt, at `d8e30464c` too.
+- Owner: torch compatibility / half-precision numerics
+- Symptom: `compat/tests/torch/test_native_fast_paths.py::TestNativeModuleDispatch::test_an_inference_group_norm_and_the_silu_after_it`
+  fails on CUDA at `torch.nn.Sequential(torch.nn.SiLU())(plain)` against
+  `jt.nn.silu(plain)` for half `plain`: 52-66 of 256 elements differ by one
+  half ulp (max 1.953e-03). The module spelling is bit-identical to real
+  PyTorch 2.11 (0 of 256 over several seeds), so `jt.nn.silu` is the side that
+  is off.
+- Cause: not isolated. `jt.nn.silu(half)` widens to float32, computes
+  `x * sigmoid(x)` and rounds once; the module path reaches the same function,
+  so the two must be taking different implementations somewhere between them
+  (the ACL `nn.silu` kernel is not involved on CUDA). A probe that builds the
+  same values outside the test and compares the two spellings under
+  `torch.no_grad()` agrees, while the test -- whose values are drawn inside the
+  scope -- does not, so grad-mode state is a suspect.
+- Workaround: none needed for accuracy; the difference is a half's last bit.
+  Use `torch.nn.functional.silu` (the frontend spelling) where bit-exact parity
+  with PyTorch is being asserted.
+- Evidence: the nodeid above, one process, `CUDA_VISIBLE_DEVICES` set; plus the
+  seed probe recorded in `docs/results/2026-11-01-python-float-division.md`.
+- Exit condition: the two spellings answer the same bits, and the case is green.
