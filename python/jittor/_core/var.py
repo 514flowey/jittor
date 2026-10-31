@@ -1368,11 +1368,21 @@ def pow(x, y):
     :param y: the second input.
     :type y: a python number or jt.Var.
     '''
-    if isinstance(x,Var) and isinstance(y, (ori_int, ori_float)):
+    if isinstance(x,Var) and isinstance(y, (ori_int, ori_float, ori_complex)):
         if y == 2:
             return x.sqr()
         if y == 3 and _jittor_dtype_name(x.dtype) == "float32":
             return x*x*x
+        if (y == 0 or y == 1) and _jittor_dtype_name(x.dtype).startswith("complex"):
+            # torch special-cases these two Python-scalar exponents of a
+            # complex tensor: x ** 0 is ones (with a zero gradient) and
+            # x ** 1 is x. A tensor exponent goes through the kernel, where a
+            # zero base gives 0 ** 0 = nan+nanj and a NaN gradient at 0 ** 1,
+            # as torch's tensor pow does.
+            if y == 1:
+                return x.clone()
+            import jittor as jt
+            return jt.ternary(jt.ones(x.shape, "bool"), jt.ones(x.shape, x.dtype), x)
     return core.ops.pow(x, y)
 
 Var.pow = Var.__pow__ = pow

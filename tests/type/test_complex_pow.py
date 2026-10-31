@@ -8,8 +8,9 @@
 # Native complex `x ** y`. It had no kernel: every complex64/complex128 pow
 # failed at materialisation with "Op 'pow' is not supported for dtype(s)".
 #
-# Forward references are numpy's (the principal branch, numpy and torch
-# agree on every case here, zero bases included). The gradient is the
+# Forward references are numpy's (the principal branch) away from a zero
+# base, where numpy and torch agree; at a zero base jittor follows torch, see
+# test_zero_base_follows_torch. The gradient is the
 # conjugate-Wirtinger one of the other holomorphic ops: for
 # loss = Re sum(W * x**y), d/dx = conj(W * y * x**(y-1)) and
 # d/dy = conj(W * x**y * log x); a real exponent takes the real part. Where
@@ -178,3 +179,41 @@ def test_python_exponent_stays_single_precision_on_complex64(device):
     z = jt.array(np.array([1 + 1j, -2j], dtype="complex64"))
     assert str((z ** 1.2345678901234567).dtype) == "complex64"
     assert str((z * (0.5 + 0.25j)).dtype) == "complex64"
+
+
+# A zero base follows torch, which differs from numpy there. A tensor exponent
+# is std::pow, exp(y log 0): 0 for Re y > 0, inf+nanj for a real y < 0 and
+# nan+nanj otherwise, 0 ** 0 included; its d/dx at y == 1 is 1 * 0 ** 0, NaN.
+# torch special-cases the Python-scalar exponents 0 (ones, zero gradient) and
+# 1 (the identity). Values recorded from torch 2.5.1 on CPU and CUDA.
+def _classify(z):
+    def part(v):
+        return "nan" if np.isnan(v) else ("inf" if np.isposinf(v) else ("-inf" if np.isneginf(v) else float(v)))
+    return [(part(c.real), part(c.imag)) for c in np.atleast_1d(z)]
+
+
+_ZERO_TENSOR = {0: ("nan", "nan"), 1: (0.0, 0.0), 2: (0.0, 0.0), 0.5: (0.0, 0.0),
+                -1: ("inf", "nan"), 0.5j: ("nan", "nan")}
+_ZERO_SCALAR = {0: (1.0, 0.0), 1: (0.0, 0.0), 2: (0.0, 0.0), 0.5: (0.0, 0.0), -1: ("inf", "nan")}
+
+
+@pytest.mark.parametrize("dtype", ["complex64", "complex128"])
+def test_zero_base_follows_torch(device, dtype):
+    for y, expected in _ZERO_TENSOR.items():
+        x = jt.array(np.zeros(1, dtype=dtype), dtype=dtype)
+        got = (x ** jt.array(np.array([y], dtype=dtype), dtype=dtype)).numpy()
+        assert _classify(got) == [expected], ("tensor", y, got)
+    for y, expected in _ZERO_SCALAR.items():
+        x = jt.array(np.zeros(1, dtype=dtype), dtype=dtype)
+        got = (x ** y).numpy()
+        assert _classify(got) == [expected], ("scalar", y, got)
+    # Gradients of the base at 0.
+    x = jt.array(np.array([0, 1 + 1j], dtype=dtype), dtype=dtype)
+    g_scalar0 = jt.grad((x ** 0).real.sum(), x).numpy()
+    g_scalar1 = jt.grad((x ** 1).real.sum(), x).numpy()
+    one = jt.array(np.array([1.0, 1.0], dtype=dtype), dtype=dtype)
+    g_tensor1 = jt.grad((x ** one).real.sum(), x).numpy()
+    np.testing.assert_array_equal(g_scalar0, [0, 0])
+    np.testing.assert_array_equal(g_scalar1, [1, 1])
+    assert np.isnan(g_tensor1[0].real) and np.isnan(g_tensor1[0].imag)
+    np.testing.assert_allclose(g_tensor1[1], 1)

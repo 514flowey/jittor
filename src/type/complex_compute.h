@@ -85,16 +85,21 @@ inline JT_CPLX_HD complex64 jt_csqrt(complex64 a) {             // principal sqr
     return complex64(re, a.imag < 0 ? -im : im);
 }
 
-// Principal power z^w, as numpy's npy_cpow and torch: w == 0 gives 1; a zero
-// base gives 0 for Re w > 0 and nan otherwise; a small integer exponent is
-// repeated multiplication (exact for Gaussian integers, unlike exp(w log z));
-// everything else is exp(w log z), with log's branch cut on the negative axis.
+// Principal power z^w with torch's tensor-exponent semantics (std::pow): a
+// zero base gives 0 for Re w > 0, inf+nanj for a real w < 0 and nan+nanj
+// otherwise -- 0^0 included, which is exp(0 * log 0); any other base gives 1
+// for w == 0. A small integer exponent is repeated multiplication (exact for
+// Gaussian integers, unlike exp(w log z)); everything else is exp(w log z),
+// with log's branch cut on the negative axis. torch's Python-scalar exponents
+// 0 and 1 (ones, identity) are special-cased in `jittor.pow` instead, which is
+// where a scalar exponent can still be told from a tensor one.
 inline JT_CPLX_HD complex64 jt_cpow(complex64 a, complex64 b) {
-    if (b.real == 0 && b.imag == 0) return complex64(1, 0);
     if (a.real == 0 && a.imag == 0) {
         if (b.real > 0) return complex64(0, 0);
+        if (b.imag == 0 && b.real < 0) return complex64(INFINITY, NAN);
         return complex64(NAN, NAN);
     }
+    if (b.real == 0 && b.imag == 0) return complex64(1, 0);
     if (b.imag == 0 && b.real == ::truncf(b.real) && ::fabsf(b.real) < 100) {
         int n = (int)b.real;
         int m = n < 0 ? -n : n;
@@ -183,16 +188,14 @@ inline JT_CPLX_HD complex128 jt_csqrt(complex128 a) {
     return complex128(re, a.imag < 0 ? -im : im);
 }
 
-// Principal power z^w, as numpy's npy_cpow and torch: w == 0 gives 1; a zero
-// base gives 0 for Re w > 0 and nan otherwise; a small integer exponent is
-// repeated multiplication (exact for Gaussian integers, unlike exp(w log z));
-// everything else is exp(w log z), with log's branch cut on the negative axis.
+// As the complex64 jt_cpow above.
 inline JT_CPLX_HD complex128 jt_cpow(complex128 a, complex128 b) {
-    if (b.real == 0 && b.imag == 0) return complex128(1, 0);
     if (a.real == 0 && a.imag == 0) {
         if (b.real > 0) return complex128(0, 0);
+        if (b.imag == 0 && b.real < 0) return complex128(INFINITY, NAN);
         return complex128(NAN, NAN);
     }
+    if (b.real == 0 && b.imag == 0) return complex128(1, 0);
     if (b.imag == 0 && b.real == ::trunc(b.real) && ::fabs(b.real) < 100) {
         int n = (int)b.real;
         int m = n < 0 ? -n : n;
