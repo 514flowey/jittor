@@ -419,6 +419,11 @@ struct VarHolder {
         return var->is_stop_grad();
     }
 
+    // See VarFlags::_replay_result.
+    // @pyjt(_mark_replay_result)
+    // @attrs(return_self)
+    VarHolder* mark_replay_result();
+
     // @pyjt(_set_first_order_only)
     // @attrs(return_self)
     inline VarHolder* set_first_order_only() {

@@ -261,6 +261,22 @@ static void apply_tensor_hook(Var* var, VarPtr& gradient) {
     gradient = move(replacement);
 }
 
+// How many results `jt.capture_step` has marked (var_holder.cc); while it is
+// zero a missing target needs no search for one.
+EXTERN_LIB std::atomic<int64> replay_results_marked;
+
+// A replayed step's result upstream of `loss`, or null. Unlike the search
+// above, this walks every input, since the point is that it has no path.
+static Var* find_replay_result(Var* loss) {
+    if (!replay_results_marked.load(std::memory_order_relaxed)) return nullptr;
+    vector<Node*> nodes{loss};
+    bfs_backward(nodes, [](Node*) { return true; });
+    for (Node* node : nodes)
+        if (node->is_var() && node->var()->flag(VarFlags::_replay_result))
+            return node->var();
+    return nullptr;
+}
+
 DEFINE_FLAG(int, missing_grad_error, 0, "Raise instead of warning when a target of grad receives no gradient at all and is filled with zeros.");
 
 void warn_grad_break(int i, Var* v) {
@@ -525,6 +541,14 @@ vector<VarPtr> grad(
                 grad = move(observed->second);
         }
         if (!grad && materialize_grads) {
+            if (Var* replayed = find_replay_result(loss))
+                USER_ERROR << "jt.grad: the loss depends on the result of a captured or"
+                    << "replayed jt.capture_step call, which has no autograd history: its"
+                    << "values were copied out of the recorded step, so a gradient"
+                    << "through it would silently be zero. Compute the gradient inside the"
+                    << "step function, or call the step under jt.no_grad() (or with"
+                    << "stop_grad inputs and parameters) to use its result as a constant."
+                    << "Target" << i << ", replayed result:" << replayed;
             // TODO: better warning message
             warn_grad_break(i, var);
             grad = make_number(0.f, var);

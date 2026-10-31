@@ -38,6 +38,12 @@ b8s256 训练 0.51 都赢；decode（batch 1 seq 1）输 1.97，d1024 decode 输
 Torch 前端把 `torch.compile(..., mode="reduce-overhead")` 接到这两者上：包模块走推理
 重放，包函数走整步捕获。
 
+`jt.capture_step` 的捕获与重放调用返回的是从录下的整步里拷出的值，与本次输入、
+与步内参数之间没有 autograd 边；反向应在步函数内部完成。只要输入或步内参数要求梯度
+（且不在 `jt.no_grad()` 下），在步外对这些返回值求导（`jt.grad`、优化器的
+`step(loss)`）会明确报错，而不是得到零梯度；第一次（eager）调用的返回值照常可导。
+不要求梯度时返回值就是常量，可以照常喂给下游可训练模块。
+
 此外有一条**默认开启**的自动策略（`JT_AUTO_GRAPH_REPLAY=1`）：它只看
 `no_grad` 下、最外层的模块调用，只在相同形状连续出现两次之后介入，只接受 Var 输入
 合计小于 `auto_graph_replay_bytes`（默认 4 MB）的调用，并且只在工作集不超过

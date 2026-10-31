@@ -393,7 +393,7 @@ class _Capture:
     __slots__ = ("inputs", "host_inputs", "outputs", "template", "roots", "state",
                  "state_lists", "prologue", "guards", "signature", "refused", "random",
                  "frozen_random", "exact", "graph_bytes", "published_gradients",
-                 "gradient_leaves")
+                 "gradient_leaves", "differentiable_leaves")
 
     def __init__(self):
         self.prologue = []
@@ -404,6 +404,7 @@ class _Capture:
         self.graph_bytes = 0
         self.published_gradients = []
         self.gradient_leaves = []
+        self.differentiable_leaves = False
 
 
 def _finish_normally(roots):
@@ -716,6 +717,13 @@ class StepCapture:
                     holder._update(_core._ready_step_gradient(source))
 
         cap.inputs = _input_vars((private_args, private_kwargs), [])
+        # Whether the step reads anything that asks for a gradient besides its
+        # inputs -- a parameter, a closure tensor. Its result then has
+        # gradients a replay cannot give; see `_results`.
+        private = {id(v) for v in cap.inputs}
+        cap.differentiable_leaves = any(
+            bool(v.requires_grad) for v in _core._step_leaf_holders(roots)
+            if id(v) not in private)
         cap.host_inputs = any(int(v.device_id) < 0 for v in cap.inputs)
         cap.outputs = outputs
         cap.template = template
@@ -730,13 +738,22 @@ class StepCapture:
         cap.signature = self._call_signature(args, kwargs)
         # What a device recording of this step would hold.
         cap.graph_bytes = working.bytes()
-        return cap, self._results(cap, outputs)
+        return cap, self._results(cap, outputs, (args, kwargs))
 
-    def _results(self, cap, sources):
+    def _results(self, cap, sources, call_inputs):
         outs = [_empty_like(o) for o in cap.outputs]
         with jt.no_grad():
             for out, src in zip(outs, sources):
                 out._copy_into(src, False)
+        # The values are copies out of the recorded step, with no autograd
+        # edge to this call's inputs or to the step's parameters: a grad
+        # through them used to answer zero (`jt.grad(step(x), x)` was 4, 0,
+        # 0 for x = 2, 3, 4). When either asks for a gradient, mark them so
+        # that such a grad raises instead (VarFlags::_replay_result).
+        if not jt.flags.no_grad and (cap.differentiable_leaves or any(
+                bool(v.requires_grad) for v in _input_vars(call_inputs, []))):
+            for out in outs:
+                out._mark_replay_result()
         return _rebuild(cap.template, outs)
 
     # -- guards --------------------------------------------------------
@@ -864,7 +881,7 @@ class StepCapture:
             if self._cuda_graph and not _core.graph_leaves_moved(self._cuda_graph):
                 _core.graph_launch(self._cuda_graph)
                 self.stats["graph"] += 1
-                return self._results(cap, self._graph_out)
+                return self._results(cap, self._graph_out, (args, kwargs))
             if self._cuda_graph:
                 # A leaf the recording reads has moved -- a parameter read back
                 # to the host migrates -- so its addresses are stale; this step
@@ -879,7 +896,7 @@ class StepCapture:
                     self._record_at = self.stats["replayed"] + 2
             jt.sync(cap.roots, False, False)
             self._write_back(cap)
-            return self._results(cap, cap.outputs)
+            return self._results(cap, cap.outputs, (args, kwargs))
         finally:
             jt.flags.keep_graph = before
 
