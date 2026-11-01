@@ -127,12 +127,6 @@ struct VarFlags {
         // unsynced constant follow its operand's device (op.cc
         // `is_pending_scalar`), so that fact gets its own bit.
         _is_constant,
-        // The result of a captured or replayed step (`jt.capture_step`): its
-        // bytes were copied out of a recorded graph, so it has no autograd
-        // history although the step it came from was differentiable. A grad
-        // that finds no path to a target, and finds one of these upstream of
-        // the loss, raises instead of answering zero (grad.cc).
-        _replay_result,
         _end,
     };
 };

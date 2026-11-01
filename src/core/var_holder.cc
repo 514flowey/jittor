@@ -1940,12 +1940,4 @@ void migrate_all_to_cpu() {
         }
 }
 
-std::atomic<int64> replay_results_marked{0};
-
-VarHolder* VarHolder::mark_replay_result() {
-    var->set_flag(VarFlags::_replay_result);
-    replay_results_marked.fetch_add(1, std::memory_order_relaxed);
-    return this;
-}
-
 } // jittor

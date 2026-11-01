@@ -80,6 +80,40 @@ class TestStepCapture(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "no autograd history"):
             jt.grad(out, w)
 
+    # The step's part of a grad that also has an ordinary path used to be
+    # dropped without a word: step(x) + x.sum() gave 1 where 2x + 1 is right.
+    def test_a_grad_with_another_path_into_the_target_raises(self):
+        w = jt.array([3.0])
+        step = jt.capture_step(lambda x: ((x * x).sum(), {"scaled": w * x}), record=False)
+        for value in (2.0, 3.0, 4.0):
+            x = jt.array([value])
+            total, parts = step(x)
+            loss = total + x.sum()
+            if step.stats["captured"] == 0:
+                np.testing.assert_allclose(jt.grad(loss, x).numpy(), [2 * value + 1])
+                continue
+            np.testing.assert_allclose(loss.numpy(), value * value + value)
+            for target, grad_of in ((x, loss), (w, parts["scaled"].sum() + w.sum()),
+                                    (x, parts["scaled"].sum() + total)):
+                with self.assertRaisesRegex(RuntimeError, "no autograd history"):
+                    jt.grad(grad_of, target)
+        self.assertEqual(step.stats["replayed"], 1)
+
+    def test_a_grad_that_does_not_reach_the_step_is_untouched(self):
+        # A target the step did not read, the result itself as the target,
+        # and a stop_grad result: none of them loses a gradient to the replay.
+        step = jt.capture_step(lambda x: (x * x).sum(), record=False)
+        y = jt.array([5.0])
+        for value in (2.0, 3.0, 4.0):
+            x = jt.array([value])
+            out = step(x)
+            np.testing.assert_allclose(jt.grad(out * y.sum() + y.sum(), y).numpy(),
+                                       [value * value + 1])
+            np.testing.assert_allclose(jt.grad(out * 3 + y.sum(), out).numpy(), 3.0)
+            frozen = out.stop_grad()
+            np.testing.assert_allclose(jt.grad(frozen * x.sum(), x).numpy(), [value * value])
+        self.assertEqual(step.stats["replayed"], 1)
+
     def test_constant_results_stay_usable(self):
         # Nothing the step reads asks for a gradient, or the call is under
         # no_grad: the result is a constant, and a grad that also reaches a
