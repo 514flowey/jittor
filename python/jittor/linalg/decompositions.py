@@ -24,20 +24,39 @@ from jittor._runtime.dispatch import select_kernel
 from .solving import _solve_triangular
 
 
-def _resolution(values, size):
-    """How close two of ``values`` (real, along the last axis) may be and still
-    count as one: ``32 * size * eps * max|values|`` per matrix. Below it the
-    computed values differ only by rounding, so their order and spacing are
-    noise. CUDA's Jacobi SVD (``gesvdj``) returned a repeated singular value
-    up to ``4.2 * size * eps * max`` off (4x4 to 128x128, every LAPACK dtype),
-    so two copies differ by up to twice that; LAPACK stayed within
-    ``eps * max``. Detached: it picks which terms a backward keeps, it is not
-    a quantity to differentiate."""
-    try:
-        eps = float(np.finfo(np.dtype(_jittor_dtype_name(values.dtype))).eps)
-    except TypeError:
-        eps = float(np.finfo(np.float32).eps)
-    return values.detach().abs().reduce("maximum", -1, keepdims=True) * (32 * size * eps)
+def _frobenius(x):
+    """Frobenius norm over the last two axes, kept as (..., 1)."""
+    absq = (x * x.conj()).real if _is_native_complex(x) else x * x
+    return absq.sum([-2, -1]).sqrt().unsqueeze(-1)
+
+
+def _resolution(a, left, values, right_h):
+    """How close two computed ``values`` (real, along the last axis) of the
+    decomposition ``a = left diag(values) right_h`` may be and still be
+    copies of one, per matrix: twice the decomposition's own measured error,
+    ``||a - left diag(values) right_h|| + max|values| (||left^H left - I||
+    + ||right_h right_h^H - I||)`` (Frobenius).
+
+    By Weyl's theorem each computed value is within that error of an exact
+    one, so values further apart than twice it are distinct in the exact
+    spectrum too, and their gap is a gap: its inverse is kept however small
+    it is (``diag(1, 1 + 2^-19)`` in complex64 has a gap of 16 eps, and a
+    fixed ``32 * size * eps * max`` used to treat it as a repeated value and
+    zero the derivative). A repeated value comes back split by at most 0.3 of
+    that error -- measured for CUDA's Jacobi SVD (``gesvdj``), cuSOLVER's and
+    LAPACK's eigh and LAPACK's SVD, 2x2 to 128x128, every LAPACK dtype -- so
+    its copies are still taken as one. Detached: it picks which terms a
+    backward keeps, it is not a quantity to differentiate."""
+    import jittor as jt
+    a, left, values, right_h = a.detach(), left.detach(), values.detach(), right_h.detach()
+    k = values.shape[-1]
+    values_c = values * (1 + 0j) if _is_native_complex(left) else values
+    rebuilt = jt.matmul(left * values_c.unsqueeze(-2), right_h)
+    eye = _eye_like(values, k)
+    nonorth = (_frobenius(jt.matmul(_conj_T(left), left) - eye)
+               + _frobenius(jt.matmul(right_h, _conj_T(right_h)) - eye))
+    err = _frobenius(a - rebuilt) + values.abs().reduce("maximum", -1, keepdims=True) * nonorth
+    return err * 2
 
 
 def _guarded_reciprocal(values, keep):
@@ -50,10 +69,15 @@ def _guarded_reciprocal(values, keep):
     return keep / (values * keep + (1 - keep))
 
 
-def _spectral_gaps(lam, values, tol):
-    """``F_ij = 1 / (lam_j - lam_i)`` off the diagonal, the factor in the
-    eigen/singular vector adjoint, with ``F_ij = 0`` wherever
+def _spectral_gaps(differences, values, tol):
+    """``F_ij = 1 / differences_ij`` -- ``lam_j - lam_i``, the factor in the
+    eigen/singular vector adjoint -- with ``F_ij = 0`` wherever
     ``|values_j - values_i| <= tol`` (the diagonal included).
+
+    The caller forms the differences: for an SVD, ``s_j^2 - s_i^2`` as
+    ``(s_j - s_i)(s_j + s_i)``, since squaring first loses the gap of two
+    close large values to the rounding of their squares (1000 and
+    1000 + 2^-9 in float32: 1.6% off).
 
     Equal ``values`` make the vectors that go with them any basis of their
     common subspace. A loss that does not depend on that choice -- the only
@@ -64,8 +88,13 @@ def _spectral_gaps(lam, values, tol):
     with the basis held fixed, not a NaN.
     """
     gap = (values.unsqueeze(-2) - values.unsqueeze(-1)).abs()
-    keep = (gap > tol.unsqueeze(-1)).cast(lam.dtype)
-    return _guarded_reciprocal(lam.unsqueeze(-2) - lam.unsqueeze(-1), keep)
+    keep = (gap > tol.unsqueeze(-1)).cast(differences.dtype)
+    return _guarded_reciprocal(differences, keep)
+
+
+def _differences(values):
+    """``values_j - values_i`` at ``[..., i, j]``."""
+    return values.unsqueeze(-2) - values.unsqueeze(-1)
 
 
 @_host_lapack
@@ -95,7 +124,8 @@ class _SVD(Function):
     # complex.py::complex_svd).
     #
     # f is 0 between singular values equal to rounding and S^-1 is 0 at a
-    # zero one (`_spectral_gaps`): the vectors of a repeated or zero
+    # zero one (`_spectral_gaps`, with `_resolution` measuring what rounding
+    # is for this decomposition): the vectors of a repeated or zero
     # singular value are any basis of their subspace, and dividing by the
     # zero gap returned NaN for the whole gradient even when the loss did
     # not depend on that basis.
@@ -131,8 +161,8 @@ class _SVD(Function):
         vh = _reconnect(self.v, vh_live)
         s = s.real if complex_input else s
         v = _conj_T(vh)
-        tol = _resolution(s, max(m, n))
-        f = _spectral_gaps(s * s, s, tol)
+        tol = _resolution(x, u, s, vh)
+        f = _spectral_gaps(_differences(s) * (s.unsqueeze(-2) + s.unsqueeze(-1)), s, tol)
         s_inv = _guarded_reciprocal(s, (s.detach() > tol).cast(s.dtype))
         s_i = s.unsqueeze(-1)
         s_j = s.unsqueeze(-2)
@@ -419,7 +449,12 @@ class _Eigh(Function):
             gw = gw.real if complex_input else gw
             t = jt.matmul(v * gw.unsqueeze(-2), vH)
         if gv is not None:
-            factors = _spectral_gaps(w_r, w_r, _resolution(w_r, k))
+            # The Hermitian matrix eigh decomposed: the lower triangle.
+            lower = jt.tril(x, -1)
+            diag = _diag_of(x)
+            hermitian = lower + _conj_T(lower) + _diag_embed(diag.real if complex_input else diag, k) * (
+                (1 + 0j) if complex_input else 1)
+            factors = _spectral_gaps(_differences(w_r), w_r, _resolution(hermitian, v, w_r, vH))
             term = jt.matmul(jt.matmul(v, factors * jt.matmul(vH, gv)), vH)
             t = term if t is None else t + term
         if t is None:

@@ -246,6 +246,14 @@ def _cuda_svd_reduced(cp, a):
     3.1 ms). When it does not converge it reports so, and the matrix goes to
     ``gesvd`` instead -- the same fallback torch takes. Reading that status is
     one host sync.
+
+    The singular values are then re-read as Rayleigh quotients
+    ``Re(u_i^H a v_i)``, whose error is second order in the vectors'. Jacobi's
+    own values carry the rounding of every rotation: for ``diag(1, 1 + 2^-19)``
+    in complex64 one came back an ulp off, which is 1/16 of the gap, and the
+    gradient through that gap 3% off (LAPACK's SVD, and torch's, exact). Re-read,
+    the values may change order by a rounding; they are sorted again, and the
+    vectors with them, on the device.
     """
     import cupyx
     from cupyx import cusolver
@@ -255,6 +263,9 @@ def _cuda_svd_reduced(cp, a):
     except np.linalg.LinAlgError:
         return cp.linalg.svd(a, full_matrices=False)
     # gesvdj returns V itself, (N, K)
+    s = cp.maximum(cp.real(cp.einsum("mi,mn,ni->i", u.conj(), a, v)), 0).astype(s.dtype)
+    order = cp.argsort(-s)
+    u, s, v = u[:, order], s[order], v[:, order]
     return u, s, v.conj().T
 
 

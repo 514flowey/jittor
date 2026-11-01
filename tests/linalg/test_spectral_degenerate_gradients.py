@@ -108,3 +108,85 @@ def test_eigh_gradient_at_repeated_eigenvalues_matches_a_split_pair(device, dtyp
     split = _eigh_projector_loss_grad(u @ np.diag([0.5, 1.0, 1.99, 2.01]) @ u.conj().T, dtype)
     assert np.isfinite(repeated).all(), repeated
     np.testing.assert_allclose(repeated, split, atol=_ATOL[dtype])
+
+
+# A small gap that is still a gap. diag(1, 1 + 2^-19) in complex64 has a gap
+# of 16 eps; the vectors' derivative is C_12 / gap, and a fixed
+# `32 * size * eps * max` resolution took it for a repeated value and returned
+# a zero gradient and HVP. The resolution is the decomposition's measured
+# error now, which a diagonal matrix's exact decomposition leaves at zero.
+# Ground truth: the loss Re tr(C P), P the projector onto the top vector
+# (phase invariant), differentiated by central differences of numpy's
+# complex128 decomposition along random Hermitian directions; the HVP against
+# the same input in double precision, where the gap is far from any
+# resolution.
+def _top_projector_loss_np(h, c, kind):
+    if kind == "eigh":
+        vec = np.linalg.eigh(h)[1][:, -1]
+    else:
+        vec = np.linalg.svd(h)[0][:, 0]
+    return np.real(np.trace(c @ np.outer(vec, vec.conj())))
+
+
+def _top_projector_loss(x, c, kind):
+    if kind == "eigh":
+        vec = linalg.eigh(x)[1][:, -1:]
+    else:
+        vec = linalg.svd(x)[0][:, :1]
+    p = jt.matmul(vec, vec.transpose(-1, -2).conj())
+    n = x.shape[-1]
+    return (jt.matmul(c, p) * jt.array(np.eye(n), dtype="float32")).real.sum()
+
+
+def _double(dtype):
+    return {"float32": "float64", "complex64": "complex128"}[dtype]
+
+
+@pytest.mark.parametrize("kind", ["eigh", "svd"])
+@pytest.mark.parametrize("dtype", ["float32", "complex64"])
+@pytest.mark.parametrize("log2_gap", [-19, -15])
+@pytest.mark.parametrize("scale, n", [(1.0, 2), (1e3, 2), (1.0, 4)])
+def test_a_small_nonzero_gap_keeps_its_derivative(device, kind, dtype, log2_gap, scale, n):
+    rng = np.random.default_rng(abs(log2_gap) * 7 + n)
+    cplx = dtype.startswith("complex")
+    values = scale * np.array([1.0, 1.0 + 2.0 ** log2_gap, 2.0, 3.0][:n])
+    if n == 2:
+        values = values[::-1]           # the top vector belongs to the gap
+    else:
+        values = np.array([scale * 0.5, scale * 0.25, scale * 1.0, scale * (1.0 + 2.0 ** log2_gap)])
+    h = np.diag(values).astype(dtype)
+    c = rng.normal(size=(n, n)) + (1j * rng.normal(size=(n, n)) if cplx else 0)
+    c = ((c + c.conj().T) / 2).astype(dtype)
+
+    def grad_of(dt):
+        x = jt.array(h.astype(dt), dtype=dt)
+        return x, jt.grad(_top_projector_loss(x, jt.array(c.astype(dt), dtype=dt), kind), x)
+
+    x, g = grad_of(dtype)
+    g_np = g.numpy().astype("complex128")
+    gap = scale * 2.0 ** log2_gap
+    hh, cc = h.astype("complex128"), c.astype("complex128")
+    worst = scale_ref = 0.0
+    for _ in range(4):
+        d = rng.normal(size=(n, n)) + (1j * rng.normal(size=(n, n)) if cplx else 0)
+        d = (d + d.conj().T) / 2
+        t = gap * 1e-4
+        fd = (_top_projector_loss_np(hh + t * d, cc, kind)
+              - _top_projector_loss_np(hh - t * d, cc, kind)) / (2 * t)
+        worst = max(worst, abs(np.real(np.sum(np.conj(g_np) * d)) - fd))
+        scale_ref = max(scale_ref, abs(fd))
+    assert scale_ref > 1.0 / gap * 1e-3     # the derivative is the large one
+    assert worst <= 2e-5 * scale_ref, (worst, scale_ref)
+
+    v = rng.normal(size=(n, n)) + (1j * rng.normal(size=(n, n)) if cplx else 0)
+    v = ((v + v.conj().T) / 2)
+
+    def hvp(dt):
+        x, g = grad_of(dt)
+        vv = jt.array(v.astype(dt), dtype=dt)
+        inner = (g.real * vv.real + g.imag * vv.imag).sum() if cplx else (g * vv).sum()
+        return jt.grad(inner, x).numpy().astype("complex128")
+
+    got, expected = hvp(dtype), hvp(_double(dtype))
+    assert np.abs(expected).max() > 1.0 / gap ** 2 * 1e-4
+    np.testing.assert_allclose(got, expected, rtol=0, atol=1e-4 * np.abs(expected).max())
