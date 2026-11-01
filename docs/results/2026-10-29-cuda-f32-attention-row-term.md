@@ -131,6 +131,11 @@ ViT 的注意力同样走 float32 融合核，1.67x → 1.28x 来自同两处修
 随机权重下贪心解码的 near-tie 会翻转个别 token，序列长度两侧都是 136，不是长度
 漂移。
 
+上表之后又修了 relay 与线性快路径的两处准入（`81b1ffda8`、`b677f2358`），它们只在
+原先会中断的图上生效；在空闲卡上重测卷积密集的四项：`resnet50_train` 0.93x、
+`sd15_unet_train` 0.64x、`vit_b16_train` 0.89x、`ddpm_unet_train` 0.97x（同一批里
+ddpm 读到 1.15x，单独重测 0.97x，PyTorch 侧在 67–76 ms 之间漂移），与上表一致。
+
 ## 复现
 
 ```bash
@@ -159,8 +164,11 @@ CUDA 设备侧 profile 需要 CUPTI：`JITTOR_CUPTI_LIB=<...>/nvidia/cuda_cupti/
   所在解释器没有装 `asv`，与本改动无关。
 - 生态 parity（`test_ecosystem_parity.py -k EcosystemParityCUDA`）：10 passed /
   6 skipped / 1 failed。唯一失败是 `transformers_t5` 的一个解码器 MLP 梯度
-  3.337e-02（带宽 2e-2），在 `008cae211` 上数值完全相同，属既有问题，记在
-  KI-COMPAT-021。
+  3.337e-02（带宽 2e-2），在 `008cae211` 上数值完全相同，当时记为 KI-COMPAT-021。
+  该条已在 2026-10-31 关闭：两侧**关掉 TF32** 后同一比较的 48 个梯度全部吻合到
+  9e-7（CPU 上 1e-6），说明差的是 TF32 十位尾数而不是内核；这个用例现在显式
+  `tf32=False` 地与参考实现对比（其余用例仍按 `JITTOR_ECOSYSTEM_TF32` 默认开
+  TF32 跑，策略本身照旧被覆盖）。
 
 ## 未结
 
@@ -168,3 +176,10 @@ CUDA 设备侧 profile 需要 CUPTI：`JITTOR_CUPTI_LIB=<...>/nvidia/cuda_cupti/
   每个算子的 Python 开销。
 - BERT/ViT 剩余的 1.26–1.28x 同样由主机侧构图主导（每 op 约 5–7 µs，PyTorch 约
   1–2 µs）。
+- `sd15_unet_train` 在 `e10e7b968` 上的实测（空闲卡，batch 2，`--size full`）：一步
+  210 ms，其中 173 ms 是 `step()` 返回前的构图时间、37 ms 是随后 sync 的设备时间；
+  作为对照 PyTorch 是 177 ms 调度 + 142 ms 设备。cProfile 里最大的单项是
+  `jittor_core.grad_optional`（反向构图）**88 ms**，其后是优化器写回的
+  `_copy_detached_storage` 2058 次共 25 ms、模块派发 `_module_call` 665 次共 64 ms
+  （含各模块整个前向）、flag 作用域 4118 次 7 ms、`dtype_name` 5979 次 5 ms。所以
+  这条的剩余差距在**反向图构建**，不在前向派发。

@@ -1,8 +1,8 @@
 # Known-Issues Ledger
 
 - Status: Maintained
-- Last reviewed: 2026-10-31
-- Baseline: `211577a5a`
+- Last reviewed: 2026-11-01
+- Baseline: `d8e30464c`
 - Owner: Jittor core maintainers
 - Review when: an entry is fixed or narrowed, a strict expected failure
   XPASSes, a new defect is reproduced, or at quarterly maintenance
@@ -290,19 +290,23 @@ workaround.
 
 - Severity: Limitation (performance)
 - Status: Open; measured 2026-09-06 on an sm_89 GPU with TF32, exclusive card
-- Owner: code generation, with the Torch-compat division in KI-COMPAT-009
+- Owner: code generation
 - Symptom: the elementwise class of a `large_diffusers_unet2d` step was 3.37 ms
   (nsys) / 3.29 ms (profiler), 1086 GB/s, roofline ratio 0.84 -- already at the
   measured copy bandwidth -- against PyTorch's 3.04 ms.
 - Cause: the positive excess of the 49 fused kernels was about 0.59 ms and none
-  of it is code generation: the float64 scalar division of KI-COMPAT-009
-  (0.55 ms), a bare `transpose` (`src/ops/composite/transpose_op.cc`, 0.10 ms),
-  and about 60 kernels that move almost no data (0.23 ms of launch latency).
+  of it is code generation: 0.55 ms was the float64 scalar division that
+  KI-COMPAT-009 carried -- that entry closed on 2026-11-01 by dividing in the
+  tensor's dtype (see `docs/results/2026-11-01-python-float-division.md`), so
+  this 0.55 ms needs re-measuring rather than assuming -- 0.10 ms a bare
+  `transpose` (`src/ops/composite/transpose_op.cc`), and 0.23 ms of launch
+  latency across about 60 kernels that move almost no data.
 - Workaround: none.
 - Evidence: `agent/skills/cuda-elementwise-bandwidth-roofline/` (measurement
   scripts, nsys and profiler cross-checked, measured copy roofline).
-- Exit condition: re-measure after KI-COMPAT-009 is decided; close when the
-  class is no slower than PyTorch's on the same step.
+- Exit condition: re-measure the class on the same step now that the division
+  no longer widens; close when it is no slower, or narrow the entry to what
+  remains.
 
 ## KI-TUNER-001: the matmul and conv relays never fire, so a hand-written meta-op product runs as a generic kernel
 
@@ -1673,46 +1677,6 @@ workaround.
   including absence of unintended accumulator activation. Preserve the existing
   old/new graph snapshots and storage/gradient contracts when adding this support.
 
-## KI-COMPAT-009: a float32 tensor divided by a Python float is computed in float64
-
-- Severity: Limitation (performance; the result is the float32 PyTorch gives)
-- Status: Open; a design decision is pending. Measured 2026-09-06 on an sm_89 GPU.
-- Owner: torch compatibility / tensor operators
-- Symptom: `x / 2.0` for a float32 `x` on CPU or CUDA casts `x` to float64,
-  divides by a float64 0-d array and casts back, to match PyTorch to the last
-  ulp. On GPUs whose FP64 rate is 1/64 of FP32 this is the largest single excess
-  in the fused elementwise class: about 0.55 ms of a diffusers UNet2D step
-  (every `ResnetBlock2D` ends in `/ self.output_scale_factor`); removing the
-  widening measured 3.29 -> 2.73 ms for that class (see KI-CODEGEN-004).
-- Cause: `use_wide` in the true-division path of
-  `compat/torch/installers/tensor/method_api.py` (float32 widens to float64,
-  float16/bfloat16 widen only to float32, ACL does not widen); the native
-  `_fast_binary` builds the same widened sequence bit for bit.
-- Workaround: multiply by the reciprocal (`x * (1 / s)`), which stays float32,
-  where 1-ulp agreement with PyTorch is not required.
-- Evidence: `compat/tests/torch/test_torch_compat_promotion.py`,
-  `compat/tests/torch/test_native_fast_paths.py`.
-- Exit condition: decide whether 1-ulp parity is worth FP64 on consumer GPUs (for
-  example widen only where FP64 is fast, or compute `x * (1/s)` with a
-  correction), update the promotion tests with the decision, and delete the entry.
-
-## KI-COMPAT-010: torchmetrics' classification and regression metrics fail under the Torch frontend on CUDA
-
-- Severity: Medium (an ecosystem library's core metrics do not run)
-- Status: Open; reproduced 2026-10-12 on CUDA with torchmetrics installed (the
-  gates do not install it, so the cases skip there)
-- Owner: torch compatibility maintainers
-- Symptom: `test_classification_metrics` dies in `reduce_op.cc` with "Reduce
-  dim out of range: requested dims [0,] for a 0-D var"; `test_regression_metrics`
-  fails to compile a fused operator; `test_torchmetrics_required_torch_ops`
-  reports a required op as unsupported.
-- Cause: not isolated; the first is a `dim=0` reduction of a 0-d tensor, which
-  torch accepts.
-- Workaround: none.
-- Evidence: `JITTOR_TORCH_SHIM=1 python -m pytest -q compat/tests/torch/test_torchmetrics_compat.py`
-  on a CUDA machine with torchmetrics.
-- Exit condition: the three cases pass on CUDA.
-
 ## KI-COMPAT-011: an RNN under the Torch frontend on CUDA does not run through cuDNN
 
 - Severity: Medium (the precision policy it is meant to follow is not exercised)
@@ -1750,30 +1714,6 @@ workaround.
 - Exit condition: the four evidence files' cases run on an environment with
   Transformers/Diffusers installed (the metadata mechanism itself is covered by
   `compat/tests/torch/test_torch_shim_distribution_metadata.py`).
-
-## KI-COMPAT-021: T5's decoder MLP gradient leaves the parity band on CUDA
-
-- Severity: Medium (a gradient is wrong by 1.7x the accepted error; the forward
-  and the rest of the gradients agree)
-- Status: Open. Reproduced 2026-10-29 at `008cae211` and `1a750dbee` with the
-  same value, so it predates the float32 attention row-term change.
-- Owner: torch compatibility maintainers
-- Symptom:
-  `compat/tests/torch/test_ecosystem_parity.py::EcosystemParityCUDA::test_transformers_t5`
-  fails on `grad::decoder.block.1.layer.2.DenseReluDense.wi.weight diverged:
-  3.337e-02` against the 2e-2 maximum-relative-error band. The reported value is
-  bit-identical on both commits and across runs.
-- Cause: not isolated. The parameter belongs to a ReLU MLP, so the divergence
-  enters through the decoder block upstream of it. Ruled out: the float32
-  attention backward row term (the number does not move across `b0dcb366d`) and
-  the reference side (the case completes; an older oracle failed in apex before
-  the model ran at all).
-- Workaround: none for T5 training parity on CUDA; the rest of the ecosystem
-  parity matrix passes on the same encoder-decoder shapes it exercises.
-- Evidence: the nodeid above, run with the command in
-  [`docs/results/2026-10-29-cuda-f32-attention-row-term.md`](../../docs/results/2026-10-29-cuda-f32-attention-row-term.md).
-- Exit condition: the case passes on CUDA inside the band, or the band for this
-  case is raised in a change that says why.
 
 ## KI-DIST-001: FSDP2 flat sharding peaks above the unsharded model
 
@@ -1921,55 +1861,29 @@ workaround.
   case states its device explicitly.
 
 
-## KI-TEST-017: `test_parallel_compile_attribution` pins a defect the tree no longer has
+## KI-COMPAT-023: `jt.nn.silu` and the Torch frontend's SiLU differ by a half-ulp on CUDA
 
-- Severity: Low for users, Medium for the gate (two red cases in the PR smoke
-  tier hide a real regression in the same file)
-- Status: Open; reproduced 2026-10-30 at `30d9f4998` and, with `src/` and
-  `python/jittor/` checked out at `f37761c40`, identically -- so it predates
-  `81d0bdf2e`.
-- Owner: test infrastructure maintainers
-- Symptom:
-  `tests/codegen/test_parallel_compile_attribution.py::TestCompileFailureAttribution::{test_a_live_failed_var_makes_the_next_sync_report_the_same_failure,test_a_traceback_keeps_the_failed_var_alive_until_frames_are_cleared}`
-  fail. The child prints `first RAISED cause_named=True` and then `second
-  CLEAN`, where the test asserts the second `sync_all(True)` re-raises the
-  first compile error.
-- Cause: unknown. The module's docstring says a Var whose op failed to compile
-  stays in the graph and every later `sync_all(True)` re-raises; the tree now
-  reports the failure once and stays clean. Either error attribution was
-  changed deliberately without updating this file, or a Var carrying the
-  failure is no longer reachable from the graph.
-- Workaround: none needed for users; the case documents a defect class rather
-  than guarding an implemented contract.
-- Evidence: the file on its own, one process, on this machine:
-  `JITTOR_HOME=<native home> PYTHONPATH=python python -m pytest -q
-  tests/codegen/test_parallel_compile_attribution.py` -> 2 failed, 4 passed.
-- Exit condition: decide which behavior is correct, then fix the code or the
-  two assertions (and the module docstring) together; a green file that still
-  asserts the old behavior is not a resolution.
-
-## KI-TEST-018: a Torch-mode import inside a native worker turns a whole file red
-
-- Severity: Low for users, Medium for the gate (46 errors from one cause)
-- Status: Open; reproduced 2026-10-30 at `30d9f4998` and 2026-10-31 at
-  `b677f2358` with `tools/run_test_suite.py --tier smoke` (native session,
-  `-n 4`), not reproducible running the file alone.
-- Owner: test infrastructure maintainers
-- Symptom: in the smoke tier `tests/ops/test_storage_layout_dtype.py` reports 46
-  setup errors, all `AssertionError: assert 'torch' not in sys.modules` from its
-  autouse `native_device_only` fixture; the same file alone reports 56 passed /
-  6 skipped.
-- Cause: the fixture asserts a clean native process, but xdist shares a worker
-  across files, so any earlier test in that worker that imports `torch`
-  in-process (the shim, or a comparison case) poisons every later file that
-  asserts the invariant. Nothing distinguishes "this file imported torch" from
-  "an earlier file in this worker did".
-- Workaround: run that file alone, or with `-p no:randomly`; `--tier core` does
-  not hit it.
-- Evidence: the smoke runs above (46 errors in that one file out of 22 failures
-  and 47 errors overall at `b677f2358`, every other failure matching a triaged
-  entry) and the isolated run of the same file.
-- Exit condition: the invariant is asserted per worker at the point a
-  Torch-mode test is collected (or native files that touch `torch` are isolated
-  by `--dist loadfile`), so a file's result no longer depends on what ran
-  before it in the same worker.
+- Severity: Low (one half-precision ulp, about 25% of elements; the values are
+  the same to within a half's rounding)
+- Status: Open; reproduced 2026-11-01 at `2869f2c5b` and, with the division
+  changes reverted and the core rebuilt, at `d8e30464c` too.
+- Owner: torch compatibility / half-precision numerics
+- Symptom: `compat/tests/torch/test_native_fast_paths.py::TestNativeModuleDispatch::test_an_inference_group_norm_and_the_silu_after_it`
+  fails on CUDA at `torch.nn.Sequential(torch.nn.SiLU())(plain)` against
+  `jt.nn.silu(plain)` for half `plain`: 52-66 of 256 elements differ by one
+  half ulp (max 1.953e-03). The module spelling is bit-identical to real
+  PyTorch 2.11 (0 of 256 over several seeds), so `jt.nn.silu` is the side that
+  is off.
+- Cause: not isolated. `jt.nn.silu(half)` widens to float32, computes
+  `x * sigmoid(x)` and rounds once; the module path reaches the same function,
+  so the two must be taking different implementations somewhere between them
+  (the ACL `nn.silu` kernel is not involved on CUDA). A probe that builds the
+  same values outside the test and compares the two spellings under
+  `torch.no_grad()` agrees, while the test -- whose values are drawn inside the
+  scope -- does not, so grad-mode state is a suspect.
+- Workaround: none needed for accuracy; the difference is a half's last bit.
+  Use `torch.nn.functional.silu` (the frontend spelling) where bit-exact parity
+  with PyTorch is being asserted.
+- Evidence: the nodeid above, one process, `CUDA_VISIBLE_DEVICES` set; plus the
+  seed probe recorded in `docs/results/2026-11-01-python-float-division.md`.
+- Exit condition: the two spellings answer the same bits, and the case is green.

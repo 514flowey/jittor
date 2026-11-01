@@ -120,6 +120,13 @@ class TestTorchMetricsCompat(unittest.TestCase):
 
         import torchmetrics.utilities.data as tm_data
         tm_confmat = importlib.import_module("torchmetrics.functional.classification.confusion_matrix")
+        # The bounded helpers below are the torchmetrics *adapter*'s contract
+        # (`jittor_adapters.torchmetrics`), not the facade's: without that
+        # distribution installed nothing patches TorchMetrics and the library
+        # still works, just with its own helpers. Asserting the patch here was
+        # a red gate on every checkout that does not install the adapters.
+        if importlib.util.find_spec("jittor_adapters") is None:
+            self.skipTest("the torchmetrics adapter (jittor_adapters) is not installed")
         self.assertIsNotNone(getattr(tm_data._bincount, "_jittor_orig_bincount", None))
         self.assertIs(tm_confmat._bincount, tm_data._bincount)
         self.assertEqual(tm_data._bincount(torch.tensor([0, 2, 2], dtype=torch.int64), minlength=4).numpy().tolist(),

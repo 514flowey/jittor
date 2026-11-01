@@ -151,6 +151,13 @@ agree flags (9.5e-02 and 1.2e-01, the harness marks anything above 5e-2):
 those rows compare generated token ids, where greedy decoding of random weights
 flips occasional near-ties; both runtimes produce the full 136 tokens.
 
+The relay and linear-fast-path admission fixes (`81b1ffda8`, `b677f2358`) only
+change graphs that used to abort, so the matrix above still applies; the four
+conv-heavy rows were re-measured paired on an idle card at `resnet50_train`
+0.93x, `sd15_unet_train` 0.64x, `vit_b16_train` 0.89x and `ddpm_unet_train`
+0.97x (1.15x in the same batch, 0.97x when re-run alone: PyTorch drifted
+between 67 and 76 ms).
+
 ## Reproduction
 
 ```bash
@@ -180,9 +187,13 @@ The device profile needs CUPTI:
 - `tests/structure`: 1571 passed / 4 skipped; the only failure is
   `test_asv_entrypoints` because that interpreter has no `asv`, unrelated here.
 - Ecosystem parity (`test_ecosystem_parity.py -k EcosystemParityCUDA`):
-  10 passed / 6 skipped / 1 failed. The failure is a T5 decoder MLP gradient at
-  3.337e-02 against a 2e-2 band, identical at `008cae211`, so it is
-  pre-existing and recorded as KI-COMPAT-021.
+  10 passed / 6 skipped / 1 failed. The failure was a T5 decoder MLP gradient at
+  3.337e-02 against a 2e-2 band, identical at `008cae211`, recorded then as
+  KI-COMPAT-021. It closed on 2026-10-31: with **TF32 off on both sides** the
+  same comparison agrees to 9e-7 on all 48 gradients (1e-6 on the CPU), so the
+  difference is TF32's ten-bit mantissa, not a kernel. That case now states
+  `tf32=False`; every other case still runs with the
+  `JITTOR_ECOSYSTEM_TF32` policy, so the switch stays exercised.
 
 ## Open
 
@@ -190,3 +201,13 @@ The device profile needs CUPTI:
   it means fewer operators per step or a cheaper host cost per operator.
 - BERT/ViT's remaining 1.26-1.28x is the same host cost (about 5-7 us per
   operator, against PyTorch's 1-2 us).
+- `sd15_unet_train` measured at `e10e7b968` (idle card, batch 2, `--size full`):
+  a 210 ms step, of which 173 ms is graph construction before `step()` returns
+  and 37 ms the device time after the sync; PyTorch is 177 ms of dispatch plus
+  142 ms of device. cProfile's largest single entry is
+  `jittor_core.grad_optional` (backward construction) at **88 ms**, then the
+  optimizer's `_copy_detached_storage` (2058 calls, 25 ms cumulative), module
+  dispatch `_module_call` (665 calls, 64 ms cumulative, which includes each
+  module's whole forward), flag scopes (4118, 7 ms) and `dtype_name` (5979,
+  5 ms). The remaining gap on this row is backward graph construction, not
+  forward dispatch.

@@ -858,17 +858,28 @@ PyObject* scalar_division(PyObject* self, PyObject* other, NanoString own) {
     if (own == ns_float64) {
         out = binary_slots[B_TRUEDIV](self, other);
     } else {
-        NanoString wide = own == ns_float32 ? ns_float64 : ns_float32;
+        // float32 divides in float32: that is what torch does with a Python
+        // float, measured -- `x / 0.28209479177387814` over 20000 float32 `x`
+        // matches `x / float32(scale)` bit for bit, and differs from a float64
+        // route on 12615 of them. Only half precision widens, to its float32
+        // opmath. The float64 route this replaces was also the largest single
+        // excess of the elementwise class on a 1/64-rate double part.
+        const bool widen = own != ns_float32;
         double value = PyFloat_AS_DOUBLE(other);
         float narrow = (float)value;
         Var* x = GET_RAW_PTR(VarHolder, self)->var;
-        PyObjHolder a(wrap_like(self, new VarHolder(make_unary(x, wide))));
+        PyObjHolder a;
+        PyObject* left = self;
+        if (widen) {
+            a.assign(wrap_like(self, new VarHolder(make_unary(x, ns_float32))));
+            left = a.obj;
+        }
         PyObjHolder b(wrap_like(self, new VarHolder(make_array(
-            wide == ns_float64 ? (const void*)&value : (const void*)&narrow, {}, wide))));
+            (const void*)&narrow, {}, ns_float32))));
         // This is a Python literal, not a trainable tensor operand. Native
         // floating ArrayOp defaults must not create a new autograd leaf.
         GET_RAW_PTR(VarHolder, b.obj)->stop_grad();
-        out = binary_slots[B_TRUEDIV](a.obj, b.obj);
+        out = binary_slots[B_TRUEDIV](left, b.obj);
     }
     if (!out || out == Py_NotImplemented || !is_var(out)) return out;
     Var* result = GET_RAW_PTR(VarHolder, out)->var;
@@ -891,8 +902,9 @@ PyObject* fast_binary(PyObject* self, PyObject* other, int code) {
         if (GET_RAW_PTR(VarHolder, other)->var->dtype() != own) return none();
         if (division ? !(is_floating(own) || own.is_complex()) : is_uint(own)) return none();
     } else if (division) {
-        // A float divisor of a floating tensor, as `_true_division` widens
-        // it; anything else -- an int, a reflected division -- stays there.
+        // A float divisor of a floating tensor, built as `_true_division`
+        // builds it; anything else -- an int, a reflected division -- stays
+        // there.
         if (code != B_TRUEDIV || !widen_division || !PyFloat_CheckExact(other)
                 || !is_floating(own))
             return none();
