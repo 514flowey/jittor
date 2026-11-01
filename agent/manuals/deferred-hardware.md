@@ -13,6 +13,7 @@ GitHub issue 和 PR 描述里；本页不记进度，只记硬件到手那天要
 | --- | --- | --- | --- |
 | `6.B02` | ACL `executeOp` 的失败一律抛出（带算子名与解码后的 ACL 状态），tensor/workspace 在失败路径上也释放 | Ascend 910B3 + CANN | Ascend 910B3，单卡 |
 | `6.B16` | `sync_run=1` 与 `sync_run=0` 在 ACL 上都是真实的同步策略，失败可归因 | Ascend 910B3 + CANN | Ascend 910B3，单卡 |
+| `6.B20` | ACL fused SGD 在动量关闭（含 Nesterov 暂停）时不读写动量 buffer，暂停后恢复沿用原 buffer | Ascend 910B3 + CANN | Ascend 910B3，单卡 |
 | `8.06` | ACL 去样板：全部 `executeOp` owner 走共享 `BaseOpRunner::launch`，带属性的 owner 经版本化数据通道传属性；逐 family 的设备行为与数值 | Ascend 910B3 + CANN | Ascend 910B3，单卡 |
 | `4.11` | ACL 作为注册表后端（不再替换 Python 函数或公共类）的注册与分派路径 | Ascend 910B3 + CANN | Ascend 910B3，单卡 |
 | `4.12` | 非 CUDA 后端只编自己的源码、不再改写共享源码：ACL 注册路径与 ROCm 自有 HIP provider | Ascend 910B3；ROCm 卡 | Ascend 910B3，单卡；ROCm |
@@ -74,6 +75,12 @@ HCCL 多卡看 [`hccl-on-device-verification.md`](hccl-on-device-verification.md
 `test_acl_runner_failure_contract` 与 `test_acl_tensor_workspace_contract` 钉住）、**`6.B16`**
 （`sync_run=1/0` 两条路径；精确 nodeid 在 Ascend 指南里）、**`8.06`** 的已迁 family（静态合同
 102 passed，逐 family 的设备行为要在这里过一遍）、**`4.11`/`4.12`** 的 ACL 注册路径。
+**`6.B20`**（fused SGD 的暂停/恢复动量）另跑独立 PyTorch 进程对拍：
+`JITTOR_TEST_REAL_TORCH_PYTHON=<真实 PyTorch 的 python>` 下执行
+`tests/optim/test_sgd_dampening_pytorch_oracle.py`，`_devices()` 在 ACL 可用时加入
+`acl` 的 fused 关/开两行；判据是 `momentum_paused`（buffer 2、2、4.8，参数 0.8、0.5、0.02）、
+`nesterov_paused`、首次参与、缺失梯度与暂停期 checkpoint 恢复全部与 PyTorch 一致，而不是只互比
+Jittor 的两条路径。主机侧只做到桩 SDK 语法检查（`fused_sgd_op_acl.cc` 过、反向对照变红）。
 ACL 的主机侧契约（数据通道、描述符缓存外壳、launcher 收口）见
 [`docs/development/acl-backend-contracts.md`](../../docs/development/acl-backend-contracts.md)。
 
