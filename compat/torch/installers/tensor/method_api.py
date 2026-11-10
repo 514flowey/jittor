@@ -699,6 +699,13 @@ def _torch_getitem(self, slices):
             return tuple(normalize(item) for item in index)
         return index
 
+    # torch (like NumPy before 1.23) reads a short list holding a slice,
+    # Ellipsis, None, a sequence or a tensor as a tuple of indices:
+    # `t[[slice(None), 0]]` is `t[:, 0]` (PennyLane's take()).
+    if (isinstance(slices, list) and len(slices) < 32
+            and any(item is None or item is Ellipsis
+                    or isinstance(item, (slice, list, tuple, _NativeVar)) for item in slices)):
+        slices = tuple(slices)
     slices = normalize(slices)
     slices = _align_advanced_index(self, slices)
     # A basic index, natively (`src/bindings/pyjt/py_compat_fast.h`).
@@ -1015,11 +1022,34 @@ def _var_type(self, dst_type=None, non_blocking=False, **kw):
     return _cast_if_needed(self, ds) if ds is not None else self
 
 
-def _complex_scalar_var(value):
+def _complex_scalar_var(value, like=None):
     # Python/NumPy complex scalars are not accepted by Jittor's automatic
-    # Var converter. Materialize the torch-default complex64 scalar first;
-    # the actual arithmetic remains a normal device op.
-    return _owner.jt.array(_owner.np.asarray([value], dtype=_owner.np.complex64))
+    # Var converter, so materialize one; the arithmetic remains a normal
+    # device op. It must be 0-dim: a one-element vector broadcast
+    # `1j * tensor(0.3)` to shape [1] and joined promotion as a dimensioned
+    # tensor. Torch treats the Python number as a weak scalar computed in the
+    # tensor's precision: double for float64/complex128 operands, otherwise
+    # the default complex64. Building the scalar in that dtype keeps its value
+    # exact (0.1j in complex64 would round 0.1 to float32 under a complex128
+    # result) while the 0-dim tier yields Torch's result dtype.
+    dtype = _owner.np.complex64
+    if like is not None and _jittor_dtype_name(like.dtype) in ("float64", "complex128"):
+        dtype = _owner.np.complex128
+    return _owner.jt.array(_owner.np.asarray(value, dtype=dtype)).stop_grad()
+
+
+def _ndarray_operand_var(value, like):
+    """A NumPy array operand as a constant Var beside ``like``, in its own dtype.
+
+    torch converts it to a tensor that does not require grad; the native
+    converter made a Var that does (every float Var requires grad by
+    default), so ``np_array / t`` reported requires_grad=True for constant
+    inputs and NumPy then refused to convert the result.
+    """
+    var = _owner.jt.array(_owner.np.ascontiguousarray(value), dtype=str(value.dtype)).stop_grad()
+    if bool(getattr(like, "is_cuda", False)):
+        var = var.cuda()
+    return var
 
 
 def _truediv_target(da, db):
@@ -1525,8 +1555,23 @@ def _promoting_binary(self, other, opname, reflected):
                     "only integer tensors of a single element can be converted to an index")
             return other * int(self.item())
         return NotImplemented
+    if isinstance(other, _owner.np.generic) and other.dtype.kind in "biuf":
+        # A NumPy real scalar is a Python number to torch: a weak, constant
+        # operand. Without this it reached the native converter as a Var
+        # that requires grad (``t - np.float64(5.1)`` did).
+        other = other.item()
+    if isinstance(other, _owner.np.ndarray) and other.dtype.kind in "biufc":
+        out = _promoting_binary(self, _ndarray_operand_var(other, self), opname, reflected)
+        if isinstance(out, _NativeVar) and not bool(self.requires_grad):
+            out.stop_grad()
+        return out
     if isinstance(other, (complex, _owner.np.complexfloating)):
-        other = _complex_scalar_var(other)
+        # A Python number is a constant in Torch autograd: the result needs a
+        # gradient only through ``self``, as on the real-scalar path below.
+        out = _promoting_binary(self, _complex_scalar_var(other, self), opname, reflected)
+        if isinstance(out, _NativeVar) and not bool(self.requires_grad):
+            out.stop_grad()
+        return out
     if isinstance(other, _NativeVar):
         # PyTorch permits a CPU zero-dimensional scalar to participate in a
         # CUDA tensor operation (for example ``cuda.arange(3) + x.max()``),
@@ -1590,6 +1635,10 @@ def _promoting_binary(self, other, opname, reflected):
         return result
     out = _binary_native(opname, self, other, native_api)
     if isinstance(other, (bool, int, float)) and isinstance(out, _NativeVar):
+        # A Python number contributes no autograd edge (see the reflected
+        # branch above); the native op may still mark the result trainable.
+        if not bool(self.requires_grad):
+            out.stop_grad()
         own = _own_dtype_name(self, native_api)
         if own in _SCALAR_KEEPS_DTYPE.get(type(other), ()):
             expected = own
@@ -1601,8 +1650,18 @@ def _promoting_binary(self, other, opname, reflected):
 
 
 def _true_division(self, other, opname):
+    if isinstance(other, _owner.np.generic) and other.dtype.kind in "biuf":
+        other = other.item()
+    if isinstance(other, _owner.np.ndarray) and other.dtype.kind in "biufc":
+        out = _true_division(self, _ndarray_operand_var(other, self), opname)
+        if isinstance(out, _NativeVar) and not bool(self.requires_grad):
+            out.stop_grad()
+        return out
     if isinstance(other, (complex, _owner.np.complexfloating)):
-        other = _complex_scalar_var(other)
+        out = _true_division(self, _complex_scalar_var(other, self), opname)
+        if isinstance(out, _NativeVar) and not bool(self.requires_grad):
+            out.stop_grad()
+        return out
     if isinstance(other, _NativeVar):
         da, db = _jittor_dtype_name(self.dtype), _jittor_dtype_name(other.dtype)
         if da == db and da.startswith(("float", "bfloat", "complex")):
@@ -1930,7 +1989,18 @@ def _api_ne(self, other):
 
 
 def _api_ne_alias(self, other):
+    if other is None:
+        return True
     return _torch_ne(self, other)
+
+
+def _api_eq_alias(self, other):
+    # torch answers ``t == None`` with False (``list.count(None)`` over
+    # gradients relies on it); the native comparison has no None overload.
+    if other is None:
+        return False
+    native = get_install_context(_owner.jt).state["tensor_native_api"]["_native_eq"]
+    return native(self, other)
 
 
 def _api_nonzero(input, as_tuple=False, **kw):
@@ -2037,6 +2107,39 @@ def _api_hash(self):
 
 def _api_nelement(self):
     return int(self.numel())
+
+
+def _api_array(self, dtype=None, copy=None):
+    # The NumPy protocol (``np.asarray(t)``, ``np.einsum`` on tensors) refuses
+    # a tensor that requires grad, as torch does. Converting it silently
+    # detached the value: PennyLane relies on the refusal to fall back from a
+    # NumPy einsum to its differentiable path, and lost every second-order
+    # term flowing through ``dy``. ``Tensor.numpy()`` itself stays permissive
+    # because the frontend's own printing and ``tolist`` go through it.
+    # Only while grad mode is on: torch accepts it under no_grad() (PennyLane's
+    # Ising demo plots trainable costs inside ``with torch.no_grad():``).
+    if bool(getattr(self, "requires_grad", False)) and not _owner.jt.flags.no_grad:
+        raise RuntimeError(
+            "Can't call numpy() on Tensor that requires grad. Use tensor.detach().numpy() instead.")
+    _native_array = get_install_context(_owner.jt).state["tensor_native_api"]["_native_array"]
+    return _native_array(self, dtype, copy)
+
+
+def _api_bool(self):
+    # torch converts any one-element tensor, float and complex included
+    # (PennyLane's ``if qml.math.real(coeff):``). Jittor's native rule accepts
+    # only integer/bool Vars, which made such code raise TypeError instead.
+    count = int(self.numel())
+    if count == 0:
+        raise RuntimeError("Boolean value of Tensor with no values is ambiguous")
+    if count != 1:
+        raise RuntimeError("Boolean value of Tensor with more than one value is ambiguous")
+    return bool(self.item())
+
+
+def _api_ndimension(self):
+    # torch's spelling of ``dim()``; autoray's torch transpose calls it.
+    return int(self.ndim)
 
 
 def _api_is_floating_point(self):

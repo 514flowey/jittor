@@ -33,6 +33,10 @@ class _CallableBool(int):
 
 class dtype:
     """Immutable Torch dtype identity, independent of Python strings."""
+    # Published as torch.dtype; libraries such as autoray identify a backend
+    # from type(x).__module__, so a dtype must name torch like the Tensor type.
+    # Pickles go through _restore_dtype and do not depend on this.
+    __module__ = "torch"
     __slots__ = ("name", "_is_fp")
     if typing.TYPE_CHECKING:
         name: str

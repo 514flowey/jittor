@@ -35,7 +35,7 @@ _NATIVE_MODULE_NAMES = {
             "fftshift", "ifftshift", "fftfreq", "rfftfreq"),
     "linalg": ("svd", "svdvals", "eig", "eigh", "eigvalsh", "inv", "inv_ex", "pinv",
                "matrix_power", "matrix_rank", "matrix_norm", "vector_norm", "norm",
-               "cond", "det", "slogdet", "cholesky", "solve", "qr"),
+               "cond", "det", "slogdet", "cholesky", "solve", "qr", "matrix_exp", "eigvals"),
 }
 
 
@@ -59,6 +59,12 @@ class NativeOperation:
         import jittor
         context = get_install_context(jittor)
         implementation = context.state["native_torch_operations"][self._operation_key]
+        if "input" in kwargs and not args:
+            # torch names the first operand ``input`` and accepts it by keyword
+            # (autoray calls ``torch.prod(input=x, dim=0)``); the native
+            # functions name it differently, so pass it positionally.
+            kwargs = dict(kwargs)
+            args = (kwargs.pop("input"),)
         defaults = self._TORCH_DEFAULTS.get(self._operation_key)
         if defaults:
             kwargs = dict(kwargs)
