@@ -570,6 +570,11 @@ class StepCapture:
         """Why the step is not replayed, or None."""
         return self._refused
 
+    @property
+    def graph_refused(self):
+        """Why replays do not launch a recorded device graph, or None."""
+        return self._graph_refused
+
     def _call_signature(self, args, kwargs):
         signature = _signature(args, kwargs)
         if self._guard_external_backward:
@@ -870,7 +875,17 @@ class StepCapture:
         finally:
             jt.flags.keep_graph = before
         if not handle:
-            self._graph_refused = "the recording contained no device work"
+            refusal = _core.graph_capture_refusal()
+            if refusal.startswith("retryable: "):
+                # Work done once per key (a library plan built on a miss)
+                # cannot be recorded; the replay that follows does it, so
+                # a later recording of the same step finds it done.
+                self._rerecords += 1
+                if self._rerecords < _RERECORD_LIMIT:
+                    self._record_at = self.stats["replayed"] + 2
+                    return
+                refusal = refusal[len("retryable: "):]
+            self._graph_refused = refusal or "the recording contained no device work"
             return
         self._cuda_graph = handle
         self._graph_out = outs

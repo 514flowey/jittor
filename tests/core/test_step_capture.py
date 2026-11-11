@@ -374,6 +374,39 @@ class TestStepCaptureCuda(TestStepCapture):
         self._replay_matches(step, [jt.array(rs.randn(256, 128).astype("float32"))
                                     for _ in range(5)])
 
+    def test_more_transposes_than_the_plan_cache_still_record(self):
+        # A step whose cuTT working set exceeds the plan cache used to evict
+        # inside the recording -- a stream sync, which a recording cannot
+        # contain -- and silently gave up on the device graph for good.
+        cutt = getattr(jt.compile_extern, "cutt", None)
+        if cutt is None or not hasattr(cutt, "cutt_set_plan_cache_size"):
+            self.skipTest("cuTT plan cache accessors not built")
+        rs = np.random.RandomState(7)
+        shapes = [(2, 2, 2, m) for m in (3, 5, 6, 7, 9, 10, 11, 12)]
+        xs = [jt.array(rs.randn(*sh).astype("float32")) for sh in shapes]
+        w = jt.array(np.ones((1,), "float32"))
+        jt.sync(xs + [w])
+
+        def step(w):
+            e = 0
+            for x in xs:
+                e = e + ((x * w[0]).permute(3, 0, 1, 2) ** 2).sum()
+            return [e, jt.grad(e, w)]
+        expect = [v.numpy() for v in step(w)]
+        cutt.cutt_set_plan_cache_size(4)
+        self.addCleanup(cutt.cutt_set_plan_cache_size, 4096)
+        captured = jt.capture_step(step)
+        for _ in range(12):
+            got = [v.numpy() for v in captured(w)]
+            for g, e in zip(got, expect):
+                np.testing.assert_allclose(g, e, rtol=1e-5)
+        self.assertIsNone(captured.graph_refused)
+        self.assertGreater(captured.stats["graph"], 0)
+        before = cutt.cutt_plan_build_count()
+        for _ in range(3):
+            captured(w)[0].sync()
+        self.assertEqual(cutt.cutt_plan_build_count(), before)
+
     def test_random_draws_differ_on_every_launch(self):
         # The device generator's offset is baked into a recorded launch; a
         # captured step draws through Philox with a position the replay
