@@ -385,7 +385,10 @@ def diag(x,diagonal=0):
         return x.reindex(output_shape,[f'i0+{d}' if diagonal<=0 else 'i0',f'i0+{d}' if diagonal>=0 else 'i0'])
 
 
-def diagonal(x, offset=0, dim1=0, dim2=1):
+def diagonal(input, offset=0, dim1=0, dim2=1):
+    # Torch names the operand ``input`` and accepts it by keyword
+    # (``torch.diagonal(input=x)``); torch.diagonal re-exports this owner.
+    x = input
     def __normalize_dim(d, rank):
         if d < 0:
             d += rank
