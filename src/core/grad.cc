@@ -13,6 +13,7 @@
 #include "core/graph.h"
 #include "runtime/node_index.h"
 #include "ops/op_register.h"
+#include "ops/composite/getitem_op.h"
 #include "core/var_holder.h"
 #include "runtime/submission_pipeline.h"
 #include <atomic>
@@ -483,6 +484,27 @@ vector<VarPtr> grad(
                     if (id<0) continue;
                     Var* dout = grads[id];
                     trace_grad_op = op;
+                    if (grad && dout && snapshot.input_index == 0
+                            && op->is_op(op_ids::getitem())
+                            && !var->recorded_gradient_shape
+                            && grad->shape == var->shape
+                            && grad->dtype() == var->dtype()) {
+                        // A slice's gradient goes straight into the running
+                        // sum: one in-place setitem instead of a zero-filled
+                        // input-sized buffer, a setitem into it and a
+                        // full-size add -- 400 scalar slices of one parameter
+                        // cost 3,186 kernels that way.
+                        AmpGradGuard agg(op);
+                        Float32PrecisionScope precision_scope(op->float32_precision);
+                        LaunchOriginScope origin_scope(op->launch_origin);
+                        BackwardStorageReadScope storage_reads(op);
+                        auto summed = static_cast<GetitemOp*>(op)->grad_into(grad, dout);
+                        check_backward_storage_read(summed.ptr);
+                        if (var->loop_options) summed->loop_options = var->loop_options;
+                        grad = move(summed);
+                        assign_attrs(grad.ptr, var);
+                        continue;
+                    }
                     VarPtr dvar = make_grad(
                         op, out, dout, var, snapshot.input_index);
                     dvar = normalize_recorded_gradient(var, move(dvar));
