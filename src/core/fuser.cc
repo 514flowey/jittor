@@ -44,6 +44,18 @@ DEFINE_FLAG(int, fuse_op_limit, 16,
     "traffic; a very wide one has to keep every live intermediate in registers, "
     "and under autocast nothing breaks the chain. 0 is unbounded.");
 
+// A chain of one-element ops -- a circuit gate's angle: p[k] -> cast -> /2 ->
+// cos, sin -- ran as one kernel per op, each ~7 us of launch for one flop
+// (400 gates: 3,200 forward kernels). Such edges may fuse when every var on
+// both sides is one element of the same rank; a broadcast of the result still
+// reads it from memory (fusing into one mixes ranks the codegen cannot index).
+// A group joined through such an edge is bounded by `fuse_op_limit` like a
+// half-precision chain, so `x += a[i]` in a loop still cannot grow one kernel
+// per iteration.
+DEFINE_FLAG(int, fuse_scalar_chains, 1,
+    "Let elementwise ops whose inputs and outputs are all one element of the "
+    "same rank fuse with each other (bounded by fuse_op_limit). 0 disables it.");
+
 DEFINE_FLAG(int, fuse_into_reduce, 1,
     "Let a reduction take in the elementwise group producing its input even "
     "when that input is also read by an op that cannot fuse; the group then "
@@ -135,6 +147,24 @@ void count_fuse(int64_t tt, int start_var_num, const vector<Op*>& ops, const vec
         }
         return var->flag(VarFlags::_python_number);
     };
+    // `other` writes the one-element `var` and `op` reads it, both elementwise
+    // over one-element vars of var's rank: see fuse_scalar_chains.
+    auto scalar_chain_edge = [&](Var* var, Op* op, Op* other) -> bool {
+        if (!fuse_scalar_chains || var->num != 1 || fuse_op_limit <= 0) return false;
+        // A constant (`jt.array(1)` someone holds) is not recomputed into
+        // its readers: it is written once and read (tests/core/test_fuser.py
+        // test_for_fuse); a Python number already fuses by the rule below.
+        if (other->_inputs.empty()) return false;
+        auto rank = var->shape.size();
+        for (Op* o : {op, other}) {
+            if (o->type() != OpType::element) return false;
+            for (Var* v : o->outputs())
+                if (v->num != 1 || v->shape.size() != rank) return false;
+            for (Var* v : o->inputs())
+                if (v->num != 1 || v->shape.size() != rank) return false;
+        }
+        return true;
+    };
     auto edge_fusable = [&](Var* var, Op* op, Op* other, int relation) -> bool {
         if (op->float32_precision != other->float32_precision) return false;
         if (op_backend[op->batch_index_at(tt)] != op_backend[other->batch_index_at(tt)]) return false;
@@ -151,10 +181,12 @@ void count_fuse(int64_t tt, int start_var_num, const vector<Op*>& ops, const vec
             // the constant out for the subtraction to read. Only a number:
             // chaining scalar ops into one another would let `x += a[i]` in a
             // loop grow one kernel per chain length.
-            if (var->num <= 1 && op->type() != OpType::broadcast
+            bool scalar_chain = scalar_chain_edge(var, op, other);
+            if (var->num <= 1 && op->type() != OpType::broadcast && !scalar_chain
                     && !(var->num == 1 && op_scalar[op->batch_index_at(tt)]
                          && is_number_constant(var))) return false;
             if (var->flag(VarFlags::_force_fuse)) return true;
+            if (scalar_chain) return true;
             // producer is a reduce: its output has to be written out
             if (other->type() == OpType::reduce) return false;
             // consumer is a broadcast: it reads the var many times
@@ -301,6 +333,9 @@ void count_fuse(int64_t tt, int start_var_num, const vector<Op*>& ops, const vec
     // path between two ops of one level-connected component only passes
     // through ops of that component, and the whole component becomes one group.
     //
+    // (A chain of one-element ops joined through `fuse_scalar_chains` edges
+    // is bounded the same way; `half_union` marks either kind.)
+    //
     // `fuse_op_limit` is what breaks it. It bounds how many operators one
     // fused kernel may hold -- see the top of this file for the measurements
     // that set it: the MiniMax-H3 video VAE decode under `autocast(float16)`
@@ -343,7 +378,8 @@ void count_fuse(int64_t tt, int start_var_num, const vector<Op*>& ops, const vec
             // walk goes stale.
             int root = find_father(i);
             int other_root = find_father(other_id);
-            char half = is_half(var);
+            char half = is_half(var)
+                || (relation == 1 && scalar_chain_edge(var, other, op));
             if (root != other_root) {
                 father[other_root] = root;
                 group_size[root] += group_size[other_root];
@@ -432,7 +468,8 @@ void count_fuse(int64_t tt, int start_var_num, const vector<Op*>& ops, const vec
                 int root = find_father(i);
                 int other_root = find_father(other_id);
                 if (root == other_root) return;
-                bool refuse = is_half(var) &&
+                bool refuse = (is_half(var)
+                        || (relation == 1 && scalar_chain_edge(var, other, op))) &&
                     group_size[root] + group_size[other_root] > fuse_op_limit;
                 refuse = refuse || reaches_through_third(root, other_root) ||
                     reaches_through_third(other_root, root);
