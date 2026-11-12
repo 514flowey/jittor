@@ -69,6 +69,31 @@ class TestGetitemGradAccumulate(unittest.TestCase):
         want[2, 3] += 5
         np.testing.assert_allclose(jt.grad(loss, p).numpy(), want)
 
+    def test_many_integer_slices_are_batched(self):
+        # Enough one-element slices to take the stacked scatter: negative and
+        # repeated indices, mixed with a whole-tensor and a range contribution.
+        rs = np.random.RandomState(4)
+        a = rs.randn(3, 4, 5).astype("float32")
+        p = jt.array(a)
+        picks = [(0, 1, 2), (-1, -1, -1), (0, 1, 2), (2, 0, 4), (1, 3, 0), (1, -2, 3)]
+        loss = (p * 0.5).sum() + (p[1:, :2] ** 2).sum()
+        want = np.full_like(a, 0.5)
+        want[1:, :2] += 2 * a[1:, :2]
+        for i, (x, y, z) in enumerate(picks):
+            loss = loss + p[x, y, z] * (i + 1)
+            want[x, y, z] += i + 1
+        np.testing.assert_allclose(jt.grad(loss, p).numpy(), want, rtol=1e-5)
+
+    def test_batched_slices_have_a_second_derivative(self):
+        a = np.arange(1, 9, dtype="float32")
+        p = jt.array(a)
+        loss = 0
+        for k in range(8):
+            loss = loss + p[k] ** 3
+        g = jt.grad(loss, p)
+        np.testing.assert_allclose(g.numpy(), 3 * a ** 2, rtol=1e-5)
+        np.testing.assert_allclose(jt.grad(g.sum(), p).numpy(), 6 * a, rtol=1e-5)
+
     def test_complex_slices(self):
         rs = np.random.RandomState(2)
         a = (rs.randn(4, 3) + 1j * rs.randn(4, 3)).astype("complex64")
@@ -100,9 +125,9 @@ class TestGetitemGradAccumulateCuda(TestGetitemGradAccumulate):
             return jt.grad(loss, p)
         count, g = kernel_launches(lambda: step().numpy())
         np.testing.assert_allclose(g, np.full((10, 2, 20), 0.2, "float32"), rtol=1e-6)
-        # 800 slice reads, each with its gradient: one in-place setitem each,
-        # not a zeros fill, a setitem and a full-size add (3,186 kernels).
-        self.assertLess(count, 2000)
+        # 800 slice reads: their gradients are stacked and scattered once, and
+        # the per-slice products share kernels (3,186 kernels before).
+        self.assertLess(count, 300)
 
 
 if __name__ == "__main__":

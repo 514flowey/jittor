@@ -304,7 +304,7 @@ class TestScalarChainsFuse(JittorTestCase):
         self.assertLess(count, unfused)
 
     def test_a_scalar_accumulation_loop_is_bounded(self, device):
-        # `x += a[i]` in a loop: the chain fuses, but `fuse_op_limit` bounds
+        # `x += a[i]` in a loop: the chain fuses, but `fuse_tiny_op_limit` bounds
         # each kernel, so the kernels a loop compiles do not grow with its
         # length (the Python numbers it reads join through their own rule).
         a = jt.array(np.arange(200, dtype="float32"))
@@ -323,7 +323,7 @@ class TestScalarChainsFuse(JittorTestCase):
             self.assertEqual(value, float(n * (n - 1)))
             widest.append(max(row[0].count("opkey") for row in rep[1:]))
         self.assertEqual(widest[0], widest[1])
-        self.assertLessEqual(widest[1], 2 * jt.flags.fuse_op_limit)
+        self.assertLessEqual(widest[1], 2 * jt.flags.fuse_tiny_op_limit)
         count, _ = kernel_launches(lambda: accumulate(100))
         self.assertLess(count, 100)
 
@@ -346,7 +346,44 @@ class TestScalarChainsFuse(JittorTestCase):
         self.assertEqual(count, 2)
 
 
+class TestGateGradientsStayBounded(JittorTestCase):
+    """Forty gates built from one parameter each, differentiated together.
+
+    Their backward passes share only constants, and with the per-slice
+    gradients stacked into one scatter nothing kept them apart: the fuser made
+    one ~700-operator kernel the code generator never finished. Every kernel
+    now stays under `fuse_op_hard_limit`, and the gradient is the vectorised one.
+    """
+
+    def test_forty_gates(self, device):
+        K = 40
+        eye = jt.array(np.eye(2).astype(np.complex64))
+        flip = jt.array(np.array([[0, 1], [1, 0]], np.complex64))
+        neg_i = jt.array(np.complex64(-1j))
+        theta = np.linspace(0.1, 1.2, K).astype(np.float32)
+        p = jt.array(theta)
+
+        def gates(p, per_slice):
+            if per_slice:
+                acc = 0
+                for k in range(K):
+                    h = p[k].astype("complex64") / 2
+                    u = jt.cos(h) * eye + neg_i * jt.sin(h) * flip
+                    acc = acc + (u * u).real.sum()
+                return acc
+            h = (p.astype("complex64") / 2).reshape(K, 1, 1)
+            u = jt.cos(h) * eye + neg_i * jt.sin(h) * flip
+            return (u * u).real.sum()
+        want = jt.grad(gates(p, False), p).numpy()
+        with jt.profile_scope() as rep:
+            got = jt.grad(gates(p, True), p).numpy()
+        np.testing.assert_allclose(got, want, rtol=1e-4, atol=1e-5)
+        widest = max(row[0].count("opkey") for row in rep[1:])
+        self.assertLessEqual(widest, jt.flags.fuse_op_hard_limit)
+
+
 instantiate_device_type_tests(TestScalarChainsFuse, globals())
+instantiate_device_type_tests(TestGateGradientsStayBounded, globals())
 
 
 if __name__ == "__main__":
