@@ -896,6 +896,15 @@ class StepCapture:
             hook()
         if self._cuda_graph and cap.host_inputs:
             _core.graph_wait()
+        # An input still pending is built from the previous replay's results
+        # -- `p = p - lr * g` in a training loop -- and so reads buffers this
+        # replay is about to overwrite. Resolved inside the kept-graph window
+        # below, it ran after the write and an SGD loop drifted from its eager
+        # twin from the third replay on. Resolve it first, as an ordinary
+        # batch, while those buffers still hold the previous step's answer.
+        pending = [v for v in _input_vars((args, kwargs), []) if not v.is_finished]
+        if pending:
+            jt.sync(pending, False, False)
         # The copies into the captured leaves are part of the kept graph's
         # lifetime, not work the caller asked for. Outside `keep_graph` the
         # executor treats them as an ordinary batch and frees what it thinks
